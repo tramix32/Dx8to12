@@ -62,7 +62,8 @@ class Device : public IDirect3DDevice8, RefCounted {
                   int64_t src_offset, int64_t num_bytes);
   void CopyBufferToTexture(GpuTexture *dest, uint32_t dest_subresource,
                            ID3D12Resource *src,
-                           D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint);
+                           D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint,
+                           uint32_t dest_x = 0, uint32_t dest_y = 0);
   void TransitionTexture(GpuTexture *texture, uint32_t subresource,
                          D3D12_RESOURCE_STATES state_after);
   // Buffers (vertex/index) rely on D3D12's implicit state promotion from

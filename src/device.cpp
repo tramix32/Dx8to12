@@ -1014,7 +1014,8 @@ void Device::CopyBuffer(Buffer *dest, int64_t dest_offset,
 
 void Device::CopyBufferToTexture(
     GpuTexture *dest, uint32_t dest_subresource, ID3D12Resource *src,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint, uint32_t dest_x,
+    uint32_t dest_y) {
   D3D12_TEXTURE_COPY_LOCATION dest_location{
       .pResource = dest->resource(),
       .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1026,7 +1027,8 @@ void Device::CopyBufferToTexture(
 
   TransitionTexture(dest, dest_subresource, D3D12_RESOURCE_STATE_COPY_DEST);
 
-  cmd_list_->CopyTextureRegion(&dest_location, 0, 0, 0, &src_location, nullptr);
+  cmd_list_->CopyTextureRegion(&dest_location, dest_x, dest_y, 0,
+                               &src_location, nullptr);
   // TODO: Transition away from copy destination back to whatever state the
   // texture was in, instead of transitioning back to common.
   TransitionTexture(dest, dest_subresource,
@@ -1045,8 +1047,6 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
     CONST POINT *pDestPointsArray) {
   TRACE_ENTRY(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface,
               pDestPointsArray);
-  ASSERT(pSourceRectsArray == nullptr);
-  ASSERT(pDestPointsArray == nullptr);
 
   ASSERT(static_cast<BaseSurface *>(pSourceSurface)->kind() ==
          SurfaceKind::Cpu);
@@ -1055,31 +1055,66 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
          SurfaceKind::Gpu);
   GpuSurface *dest_surface = static_cast<GpuSurface *>(pDestinationSurface);
 
-  // Allocate space in our ring buffer and move the source data.
   const D3D12_SUBRESOURCE_FOOTPRINT &source_footprint =
       source_surface->footprint().Footprint;
-  const size_t num_bytes =
-      static_cast<size_t>(source_footprint.RowPitch * source_footprint.Height);
-  DynamicRingBuffer::Allocation ring_alloc =
-      dynamic_ring_buffer()->Allocate(num_bytes);
-  char *source_ring_ptr = dynamic_ring_buffer()->GetCpuPtrFor(ring_alloc);
   const uint32_t compact_pitch =
       safe_cast<uint32_t>(source_surface->compact_pitch());
-  if (compact_pitch == source_footprint.RowPitch)
-    memcpy(source_ring_ptr, source_surface->GetPtr(), num_bytes);
-  else {
-    for (uint32_t i = 0; i < source_footprint.Height; ++i) {
-      memcpy(source_ring_ptr + i * source_footprint.RowPitch,
-             source_surface->GetPtr() + i * compact_pitch, compact_pitch);
-    }
-  }
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_placed_footprint = {
-      .Offset = safe_cast<uint64_t>(ring_alloc.offset),
-      .Footprint = source_footprint};
+  const int format_size = DXGIFormatSize(source_footprint.Format);
 
-  CopyBufferToTexture(dest_surface->texture(), dest_surface->subresource(),
-                      dynamic_ring_buffer_->GetBackingResource(),
-                      src_placed_footprint);
+  // No source rects means "copy the whole surface", per the D3D8 docs; a
+  // single synthetic rect covering it lets the general per-rect path below
+  // handle both cases identically.
+  RECT whole_surface_rect{.left = 0,
+                          .top = 0,
+                          .right = static_cast<LONG>(source_footprint.Width),
+                          .bottom = static_cast<LONG>(source_footprint.Height)};
+  const bool copy_whole_surface = pSourceRectsArray == nullptr;
+  const UINT num_rects = copy_whole_surface ? 1 : cRects;
+
+  for (UINT i = 0; i < num_rects; ++i) {
+    const RECT &rect =
+        copy_whole_surface ? whole_surface_rect : pSourceRectsArray[i];
+    const uint32_t rect_width = static_cast<uint32_t>(rect.right - rect.left);
+    const uint32_t rect_height = static_cast<uint32_t>(rect.bottom - rect.top);
+    const POINT dest_point = pDestPointsArray
+                                  ? pDestPointsArray[i]
+                                  : POINT{.x = rect.left, .y = rect.top};
+
+    // Allocate space in our ring buffer and move just this rect's source
+    // data, row by row (the source rect's rows aren't contiguous in the
+    // backing CPU surface unless the rect is the full width).
+    const uint32_t row_bytes = rect_width * static_cast<uint32_t>(format_size);
+    const uint32_t dest_row_pitch =
+        safe_cast<uint32_t>(AlignUp(static_cast<int>(row_bytes),
+                                    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+    const size_t num_bytes =
+        static_cast<size_t>(dest_row_pitch) * rect_height;
+    DynamicRingBuffer::Allocation ring_alloc =
+        dynamic_ring_buffer()->Allocate(
+            num_bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    char *source_ring_ptr = dynamic_ring_buffer()->GetCpuPtrFor(ring_alloc);
+    const char *rect_src_ptr = source_surface->GetPtr() +
+                               rect.top * compact_pitch +
+                               rect.left * format_size;
+    for (uint32_t row = 0; row < rect_height; ++row) {
+      memcpy(source_ring_ptr + row * dest_row_pitch,
+             rect_src_ptr + row * compact_pitch, row_bytes);
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_placed_footprint{
+        .Offset = safe_cast<uint64_t>(ring_alloc.offset),
+        .Footprint = {.Format = source_footprint.Format,
+                      .Width = rect_width,
+                      .Height = rect_height,
+                      .Depth = 1,
+                      .RowPitch = dest_row_pitch}};
+
+    CopyBufferToTexture(dest_surface->texture(), dest_surface->subresource(),
+                        dynamic_ring_buffer_->GetBackingResource(),
+                        src_placed_footprint,
+                        safe_cast<uint32_t>(dest_point.x),
+                        safe_cast<uint32_t>(dest_point.y));
+  }
 
   MarkResourceAsUsed(InternalPtr(dest_surface));
   return S_OK;
