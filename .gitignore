@@ -5,6 +5,10 @@ dumps/
 build/
 build-x86/
 
+# Game-specific binary analysis artifacts (not for the public repo).
+d3d8_calls_*.txt
+d3d8calls.py
+
 CMakeLists.txt.user
 CMakeCache.txt
 CMakeFiles
