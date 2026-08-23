@@ -2051,10 +2051,48 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
 HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
                                                 UINT StartVertex,
                                                 UINT PrimitiveCount) {
+  // D3D12 has no fan topology. Emulate it with a generated index list (0,
+  // i+1, i+2 for each triangle) drawn as a triangle list against the
+  // already-bound vertex buffer, the same trick DrawPrimitiveUP already uses
+  // by rewriting the vertex data directly -- here we can't rewrite the
+  // (GPU-side, already bound) vertex buffer, so we index into it instead.
+  if (PrimitiveType == D3DPT_TRIANGLEFAN) {
+    const UINT vertex_count = PrimitiveCount + 2;
+    const UINT index_count = 3 * PrimitiveCount;
+    std::vector<uint16_t> indices;
+    indices.reserve(index_count);
+    for (UINT i = 0; i < PrimitiveCount; ++i) {
+      indices.push_back(static_cast<uint16_t>(StartVertex));
+      indices.push_back(static_cast<uint16_t>(StartVertex + i + 1));
+      indices.push_back(static_cast<uint16_t>(StartVertex + i + 2));
+    }
+    const size_t index_bytes = index_count * sizeof(uint16_t);
+    DynamicRingBuffer::Allocation index_alloc =
+        dynamic_ring_buffer()->Allocate(index_bytes);
+    memcpy(dynamic_ring_buffer()->GetCpuPtrFor(index_alloc), indices.data(),
+           index_bytes);
+    D3D12_INDEX_BUFFER_VIEW ib_view{
+        .BufferLocation = dynamic_ring_buffer()->GetGpuPtrFor(index_alloc),
+        .SizeInBytes = safe_cast<UINT>(index_bytes),
+        .Format = DXGI_FORMAT_R16_UINT};
+
+    HR_OR_RETURN(
+        PrepareDrawCall(D3DPT_TRIANGLELIST, StartVertex, vertex_count));
+    cmd_list_->IASetIndexBuffer(&ib_view);
+    cmd_list_->DrawIndexedInstanced(index_count, 1, 0, 0, 0);
+    return S_OK;
+  }
+
   int vertex_count;
   switch (PrimitiveType) {
+    case D3DPT_POINTLIST:
+      vertex_count = PrimitiveCount;
+      break;
     case D3DPT_LINELIST:
       vertex_count = 2 * PrimitiveCount;
+      break;
+    case D3DPT_LINESTRIP:
+      vertex_count = 1 + PrimitiveCount;
       break;
     case D3DPT_TRIANGLELIST:
       vertex_count = 3 * PrimitiveCount;
@@ -2145,6 +2183,15 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
 
   int index_count;
   switch (PrimitiveType) {
+    case D3DPT_POINTLIST:
+      index_count = primCount;
+      break;
+    case D3DPT_LINELIST:
+      index_count = 2 * primCount;
+      break;
+    case D3DPT_LINESTRIP:
+      index_count = 1 + primCount;
+      break;
     case D3DPT_TRIANGLELIST:
       index_count = 3 * primCount;
       break;
