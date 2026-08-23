@@ -183,6 +183,15 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
   if (is_nooverwrite && prev_lock_frame_ < device_->CurrentFrame()) {
     return Buffer::Lock(OffsetToLock, SizeToLock, ppbData, Flags);
   }
+  if (!is_discard && !is_nooverwrite) {
+    // Neither flag set: real D3D9 docs say this "behaves the same as if
+    // usage were not dynamic" -- a plain, synchronized lock against the
+    // buffer's own persistent resource, skipping the speculative-write/
+    // ring-buffer fast paths below entirely. A real, if less common, usage
+    // pattern -- hit in practice by GTA: Vice City.
+    is_plain_lock_ = true;
+    return Buffer::Lock(OffsetToLock, SizeToLock, ppbData, Flags);
+  }
 
   // We're modifying the contents of the buffer. We have to persist the last
   // modification.
@@ -225,6 +234,10 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
 }
 
 HRESULT STDMETHODCALLTYPE DynamicBuffer::Unlock() noexcept {
+  if (is_plain_lock_) {
+    is_plain_lock_ = false;
+    return Buffer::Unlock();
+  }
   if (prev_lock_frame_ < device_->CurrentFrame()) return Buffer::Unlock();
   return S_OK;
 }

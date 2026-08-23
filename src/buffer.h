@@ -147,6 +147,13 @@ class DynamicBuffer : public Buffer {
   DynamicRingBuffer::Allocation current_ring_alloc_ = {};
   D3D12_CPU_DESCRIPTOR_HANDLE prev_csv_handle_ = {};
   uint64_t prev_lock_frame_ = 0;
+  // Set for the lifetime of a Lock()/Unlock() pair that fell back to the
+  // plain Buffer::Lock() path (neither D3DLOCK_DISCARD nor
+  // D3DLOCK_NOOVERWRITE) -- Unlock() must check this explicitly rather than
+  // re-deriving it from prev_lock_frame_, since a plain lock can happen in
+  // the same frame as an earlier DISCARD/NOOVERWRITE one, where the frame
+  // comparison alone can't tell the two apart.
+  bool is_plain_lock_ = false;
 
   RangeSet written_ranges_;
   // static constexpr bool use_cbv_ = false;
