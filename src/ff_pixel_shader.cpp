@@ -84,6 +84,15 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
   ss << ";" << endl;
   // Prepare any temporary arguments.
   switch (op) {
+    case D3DTOP_MULTIPLYADD:
+    case D3DTOP_LERP: {
+      DWORD arg0_source = components[0] == 'a' ? s.ts[stage].alpha_arg0
+                                               : s.ts[stage].color_arg0;
+      ss << "arg0 = ";
+      GenerateArgValue(stage, s.ts[stage], arg0_source, ss);
+      ss << ";" << endl;
+      break;
+    }
     case D3DTOP_BLENDTEXTUREALPHA:
     case D3DTOP_BLENDTEXTUREALPHAPM:
       ASSERT(s.stage_has_texture(stage));
@@ -154,6 +163,14 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
     case D3DTOP_DOTPRODUCT3:
       ss << "saturate(dot(arg1-0.5f, arg2-0.5f)).xxxx";
       break;
+    case D3DTOP_MULTIPLYADD:
+      // Result = Arg0 + Arg1*Arg2.
+      ss << "arg0 + arg1*arg2";
+      break;
+    case D3DTOP_LERP:
+      // Result = Arg1*Arg0 + Arg2*(1-Arg0).
+      ss << "arg1*arg0 + arg2*(1.f-arg0)";
+      break;
     default:
       FAIL("Unsupported texture op %d", op);
   }
@@ -170,7 +187,7 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
   ss << "float4 specular_color = IN.oD1;" << endl;
 
   ss << "float4 result_color = diffuse_color;" << endl;
-  ss << "float4 arg1, arg2;" << endl;
+  ss << "float4 arg0, arg1, arg2;" << endl;
   ss << "float alpha;" << endl;
 
   for (int i = 0; i < kMaxTexStages; ++i) {

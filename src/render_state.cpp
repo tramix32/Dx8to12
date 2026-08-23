@@ -191,7 +191,9 @@ PixelShaderState::PixelShaderState(
                               .alpha_arg1 = stage.alpha_arg1,
                               .alpha_arg2 = stage.alpha_arg2,
                               .texcoord_index = stage.texcoord_index,
-                              .transform_flags = stage.transform_flags};
+                              .transform_flags = stage.transform_flags,
+                              .color_arg0 = stage.color_arg0,
+                              .alpha_arg0 = stage.alpha_arg0};
     if (stage.alpha_arg1 == D3DTA_TEXTURE && !stage_has_texture[i]) {
       // Default argument is DIFFUSE if no texture is set.
       ts[i].alpha_arg1 = D3DTA_DIFFUSE;
