@@ -1075,6 +1075,21 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
     const bool copy_whole_surface = pSourceRectsArray == nullptr;
     const UINT num_rects = copy_whole_surface ? 1 : cRects;
 
+    const D3D12_RESOURCE_DESC &dst_desc =
+        dest_surface->texture()->resource_desc();
+    // D3D12 requires an exact (or explicitly-equivalent, per the small set
+    // the validation layer recognizes -- BC[1|4], BC[2|3|5|6|7],
+    // R9G9B9E5_SHAREDEXP) format match for a direct texture-to-texture
+    // CopyTextureRegion. It rejects e.g. B8G8R8A8 <-> B8G8R8X8 even though
+    // they're byte-for-byte identical layouts (alpha vs. an unused padding
+    // channel) -- exactly the backbuffer-vs-render-target mismatch this hit
+    // in practice. Route through an intermediate buffer in that case: a
+    // texture-to-buffer copy doesn't care about the source's pixel format
+    // (the destination is just raw bytes), and the following buffer-to-
+    // texture copy only needs to agree with the *destination* texture's own
+    // format, which it does by construction.
+    const bool needs_staging = src_desc.Format != dst_desc.Format;
+
     const D3D12_RESOURCE_STATES src_prior_state = src_texture->current_state();
     TransitionTexture(src_texture, src_subresource,
                       D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1088,22 +1103,63 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
         .pResource = src_texture->resource(),
         .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         .SubresourceIndex = src_subresource};
+    const int src_format_size = DXGIFormatSize(src_desc.Format);
     for (UINT i = 0; i < num_rects; ++i) {
       const RECT &rect =
           copy_whole_surface ? whole_surface_rect : pSourceRectsArray[i];
       const POINT dest_point = pDestPointsArray
                                     ? pDestPointsArray[i]
                                     : POINT{.x = rect.left, .y = rect.top};
+      if (!needs_staging) {
+        D3D12_BOX src_box{.left = static_cast<UINT>(rect.left),
+                          .top = static_cast<UINT>(rect.top),
+                          .front = 0,
+                          .right = static_cast<UINT>(rect.right),
+                          .bottom = static_cast<UINT>(rect.bottom),
+                          .back = 1};
+        cmd_list_->CopyTextureRegion(&dst_location,
+                                     safe_cast<uint32_t>(dest_point.x),
+                                     safe_cast<uint32_t>(dest_point.y), 0,
+                                     &src_location, &src_box);
+        continue;
+      }
+      const uint32_t rect_width =
+          static_cast<uint32_t>(rect.right - rect.left);
+      const uint32_t rect_height =
+          static_cast<uint32_t>(rect.bottom - rect.top);
+      const uint32_t row_bytes =
+          rect_width * static_cast<uint32_t>(src_format_size);
+      const uint32_t staged_row_pitch = safe_cast<uint32_t>(
+          AlignUp(static_cast<int>(row_bytes),
+                  D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+      DynamicRingBuffer::Allocation staging_alloc =
+          dynamic_ring_buffer()->Allocate(
+              static_cast<size_t>(staged_row_pitch) * rect_height,
+              D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      D3D12_TEXTURE_COPY_LOCATION staging_location{
+          .pResource = dynamic_ring_buffer_->GetBackingResource(),
+          .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+          .PlacedFootprint = {
+              .Offset = safe_cast<uint64_t>(staging_alloc.offset),
+              .Footprint = {.Format = src_desc.Format,
+                            .Width = rect_width,
+                            .Height = rect_height,
+                            .Depth = 1,
+                            .RowPitch = staged_row_pitch}}};
       D3D12_BOX src_box{.left = static_cast<UINT>(rect.left),
                         .top = static_cast<UINT>(rect.top),
                         .front = 0,
                         .right = static_cast<UINT>(rect.right),
                         .bottom = static_cast<UINT>(rect.bottom),
                         .back = 1};
+      cmd_list_->CopyTextureRegion(&staging_location, 0, 0, 0, &src_location,
+                                   &src_box);
+      D3D12_TEXTURE_COPY_LOCATION staging_src_location = staging_location;
+      staging_src_location.PlacedFootprint.Footprint.Format = dst_desc.Format;
       cmd_list_->CopyTextureRegion(&dst_location,
                                    safe_cast<uint32_t>(dest_point.x),
                                    safe_cast<uint32_t>(dest_point.y), 0,
-                                   &src_location, &src_box);
+                                   &staging_src_location, nullptr);
     }
     TransitionTexture(src_texture, src_subresource, src_prior_state);
     TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
