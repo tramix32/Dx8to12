@@ -224,8 +224,21 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceFormat(
   } else if (RType == D3DRTYPE_TEXTURE) {
     is_valid &= HasFlag(support.Support1, D3D12_FORMAT_SUPPORT1_TEXTURE2D);
     ASSERT(Usage == 0);
+  } else if (RType == D3DRTYPE_CUBETEXTURE) {
+    // Cube textures are actually implemented (unlike volume textures, see
+    // below) -- this was previously falling into the FAIL default, meaning
+    // a compliant game that checks CheckDeviceFormat before creating a cube
+    // texture (a common pattern for reflective surfaces: water, chrome,
+    // environment maps) would crash on the mere capability query, despite
+    // the feature working fine.
+    is_valid &= HasFlag(support.Support1, D3D12_FORMAT_SUPPORT1_TEXTURECUBE);
+    ASSERT(Usage == 0);
   } else {
-    FAIL("Unexpected RType %d", RType);
+    // Anything else (D3DRTYPE_VOLUMETEXTURE, D3DRTYPE_VERTEXBUFFER, etc.) --
+    // genuinely not implemented. Answer gracefully rather than crashing on a
+    // mere capability query, matching CheckDeviceFormat's existing
+    // DXGI_FORMAT_UNKNOWN early-return above.
+    return D3DERR_NOTAVAILABLE;
   }
   return is_valid ? S_OK : D3DERR_NOTAVAILABLE;
 }
