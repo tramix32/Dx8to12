@@ -387,12 +387,15 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   if (!(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED)) {
     LOG(INFO) << "Resetting device: Submitting commands..\n";
     SubmitAndWait(false);
+    LOG(INFO) << "Reset: WaitForFrame(next_fence_ - 1)\n";
     WaitForFrame(next_fence_ - 1);
+    LOG(INFO) << "Reset: cmd_list_->Close()\n";
     ASSERT_HR(cmd_list_->Close());
     dirty_flags_ |= DIRTY_FLAG_CMD_LIST_CLOSED;
   } else {
     LOG(INFO) << "Resetting device. Commands already submitted.\n";
   }
+  LOG(INFO) << "Reset: releasing old back buffers/depth-stencil\n";
   bound_render_target_.Reset();
   bound_depth_target_.Reset();
   ASSERT(depth_stencil_tex_->total_ref_count() == 1);
@@ -416,14 +419,17 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // early in its own init sequence. ResizeBuffers alone is enough to make
   // the swap chain match the window's existing size -- we're not the one
   // deciding the window should move or resize.
+  LOG(INFO) << "Reset: swap_chain_->ResizeBuffers()\n";
   ASSERT_HR(swap_chain_->ResizeBuffers(
       2, pPresentationParameters->BackBufferWidth,
       pPresentationParameters->BackBufferHeight, new_format, 0));
+  LOG(INFO) << "Reset: swap_chain_->ResizeBuffers() done\n";
 
   DXGI_SWAP_CHAIN_DESC swap_chain_desc;
   ASSERT_HR(swap_chain_->GetDesc(&swap_chain_desc));
 
   if (pPresentationParameters->EnableAutoDepthStencil) {
+    LOG(INFO) << "Reset: creating depth-stencil texture\n";
     D3DFORMAT depth_format = pPresentationParameters->AutoDepthStencilFormat;
     if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
     ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32);
@@ -438,6 +444,8 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     render_state_.zbuffer_type = D3DZB_TRUE;
   }
 
+  LOG(INFO) << "Reset: re-acquiring " << swap_chain_desc.BufferCount
+            << " back buffer(s)\n";
   ASSERT(back_buffers_.empty());
   for (uint32_t i = 0; i < swap_chain_desc.BufferCount; ++i) {
     ComPtr<ID3D12Resource> back_buffer_resource;
@@ -448,14 +456,17 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     back_buffer->SetName(std::string("back_buffer_") + std::to_string(i));
     back_buffers_.push_back(ComOwn(back_buffer));
   }
+  LOG(INFO) << "Reset: back buffers re-acquired\n";
 
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
 
+  LOG(INFO) << "Reset: final allocator/cmd list reset\n";
   ASSERT_HR(cmd_allocators_[current_back_buffer_]->Reset());
   ASSERT_HR(
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
 
+  LOG(INFO) << "Reset: done\n";
   return S_OK;
 }
 

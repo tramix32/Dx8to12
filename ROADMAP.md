@@ -195,6 +195,14 @@ Also fixed the crash handler's own bug that produced misleading earlier stack tr
 
 Since log-reading alone has hit its limit here, added fine-grained `LOG(INFO)` checkpoints around every individual D3D12/DXGI call inside `SubmitAndWait`/`WaitForFrame` (`Close`, `ExecuteCommandLists`, `Present`, `Signal`, `GetCurrentBackBufferIndex`, the fence wait, allocator/list `Reset`) -- deliberately noisy, meant to be removed once this is resolved. The next crash log will show the last-logged checkpoint immediately before the crash, which pins down *which specific call* triggers it, even though the fault itself lands in un-symbolicated game code.
 
+## Checkpoints pinned it inside `Reset()`, past `SubmitAndWait`/`WaitForFrame` themselves -- more logging added
+
+The checkpoints added inside `SubmitAndWait`/`WaitForFrame` paid off: the log showed the full `SubmitAndWait` cycle complete cleanly (`Close` → `ExecuteCommandLists` → `Signal` → `GetCurrentBackBufferIndex` → `WaitForFrame` → allocator/list `Reset`, all logged, `"SubmitAndWait: done"`), then `Reset()`'s own *second*, redundant `WaitForFrame(next_fence_ - 1)` call also completed cleanly (`"WaitForFrame: done"`) -- and *then* the crash, with nothing else logged in between. That means the fault is somewhere in the ~15 lines of `Reset()` after that second `WaitForFrame` call that had no checkpoints yet: `cmd_list_->Close()`, releasing/clearing the old back buffers and depth-stencil texture, `ResizeBuffers`, recreating the depth-stencil texture, re-acquiring the new back buffers via `GetBuffer`, or the final allocator/command-list `Reset`.
+
+Noted in passing: `Reset()` calls `WaitForFrame(next_fence_ - 1)` a second time immediately after `SubmitAndWait(false)` already did the equivalent wait internally. Tracing through `DynamicRingBuffer::HasCompletedFrame`/`SetCurrentFrame`, this redundant second call ends up setting `head_` to the *current* `tail_` position (since by the time it runs, `SetCurrentFrame` has already advanced `current_frame_` and pushed a fresh `{current_frame_, tail_}` entry that this second call immediately consumes) -- not obviously the cause of an immediate crash on the next line, but a real, separate correctness bug in the ring buffer's free-space bookkeeping worth fixing once the fatal crash itself is resolved.
+
+Added checkpoints through the rest of `Reset()`: after releasing old back buffers/depth-stencil, around `ResizeBuffers`, around depth-stencil texture (re)creation, around re-acquiring the new back buffers, and around the final allocator/command-list reset. The next crash log will show exactly which of these is the last one logged before the fault.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
