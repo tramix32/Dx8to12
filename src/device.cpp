@@ -217,7 +217,20 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   debug_iface->Release();
   debug_interface_->EnableDebugLayer();
   // debug_interface_->SetEnableSynchronizedCommandQueueValidation(TRUE);
-  debug_interface_->SetEnableGPUBasedValidation(TRUE);
+  // GPU-based validation is much heavier than the regular debug layer (shader
+  // instrumentation on every draw/copy) -- it's the likely cause of very low
+  // FPS even in menus, and its validation runs asynchronously relative to the
+  // CPU submission that triggered it, which can surface as a message
+  // hundreds of ms after the actual call (observed: a "Command lists must be
+  // successfully closed" error logged ~350ms after the last real
+  // ExecuteCommandLists, with nothing logged in between) -- misleading when
+  // chasing a crash via checkpoint logging, since the real cause isn't the
+  // most recently logged call. EnableDebugLayer() alone (kept, no perf cost
+  // even close to GBV's) already catches the vast majority of real bugs this
+  // project has actually been fixed from (resource-state validation, leaked
+  // descriptors, etc.) -- turn this back on only if specifically chasing a
+  // GPU-side corruption/UAV-hazard bug that plain validation can't see.
+  // debug_interface_->SetEnableGPUBasedValidation(TRUE);
   // debug_interface_->SetEnableAutoName(TRUE);
 #endif
 
