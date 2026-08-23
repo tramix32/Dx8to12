@@ -2487,8 +2487,26 @@ void Device::WaitForFrame(uint64_t frame_number) {
       LOG(TRACE) << "Waiting for fence " << frame_number << ".\n";
       ASSERT_HR(cmd_list_done_fence_->SetEventOnCompletion(
           frame_number, cmd_list_done_event_handle_));
-      WaitForSingleObjectEx(cmd_list_done_event_handle_, 60 * 1000, FALSE);
+      DWORD wait_result =
+          WaitForSingleObjectEx(cmd_list_done_event_handle_, 60 * 1000, FALSE);
       LOG(INFO) << "WaitForFrame: fence event signaled/timed out\n";
+      if (wait_result != WAIT_OBJECT_0) {
+        // The fence never signaled -- most likely the GPU driver hung and
+        // got TDR-reset (device removed), or genuinely never finished this
+        // workload. Previously this return value was ignored entirely: on
+        // timeout, execution fell straight through to FreeFrameResources()
+        // below as if the wait had succeeded, freeing/reusing resources the
+        // GPU might still (think it) owns -- silent corruption instead of a
+        // diagnosable failure, observed in practice as an unresponsive
+        // ~60s "freeze" followed by the process dying with no error shown.
+        HRESULT removed_reason = d3d12_device_->GetDeviceRemovedReason();
+        FAIL(
+            "WaitForFrame: fence %llu never signaled after 60s (wait_result="
+            "0x%X). GetDeviceRemovedReason=0x%X -- the GPU driver likely "
+            "hung or was TDR-reset.",
+            static_cast<unsigned long long>(frame_number), wait_result,
+            removed_reason);
+      }
     }
   }
 
