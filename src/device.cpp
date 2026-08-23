@@ -377,6 +377,20 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
   ASSERT_HR(Reset(&params));
 
   InitRootSignatures();
+
+  // Real D3D8 devices come out of CreateDevice with a default vertex format
+  // already active (D3DFVF_XYZ -- untransformed position only), not with no
+  // format set at all. Confirmed by comparing against d3d8to9 (a known-good
+  // D3D8-on-D3D9 wrapper), which explicitly calls SetFVF(D3DFVF_XYZ) right
+  // after constructing its device wrapper, before returning it to the app.
+  // Without this, bound_vertex_shader_ defaults to 0 with no corresponding
+  // entry in vertex_shaders_ (SetVertexShader was never actually called),
+  // which is a real, observable difference from every other implementation
+  // a game might have been tested against -- some games rely on a default
+  // format being active before they ever call SetVertexShader/SetFVF
+  // themselves.
+  ASSERT_HR(SetVertexShader(D3DFVF_XYZ));
+
   LOG(INFO) << "Init: done, returning to Create()\n";
   return S_OK;
 }

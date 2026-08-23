@@ -211,6 +211,16 @@ This reframes the whole investigation: every crash signature seen so far (small-
 
 **If the next log shows `"CreateDevice: returning device to caller"` before the crash, this is very likely a bug on the game's side (or a real-vs-our-implementation behavioral difference the game depends on) rather than something in our `Reset`/`Init` sequence** -- would need to shift focus to *what the game does immediately after `CreateDevice` succeeds* (per the earlier static call-site analysis: likely `GetDeviceCaps`, `SetRenderState`, or one of the many `Create*` calls RenderWare makes during its own post-device-creation setup) rather than continuing to suspect `Reset()`/`SubmitAndWait()`, which are now confirmed innocent.
 
+## Confirmed our bug, found via comparison against `d3d8to9` -- missing default vertex format on device creation
+
+User confirmed: the game works fine with the real system `d3d8.dll`, *and* with `d3d8to9` (a well-known, mature D3D8-on-D3D9 compatibility wrapper). That rules out a game-side/OS-compatibility issue definitively -- this is a genuine behavioral gap in this implementation.
+
+Fetched `d3d8to9`'s source (`d3d8to9_base.cpp`, `Direct3D8::CreateDevice`) for comparison. Its last action before returning the newly-created device to the caller: `DeviceInterface->SetFVF(D3DFVF_XYZ);` -- it explicitly primes the device with a default vertex format. This means **a freshly created real D3D8 device already has `D3DFVF_XYZ` (untransformed position-only) active**, not "no format set." Our `Device` never did this: `bound_vertex_shader_` defaults to `0` with *no* corresponding entry in `vertex_shaders_` (populated lazily, only on an actual `SetVertexShader` call) -- a real, observable difference from what every other implementation apparently provides. If a game inspects or relies on a default format being active before it ever calls `SetVertexShader`/`SetFVF` itself (plausible immediately after `CreateDevice` returns, matching exactly where the crash was pinned down to), this exact gap would explain it.
+
+Fixed: `Device::Init` now calls `SetVertexShader(D3DFVF_XYZ)` right before returning, after `InitRootSignatures()` -- this both sets `bound_vertex_shader_` to a valid, real handle *and* creates the corresponding fixed-function `VertexShader` entry in `vertex_shaders_`, matching the state a real D3D8 device is documented/observed to start in.
+
+**Not yet confirmed against a real run** -- needs a retest. If this doesn't resolve it, the `d3d8to9` source is now a proven-useful comparison point for chasing whatever's next -- worth diffing more of its `CreateDevice`/`Reset` path against ours if this specific fix isn't sufficient (e.g. it also does its own present-parameter translation and depth-stencil-format handling that might differ from what we do).
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
