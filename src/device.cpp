@@ -1753,6 +1753,10 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
       d3d12_prim_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
       break;
     case D3DPT_LINELIST:
+    case D3DPT_LINESTRIP:
+      // The PSO's topology *type* only distinguishes point/line/triangle/
+      // patch, not list vs strip -- that's set per-draw via
+      // IASetPrimitiveTopology, so list and strip share a PSO type.
       d3d12_prim_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
       break;
     case D3DPT_TRIANGLELIST:
