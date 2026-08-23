@@ -187,6 +187,14 @@ Following up on the earlier hypothesis: the actual root cause looks like `Device
 
 Removed the `ResizeTarget` call entirely; `ResizeBuffers` alone is sufficient to make the swap chain match the window's existing size (we're not the one deciding the window should move). **Not yet confirmed against a real run** -- needs a retest.
 
+## The `ResizeTarget` fix did NOT resolve it -- retest with corrected diagnostics, still open
+
+Retested after removing `ResizeTarget`: **same crash**, still right after `"Resetting device: Submitting commands.."`, `gta-vc.exe+0x23c54e` reading address `0x28`. Ruled out `ResizeTarget` as the cause (or at least as *the whole* cause) -- worth keeping the removal regardless (still correct per the DXGI docs reasoning), but it wasn't sufficient.
+
+Also fixed the crash handler's own bug that produced misleading earlier stack traces: `CaptureStackBackTrace()` called plainly captures the *handler's own* call stack, not the faulted thread's -- switched to walking the EBP chain from `EXCEPTION_POINTERS::ContextRecord->Ebp` (the actual faulted register state), reading through a `__try`/`__except`-guarded helper so a corrupted stack can't cause a second crash inside the handler. This retest's data is trustworthy, and it shows: at the crash, `Ebp` itself is `0x4e3` -- far too small to be a real stack address, meaning either the function at `gta-vc.exe+0x23c54e` doesn't use conventional EBP frame chaining (plausible: `/Oy` frame-pointer omission is common in Release-optimized commercial code from this era) or something register-level is already corrupted by this point. Either way, EBP-walking can't help for *this specific* fault, and there's no PDB for the game's own exe to symbolicate it even if it could.
+
+Since log-reading alone has hit its limit here, added fine-grained `LOG(INFO)` checkpoints around every individual D3D12/DXGI call inside `SubmitAndWait`/`WaitForFrame` (`Close`, `ExecuteCommandLists`, `Present`, `Signal`, `GetCurrentBackBufferIndex`, the fence wait, allocator/list `Reset`) -- deliberately noisy, meant to be removed once this is resolved. The next crash log will show the last-logged checkpoint immediately before the crash, which pins down *which specific call* triggers it, even though the fault itself lands in un-symbolicated game code.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
