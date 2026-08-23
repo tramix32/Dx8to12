@@ -128,29 +128,33 @@ static SourceParamToken ParseSourceParamToken(const DWORD** ptr,
   }
 #endif
 
-  os << "(";
+  // Build the raw register+swizzle expression separately from the
+  // modification wrapping below -- some modifiers (e.g. the complement
+  // "1-x") need to wrap the whole expression, not just append a suffix, so
+  // we can't stream straight into `os` until the modifier is known.
+  std::ostringstream reg_os;
   switch (reg_type) {
     case D3DSPR_TEMP:
       ASSERT(reg_number < kMaxNumTempRegs);
-      os << kTempRegName << "[" << reg_number << "]";
+      reg_os << kTempRegName << "[" << reg_number << "]";
       break;
     case D3DSPR_INPUT:
       ASSERT(reg_number < 16);
-      os << "IN." << kInputRegName << reg_number;
+      reg_os << "IN." << kInputRegName << reg_number;
       break;
     case D3DSPR_CONST:
       ASSERT(reg_number < kMaxNumConstRegs);
       if (is_relative_mode) {
-        os << "c[addr_reg.x + " << reg_number << "]";
+        reg_os << "c[addr_reg.x + " << reg_number << "]";
       } else {
-        os << "c[" << reg_number << "]";
+        reg_os << "c[" << reg_number << "]";
       }
       break;
     case D3DSPR_RASTOUT:
-      os << "OUT.";
+      reg_os << "OUT.";
       switch (reg_number) {
         case D3DSRO_POSITION:
-          os << "oPos";
+          reg_os << "oPos";
           break;
         case D3DSRO_FOG:
           printf("TODO: Support fog output.\n");
@@ -165,18 +169,18 @@ static SourceParamToken ParseSourceParamToken(const DWORD** ptr,
       break;
     case D3DSPR_ATTROUT:
       ASSERT(reg_number < 2);
-      os << "OUT.oD" << reg_number;
+      reg_os << "OUT.oD" << reg_number;
       break;
     case D3DSPR_TEXCRDOUT:
       ASSERT(reg_number < 8);
-      os << "OUT.oT" << reg_number;
+      reg_os << "OUT.oT" << reg_number;
       break;
     case D3DSPR_ADDR:  // Same as D3DSPR_TEXTURE
       // Differentiate between tex and address based on relative bit?
       if (is_relative_mode) {
         FAIL("TODO: Use address reg as source?");
       } else {
-        os << "t" << reg_number;
+        reg_os << "t" << reg_number;
       }
       break;
     default:
@@ -186,35 +190,62 @@ static SourceParamToken ParseSourceParamToken(const DWORD** ptr,
 
   // Parse the swizzle.
   uint32_t swizzle = (token & D3DSP_SWIZZLE_MASK) >> D3DSP_SWIZZLE_SHIFT;
-  os << ".";
+  reg_os << ".";
   for (int i = 0; i < 4; ++i, swizzle >>= 2) {
     switch (swizzle & 0x3) {
       case 0:
-        os << "x";
+        reg_os << "x";
         break;
       case 1:
-        os << "y";
+        reg_os << "y";
         break;
       case 2:
-        os << "z";
+        reg_os << "z";
         break;
       case 3:
-        os << "w";
+        reg_os << "w";
         break;
     }
   }
+
+  const std::string reg_str = reg_os.str();
   result.modification = token & D3DSP_SRCMOD_MASK;
   switch (result.modification) {
     case D3DSPSM_NONE:
+      os << "(" << reg_str << ")";
       break;
     case D3DSPSM_NEG:
-      os << "*-1";
+      os << "(-(" << reg_str << "))";
+      break;
+    case D3DSPSM_BIAS:
+      os << "((" << reg_str << ") - 0.5)";
+      break;
+    case D3DSPSM_BIASNEG:
+      os << "(0.5 - (" << reg_str << "))";
+      break;
+    case D3DSPSM_SIGN:
+      os << "(2.0 * (" << reg_str << ") - 1.0)";
+      break;
+    case D3DSPSM_SIGNNEG:
+      os << "(1.0 - 2.0 * (" << reg_str << "))";
+      break;
+    case D3DSPSM_COMP:
+      os << "(1.0 - (" << reg_str << "))";
+      break;
+    case D3DSPSM_X2:
+      os << "(2.0 * (" << reg_str << "))";
+      break;
+    case D3DSPSM_X2NEG:
+      os << "(-2.0 * (" << reg_str << "))";
       break;
     default:
+      // D3DSPSM_DZ/D3DSPSM_DW (divide the other components through by this
+      // source's z/w component) are genuinely rare (texm3x2tex-style
+      // instructions) and need per-component access rather than a simple
+      // wrap -- not implemented.
       FAIL("Unexpected modification %d",
            result.modification >> D3DSP_SRCMOD_SHIFT);
   }
-  os << ")";
 
   return result;
 }
