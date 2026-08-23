@@ -50,8 +50,12 @@ SamplerDesc::SamplerDesc(const TextureStageState &ts) {
       .MaxAnisotropy = ts.max_anisotropy,
       .ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS,
       .BorderColor = {border.r, border.g, border.b, border.a},
-      .MinLOD = 0.f,      // TODO
-      .MaxLOD = 0.f       // TODO
+      .MinLOD = 0.f,
+      // D3DTEXF_NONE for the mip filter means "don't blend between mip
+      // levels" -- clamp to the single most-detailed level. Otherwise allow
+      // the full chain; the GPU picks the appropriate level per-pixel based
+      // on screen-space derivatives, same as real D3D8 hardware would.
+      .MaxLOD = ts.mip_filter == D3DTEXF_NONE ? 0.f : D3D12_FLOAT32_MAX,
   };
 }
 
