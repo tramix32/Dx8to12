@@ -174,6 +174,8 @@ DWORD &TextureStageState::GetAtIndex(size_t index) {
       return reinterpret_cast<DWORD &>(address_u);
     case D3DTSS_ADDRESSV:
       return reinterpret_cast<DWORD &>(address_v);
+    case D3DTSS_BORDERCOLOR:
+      return border_color;
     case D3DTSS_MAGFILTER:
       return reinterpret_cast<DWORD &>(mag_filter);
     case D3DTSS_MINFILTER:

@@ -938,7 +938,9 @@ HRESULT STDMETHODCALLTYPE Device::GetRenderState(D3DRENDERSTATETYPE State,
 
 HRESULT STDMETHODCALLTYPE Device::GetTextureStageState(
     DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD *pValue) {
-  NOT_IMPLEMENTED();
+  if (Stage >= texture_stage_states_.size()) return D3DERR_INVALIDCALL;
+  *pValue = texture_stage_states_[Stage].GetAtIndex(static_cast<size_t>(Type));
+  return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Device::SetTextureStageState(
@@ -949,6 +951,83 @@ HRESULT STDMETHODCALLTYPE Device::SetTextureStageState(
     dirty_flags_ |= DIRTY_FLAG_PS_SAMPLERS;
   }
   texture_stage_states_[Stage].GetAtIndex(static_cast<size_t>(Type)) = Value;
+  return S_OK;
+}
+
+Device::StateBlock Device::CaptureCurrentState() const {
+  return StateBlock{
+      .render_state = render_state_,
+      .texture_stage_states = texture_stage_states_,
+      .transforms = transforms_,
+      .material = material_,
+      .lights = lights_,
+      .enabled_lights = enabled_lights_,
+      .bound_textures = bound_textures_,
+      .bound_vertex_shader = bound_vertex_shader_,
+      .bound_pixel_shader = bound_pixel_shader_,
+      .bound_vs_cregs = bound_vs_cregs_,
+  };
+}
+
+void Device::ApplyState(const StateBlock &block) {
+  render_state_ = block.render_state;
+  texture_stage_states_ = block.texture_stage_states;
+  transforms_ = block.transforms;
+  material_ = block.material;
+  lights_ = block.lights;
+  enabled_lights_ = block.enabled_lights;
+  bound_textures_ = block.bound_textures;
+  bound_vertex_shader_ = block.bound_vertex_shader;
+  bound_pixel_shader_ = block.bound_pixel_shader;
+  bound_vs_cregs_ = block.bound_vs_cregs;
+  // Force everything above to actually get re-bound/re-uploaded before the
+  // next draw call, since we just changed it out from under the renderer.
+  dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
+}
+
+HRESULT STDMETHODCALLTYPE Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type,
+                                                   DWORD *pToken) {
+  // Simplification: always captures the full state snapshot regardless of
+  // Type (D3DSBT_ALL/D3DSBT_PIXELSTATE/D3DSBT_VERTEXSTATE) -- see the
+  // StateBlock comment in device.h.
+  *pToken = next_state_block_token_++;
+  state_blocks_[*pToken] = CaptureCurrentState();
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::BeginStateBlock() {
+  if (recording_state_block_) return D3DERR_INVALIDCALL;
+  recording_state_block_ = true;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::EndStateBlock(DWORD *pToken) {
+  if (!recording_state_block_) return D3DERR_INVALIDCALL;
+  recording_state_block_ = false;
+  // Simplification: captures the full live state as of now, rather than only
+  // the states actually Set() during the Begin/End window -- see the
+  // StateBlock comment in device.h.
+  *pToken = next_state_block_token_++;
+  state_blocks_[*pToken] = CaptureCurrentState();
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::ApplyStateBlock(DWORD Token) {
+  auto it = state_blocks_.find(Token);
+  if (it == state_blocks_.end()) return D3DERR_INVALIDCALL;
+  ApplyState(it->second);
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::CaptureStateBlock(DWORD Token) {
+  auto it = state_blocks_.find(Token);
+  if (it == state_blocks_.end()) return D3DERR_INVALIDCALL;
+  it->second = CaptureCurrentState();
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::DeleteStateBlock(DWORD Token) {
+  if (state_blocks_.erase(Token) == 0) return D3DERR_INVALIDCALL;
   return S_OK;
 }
 

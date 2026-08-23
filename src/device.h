@@ -202,15 +202,13 @@ class Device : public IDirect3DDevice8, RefCounted {
                                                    DWORD Value) override;
   virtual HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State,
                                                    DWORD *pValue) override;
-  virtual HRESULT STDMETHODCALLTYPE BeginStateBlock(THIS) PURE;
-  virtual HRESULT STDMETHODCALLTYPE EndStateBlock(DWORD *pToken) PURE;
-  virtual HRESULT STDMETHODCALLTYPE ApplyStateBlock(DWORD Token) PURE;
-  virtual HRESULT STDMETHODCALLTYPE CaptureStateBlock(DWORD Token) PURE;
-  virtual HRESULT STDMETHODCALLTYPE DeleteStateBlock(DWORD Token) PURE;
+  virtual HRESULT STDMETHODCALLTYPE BeginStateBlock(THIS) override;
+  virtual HRESULT STDMETHODCALLTYPE EndStateBlock(DWORD *pToken) override;
+  virtual HRESULT STDMETHODCALLTYPE ApplyStateBlock(DWORD Token) override;
+  virtual HRESULT STDMETHODCALLTYPE CaptureStateBlock(DWORD Token) override;
+  virtual HRESULT STDMETHODCALLTYPE DeleteStateBlock(DWORD Token) override;
   virtual HRESULT STDMETHODCALLTYPE CreateStateBlock(D3DSTATEBLOCKTYPE Type,
-                                                     DWORD *pToken) override {
-    return S_OK;
-  }
+                                                     DWORD *pToken) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetClipStatus(CONST D3DCLIPSTATUS8 *pClipStatus) PURE;
   virtual HRESULT STDMETHODCALLTYPE
@@ -329,6 +327,34 @@ class Device : public IDirect3DDevice8, RefCounted {
   void FreeFrameResources(uint64_t frame_number);
 
   D3DMATRIX GetTransform(D3DTRANSFORMSTATETYPE state);
+
+  // A full snapshot of the fixed-function/shader-binding state that D3D8
+  // state blocks cover. Simplification: real D3D8 partitions state into
+  // D3DSBT_VERTEXSTATE/D3DSBT_PIXELSTATE/D3DSBT_ALL and, for a recorded
+  // (Begin/End) block, only includes states actually touched during
+  // recording. This always captures/restores everything below regardless of
+  // D3DSTATEBLOCKTYPE or what was touched during recording -- harmless for
+  // the common case (games save/restore a broad swath of state around an
+  // effect) but can restore more than a game expects if it relied on the
+  // precise partitioning.
+  struct StateBlock {
+    RenderState render_state;
+    std::array<TextureStageState, kMaxTexStages> texture_stage_states;
+    std::unordered_map<D3DTRANSFORMSTATETYPE, D3DMATRIX> transforms;
+    D3DMATERIAL8 material;
+    std::unordered_map<DWORD, D3DLIGHT8> lights;
+    std::unordered_set<DWORD> enabled_lights;
+    std::array<InternalPtr<GpuTexture>, kMaxTexStages> bound_textures;
+    DWORD bound_vertex_shader = 0;
+    DWORD bound_pixel_shader = 0;
+    std::vector<DirectX::SimpleMath::Vector4> bound_vs_cregs;
+  };
+  StateBlock CaptureCurrentState() const;
+  void ApplyState(const StateBlock &block);
+
+  std::unordered_map<DWORD, StateBlock> state_blocks_;
+  DWORD next_state_block_token_ = 1;
+  bool recording_state_block_ = false;
 
   int ref_count_;
 

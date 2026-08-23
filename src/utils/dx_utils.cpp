@@ -38,6 +38,7 @@ static D3D12_FILTER EncodeFilter(D3DTEXTUREFILTERTYPE min_filter,
 }
 
 SamplerDesc::SamplerDesc(const TextureStageState &ts) {
+  D3DCOLORVALUE border = Dx8::Color(ts.border_color).ToValue();
   *this = D3D12_SAMPLER_DESC{
       .Filter = EncodeFilter(ts.min_filter, ts.mag_filter, ts.mip_filter),
       // Luckily D3D12_TEXTURE_ADDRESS_MODE maps directly.
@@ -48,7 +49,7 @@ SamplerDesc::SamplerDesc(const TextureStageState &ts) {
       .MipLODBias = std::clamp(ts.mipmap_lod_bias, -16.f, 15.99f),
       .MaxAnisotropy = ts.max_anisotropy,
       .ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS,
-      .BorderColor = {},  // TODO
+      .BorderColor = {border.r, border.g, border.b, border.a},
       .MinLOD = 0.f,      // TODO
       .MaxLOD = 0.f       // TODO
   };
