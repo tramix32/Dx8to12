@@ -33,6 +33,8 @@ On Clang, warnings are treated as errors (`-Werror`); MSVC uses `/W4` with a cou
 
 Logging goes to `log.txt` next to the source tree (`CURRENT_SOURCE_DIR` baked in at compile time), via AixLog (`third_party/aixlog.hpp`).
 
+`dllmain.cpp` also installs a vectored exception handler (`AddVectoredExceptionHandler`) that logs a `=== Unhandled exception ===` block to `log.txt` — code, faulting address, and the module+offset it falls in — on native crashes (access violations, stack overflow, etc.) before letting the crash proceed normally. This catches crashes `ASSERT`/`FAIL`/`NOT_IMPLEMENTED()` can't, since those only fire on paths that are explicitly guarded. When a game crashes with no `FAIL`/`ASSERT` message in the log, check for this block first — it narrows down the faulting module/offset even when nothing on the D3D12 debug-layer side reported anything.
+
 ## Architecture
 
 ### Layer mapping

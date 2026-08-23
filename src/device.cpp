@@ -1264,9 +1264,22 @@ HRESULT STDMETHODCALLTYPE Device::CreateVertexShader(const DWORD *pDeclaration,
   }
 
   // Keep a copy of the original declaration token stream for
-  // GetVertexShaderDeclaration.
+  // GetVertexShaderDeclaration. Cap the scan for the D3DVSD_END() terminator
+  // so a malformed/corrupt declaration produces a clear, logged failure
+  // instead of walking off into unmapped memory looking for a token that
+  // isn't there.
+  static constexpr ptrdiff_t kMaxDeclarationTokens = 512;
   const DWORD *decl_end = pDeclaration;
-  while (*decl_end != D3DVSD_END()) ++decl_end;
+  while (*decl_end != D3DVSD_END()) {
+    if (decl_end - pDeclaration >= kMaxDeclarationTokens) {
+      FAIL(
+          "CreateVertexShader: declaration token stream did not terminate "
+          "with D3DVSD_END() within %td tokens; pDeclaration=%p is likely "
+          "invalid.",
+          kMaxDeclarationTokens, pDeclaration);
+    }
+    ++decl_end;
+  }
   ++decl_end;  // Include the END token itself.
   shader.declaration_tokens.assign(pDeclaration, decl_end);
 
@@ -1963,6 +1976,9 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
     UINT NumVertexIndices, UINT PrimitiveCount, CONST void *pIndexData,
     D3DFORMAT IndexDataFormat, CONST void *pVertexStreamZeroData,
     UINT VertexStreamZeroStride) {
+  TRACE_ENTRY(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount,
+             pIndexData, IndexDataFormat, pVertexStreamZeroData,
+             VertexStreamZeroStride);
   if (!bound_vertex_shader_) {
     LOG_ERROR()
         << "Cannot use DrawIndexedPrimitiveUP without a vertex shader.\n";
@@ -1971,6 +1987,15 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
   if (IndexDataFormat != D3DFMT_INDEX16 && IndexDataFormat != D3DFMT_INDEX32) {
     LOG_ERROR() << "Invalid IndexDataFormat for DrawIndexedPrimitiveUP: "
                 << IndexDataFormat << "\n";
+    return D3DERR_INVALIDCALL;
+  }
+  if (pIndexData == nullptr || pVertexStreamZeroData == nullptr ||
+      VertexStreamZeroStride == 0) {
+    LOG_ERROR() << "Invalid DrawIndexedPrimitiveUP arguments: pIndexData="
+                << pIndexData << " pVertexStreamZeroData="
+                << pVertexStreamZeroData
+                << " VertexStreamZeroStride=" << VertexStreamZeroStride
+                << "\n";
     return D3DERR_INVALIDCALL;
   }
   // Not supported: PrepareDrawCall rejects fans outright, and rewriting a fan
