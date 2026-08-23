@@ -47,6 +47,71 @@ static DXGI_FORMAT ToFlipModelSwapChainFormat(DXGI_FORMAT format) {
   return format;
 }
 
+// Backs IDirect3DDevice8::CreateAdditionalSwapChain. Only a thin wrapper: its
+// backbuffers are plain GpuTextures/GpuSurfaces, so the app renders to them
+// through the normal Device::SetRenderTarget/Draw*/etc. path -- this class
+// only needs to own the second DXGI swap chain and know how to flush +
+// present it, reusing Device's existing command-submission machinery rather
+// than duplicating it.
+class AdditionalSwapChain : public IDirect3DSwapChain8, public RefCounted {
+ public:
+  AdditionalSwapChain(Device *device, ComPtr<IDXGISwapChain3> swap_chain,
+                      std::vector<ComPtr<GpuTexture>> back_buffers)
+      : device_(device),
+        swap_chain_(std::move(swap_chain)),
+        back_buffers_(std::move(back_buffers)),
+        current_index_(swap_chain_->GetCurrentBackBufferIndex()) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void **ppvObj) override {
+    if (riid == IID_IUnknown || riid == IID_IDirect3DSwapChain8) {
+      *ppvObj = static_cast<IDirect3DSwapChain8 *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppvObj = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return RefCounted::AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    return RefCounted::Release();
+  }
+
+  HRESULT STDMETHODCALLTYPE Present(CONST RECT *pSourceRect,
+                                    CONST RECT *pDestRect,
+                                    HWND hDestWindowOverride,
+                                    CONST RGNDATA *pDirtyRegion) override {
+    // Same simplifications as Device::Present: no partial-rect presentation.
+    ASSERT(pSourceRect == nullptr && pDestRect == nullptr &&
+           pDirtyRegion == nullptr);
+    (void)hDestWindowOverride;
+    device_->TransitionTexture(back_buffers_[current_index_].get(), 0,
+                               D3D12_RESOURCE_STATE_PRESENT);
+    // Flush the shared command list (without presenting the *primary* swap
+    // chain), then present this one specifically.
+    device_->SubmitAndWait(false);
+    ASSERT_HR(swap_chain_->Present(1, 0));
+    current_index_ = swap_chain_->GetCurrentBackBufferIndex();
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetBackBuffer(UINT BackBuffer,
+                                          D3DBACKBUFFER_TYPE Type,
+                                          IDirect3DSurface8 **ppBackBuffer)
+      override {
+    ASSERT(Type == D3DBACKBUFFER_TYPE_MONO);
+    if (BackBuffer >= back_buffers_.size()) return D3DERR_INVALIDCALL;
+    *ppBackBuffer = new GpuSurface(device_, back_buffers_[BackBuffer].get(), 0);
+    return S_OK;
+  }
+
+ private:
+  Device *device_;
+  ComPtr<IDXGISwapChain3> swap_chain_;
+  std::vector<ComPtr<GpuTexture>> back_buffers_;
+  UINT current_index_;
+};
+
 // Implements the standard D3D8 "query size, then fetch" pattern used by
 // GetVertexShaderDeclaration/GetVertexShaderFunction/GetPixelShaderFunction:
 // if pData is null, just report the required size; otherwise copy up to
@@ -339,11 +404,18 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   DXGI_FORMAT new_format = ToFlipModelSwapChainFormat(
       DXGIFromD3DFormat(pPresentationParameters->BackBufferFormat));
 
-  DXGI_MODE_DESC mode_desc{.Width = pPresentationParameters->BackBufferWidth,
-                           .Height = pPresentationParameters->BackBufferHeight,
-                           .Format = new_format};
-
-  ASSERT_HR(swap_chain_->ResizeTarget(&mode_desc));
+  // Deliberately not calling IDXGISwapChain::ResizeTarget here: for a
+  // windowed swap chain (this codebase never calls SetFullscreenState, so
+  // that's always the case), ResizeTarget actually moves/resizes the target
+  // *window* itself via SetWindowPos -- real D3D8 never touched the app's
+  // window like that. That SetWindowPos synchronously dispatches
+  // WM_WINDOWPOSCHANGING/CHANGED/SIZE to the window's own WndProc, and a
+  // real crash log (GTA: Vice City) showed exactly this: our code calling
+  // into the game's WndProc during this Reset, which then null-derefs
+  // because the game evidently isn't ready to handle a resize message this
+  // early in its own init sequence. ResizeBuffers alone is enough to make
+  // the swap chain match the window's existing size -- we're not the one
+  // deciding the window should move or resize.
   ASSERT_HR(swap_chain_->ResizeBuffers(
       2, pPresentationParameters->BackBufferWidth,
       pPresentationParameters->BackBufferHeight, new_format, 0));
@@ -356,8 +428,9 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
     ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32);
     depth_stencil_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
-        this, TextureKind::Texture2d, mode_desc.Width, mode_desc.Height, 1, 1,
-        D3DUSAGE_DEPTHSTENCIL, depth_format, D3DPOOL_DEFAULT)));
+        this, TextureKind::Texture2d, pPresentationParameters->BackBufferWidth,
+        pPresentationParameters->BackBufferHeight, 1, 1, D3DUSAGE_DEPTHSTENCIL,
+        depth_format, D3DPOOL_DEFAULT)));
     depth_stencil_tex_->SetName("depth_stencil_tex");
     bound_depth_target_ = InternalPtr(depth_stencil_tex_.Get());
     // See the matching comment in Init(): D3DRS_ZENABLE defaults to
@@ -744,6 +817,54 @@ HRESULT STDMETHODCALLTYPE Device::CreateImageSurface(
   if (!texture) return D3DERR_INVALIDCALL;
   ComPtr<BaseTexture> owned_texture = ComOwn(texture);
   return owned_texture->GetSurfaceLevel(0, ppSurface);
+}
+
+HRESULT STDMETHODCALLTYPE Device::CreateAdditionalSwapChain(
+    D3DPRESENT_PARAMETERS *pPresentationParameters,
+    IDirect3DSwapChain8 **pSwapChain) {
+  TRACE_ENTRY(pPresentationParameters, pSwapChain);
+  // D3D8 lets an additional swap chain target a different window than the
+  // device's primary one (D3DPRESENT_PARAMETERS::hDeviceWindow); fall back to
+  // the primary window if the caller didn't specify one, matching how the
+  // primary swap chain itself is created.
+  HWND target_window = pPresentationParameters->hDeviceWindow
+                           ? pPresentationParameters->hDeviceWindow
+                           : window_;
+
+  DXGI_SWAP_CHAIN_DESC1 swap_chain_desc{
+      .Width = pPresentationParameters->BackBufferWidth,
+      .Height = pPresentationParameters->BackBufferHeight,
+      .Format = ToFlipModelSwapChainFormat(
+          DXGIFromD3DFormat(pPresentationParameters->BackBufferFormat)),
+      .SampleDesc = {.Count = 1, .Quality = 0},
+      .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+      .BufferCount = kNumBackBuffers,
+      .Scaling = DXGI_SCALING_NONE,
+      .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+  };
+  ComPtr<IDXGISwapChain1> swap_chain1;
+  HR_OR_RETURN(dxgi_factory_->CreateSwapChainForHwnd(
+      cmd_queue_.get(), target_window, &swap_chain_desc, nullptr, nullptr,
+      swap_chain1.GetForInit()));
+  ComPtr<IDXGISwapChain3> swap_chain3;
+  ASSERT_HR(swap_chain1->QueryInterface(swap_chain3.GetForInit()));
+  // See the matching comment in Init() -- opt out of DXGI's automatic
+  // window monitoring for this window too.
+  ASSERT_HR(dxgi_factory_->MakeWindowAssociation(
+      target_window, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER |
+                         DXGI_MWA_NO_PRINT_SCREEN));
+
+  std::vector<ComPtr<GpuTexture>> back_buffers;
+  for (uint32_t i = 0; i < swap_chain_desc.BufferCount; ++i) {
+    ComPtr<ID3D12Resource> resource;
+    ASSERT_HR(
+        swap_chain3->GetBuffer(i, IID_PPV_ARGS(resource.GetForInit())));
+    back_buffers.push_back(ComOwn(GpuTexture::InitFromResource(this, resource)));
+  }
+
+  *pSwapChain = new AdditionalSwapChain(this, std::move(swap_chain3),
+                                        std::move(back_buffers));
+  return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE

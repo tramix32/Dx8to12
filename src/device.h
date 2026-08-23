@@ -118,7 +118,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual BOOL STDMETHODCALLTYPE ShowCursor(BOOL bShow) override;
   virtual HRESULT STDMETHODCALLTYPE
   CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS *pPresentationParameters,
-                            IDirect3DSwapChain8 **pSwapChain) PURE;
+                            IDirect3DSwapChain8 **pSwapChain) override;
   virtual HRESULT STDMETHODCALLTYPE
   Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) override;
   virtual HRESULT STDMETHODCALLTYPE
