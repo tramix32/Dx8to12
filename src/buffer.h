@@ -44,6 +44,9 @@ class Buffer : public IDirect3DVertexBuffer8,
   ID3D12Resource* resource();
   D3D12_RESOURCE_DESC resource_desc() const { return resource_desc_; }
 
+  D3D12_RESOURCE_STATES current_state() const { return current_state_; }
+  void set_state(D3D12_RESOURCE_STATES state) { current_state_ = state; }
+
   DXGI_FORMAT index_buffer_fmt() const {
     ASSERT(index_buffer_fmt_ != DXGI_FORMAT_UNKNOWN);
     return index_buffer_fmt_;
@@ -114,6 +117,7 @@ class Buffer : public IDirect3DVertexBuffer8,
   DXGI_FORMAT index_buffer_fmt_ = DXGI_FORMAT_UNKNOWN;
   int size_ = 0;
   DWORD priority_ = 0;
+  D3D12_RESOURCE_STATES current_state_ = D3D12_RESOURCE_STATE_COMMON;
 
 #ifdef DX8TO12_ENABLE_VALIDATION
   std::wstring name_;

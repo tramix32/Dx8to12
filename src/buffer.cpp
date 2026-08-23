@@ -261,7 +261,7 @@ void DynamicBuffer::PersistDynamicChanges() {
   ASSERT(current_ring_alloc_.size > 0);
   ASSERT(written_ranges_.ranges.size() == 1);
   for (auto [offset, size] : written_ranges_.ranges) {
-    device_->CopyBuffer(resource(), 0,
+    device_->CopyBuffer(this, 0,
                         device_->dynamic_ring_buffer()->GetBackingResource(),
                         current_ring_alloc_.offset + offset, size);
   }

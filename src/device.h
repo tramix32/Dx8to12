@@ -58,13 +58,21 @@ class Device : public IDirect3DDevice8, RefCounted {
   }
 
   uint64_t CurrentFrame() const;
-  void CopyBuffer(ID3D12Resource *dest, int64_t dest_offset,
-                  ID3D12Resource *src, int64_t src_offset, int64_t num_bytes);
+  void CopyBuffer(Buffer *dest, int64_t dest_offset, ID3D12Resource *src,
+                  int64_t src_offset, int64_t num_bytes);
   void CopyBufferToTexture(GpuTexture *dest, uint32_t dest_subresource,
                            ID3D12Resource *src,
                            D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint);
   void TransitionTexture(GpuTexture *texture, uint32_t subresource,
                          D3D12_RESOURCE_STATES state_after);
+  // Buffers (vertex/index) rely on D3D12's implicit state promotion from
+  // COMMON for read usages, but that promotion is tracked/validated per
+  // command list and does NOT cover write usages like being a
+  // CopyBufferRegion destination (see DynamicBuffer::PersistDynamicChanges).
+  // Track each Buffer's state explicitly (mirroring TransitionTexture) so a
+  // buffer written-to-after-being-drawn-from in the same command list gets a
+  // correct StateBefore instead of tripping the D3D12 debug layer.
+  void TransitionBuffer(Buffer *buffer, D3D12_RESOURCE_STATES state_after);
 
   // Marks a dynamic buffer that needs to be persisted at the end of the frame.
   void MarkBufferForPersist(Buffer *buffer);

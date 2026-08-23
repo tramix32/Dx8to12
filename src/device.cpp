@@ -954,16 +954,24 @@ void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
   MarkResourceAsUsed(InternalPtr(texture));
 }
 
-void Device::CopyBuffer(ID3D12Resource *dest, int64_t dest_offset,
+void Device::TransitionBuffer(Buffer *buffer,
+                              D3D12_RESOURCE_STATES state_after) {
+  if (buffer->current_state() == state_after) return;
+  D3D12_RESOURCE_BARRIER barrier = CreateBufferTransition(
+      buffer->resource(), buffer->current_state(), state_after);
+  cmd_list_->ResourceBarrier(1, &barrier);
+  buffer->set_state(state_after);
+}
+
+void Device::CopyBuffer(Buffer *dest, int64_t dest_offset,
                         ID3D12Resource *src, int64_t src_offset,
                         int64_t num_bytes) {
-  cmd_list_->CopyBufferRegion(dest, static_cast<UINT64>(dest_offset), src,
+  TransitionBuffer(dest, D3D12_RESOURCE_STATE_COPY_DEST);
+  cmd_list_->CopyBufferRegion(dest->resource(),
+                              static_cast<UINT64>(dest_offset), src,
                               static_cast<UINT64>(src_offset),
                               static_cast<UINT64>(num_bytes));
-  // Transition destination back to common.
-  D3D12_RESOURCE_BARRIER barrier = CreateBufferTransition(
-      dest, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-  cmd_list_->ResourceBarrier(1, &barrier);
+  TransitionBuffer(dest, D3D12_RESOURCE_STATE_COMMON);
 }
 
 void Device::CopyBufferToTexture(
@@ -1914,6 +1922,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
       auto &d3d_buffer = bound_vertex_streams_[i];
       if (d3d_buffer) {
         Buffer *buffer = static_cast<Buffer *>(d3d_buffer.Get());
+        TransitionBuffer(buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         int stride = vertex_shader->decl.buffer_strides[i];
         vbuffer_views[i] = {.BufferLocation = buffer->GetGpuPtr(),
                             .SizeInBytes = static_cast<UINT>(
@@ -2207,6 +2216,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, minIndex + bound_base_vertex_,
                                NumVertices));
 
+  TransitionBuffer(bound_index_buffer_.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER);
   D3D12_INDEX_BUFFER_VIEW ib_view{
       .BufferLocation = bound_index_buffer_->GetGpuPtr(),
       .SizeInBytes = static_cast<UINT>(
