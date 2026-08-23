@@ -64,9 +64,15 @@ LONG WINAPI LogCrashAndContinueSearch(EXCEPTION_POINTERS *info) {
     default:
       return EXCEPTION_CONTINUE_SEARCH;
   }
+  // Thread ID is critical here: earlier investigation assumed this crash was
+  // "the next thing that runs after CreateDevice returns" purely because of
+  // log-line proximity, but that's only true if it's on the *same* thread.
+  // If some other thread crashes on its own schedule (e.g. an asset-loading
+  // or watchdog thread), the timing correlation would be coincidental.
   LOG(AixLog::Severity::fatal)
       << "=== Unhandled exception 0x" << std::hex << record->ExceptionCode
-      << std::dec << " at " << record->ExceptionAddress << " ===\n";
+      << std::dec << " at " << record->ExceptionAddress << " on thread "
+      << GetCurrentThreadId() << " ===\n";
   if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
       record->NumberParameters >= 2) {
     const char *kind = record->ExceptionInformation[0] == 1   ? "writing"
@@ -134,8 +140,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                                           CURRENT_SOURCE_DIR "/log.txt");
       AddVectoredExceptionHandler(1 /* call first */,
                                   LogCrashAndContinueSearch);
+      LOG(AixLog::Severity::info)
+          << "DLL_PROCESS_ATTACH on thread " << GetCurrentThreadId() << "\n";
       break;
     case DLL_THREAD_ATTACH:
+      // Cheap breadcrumb for the thread-ID cross-referencing above -- lets
+      // us see whether a crash on some other thread is one the game spun up
+      // itself vs. one of ours.
+      LOG(AixLog::Severity::info)
+          << "DLL_THREAD_ATTACH on thread " << GetCurrentThreadId() << "\n";
+      break;
     case DLL_THREAD_DETACH:
     case DLL_PROCESS_DETACH:
       break;

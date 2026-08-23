@@ -221,6 +221,14 @@ Fixed: `Device::Init` now calls `SetVertexShader(D3DFVF_XYZ)` right before retur
 
 **Not yet confirmed against a real run** -- needs a retest. If this doesn't resolve it, the `d3d8to9` source is now a proven-useful comparison point for chasing whatever's next -- worth diffing more of its `CreateDevice`/`Reset` path against ours if this specific fix isn't sufficient (e.g. it also does its own present-parameter translation and depth-stencil-format handling that might differ from what we do).
 
+## The `SetVertexShader(D3DFVF_XYZ)` fix had zero effect -- reconsidering whether this crash is even on the same thread
+
+Retested: **byte-for-byte identical crash** (`0x44584749`, `Ebp=0x4e3`, same offsets in the recursive fault) despite the default-vertex-format fix actually changing device state. That a real state change had *zero* observable effect on this crash's signature, combined with the crash reproducing with *exactly* the same address and register values across every single test run regardless of what's been changed in `Device`, is a strong signal this isn't "the game reading uninitialized/wrong device state" at all -- garbage reads from real memory corruption vary between runs (ASLR, allocation timing); a fixed, deterministic repro like this looks more like a *scheduling* coincidence than a causal one.
+
+Compared `d3d8to9`'s `Direct3DDevice8` constructor and `Reset()`/`Present()`/`TestCooperativeLevel()` too (also fetched from source) -- nothing else jumped out as a missing default (it also does no window subclassing or HWND-touching of any kind, for what that's worth re: the earlier `ResizeTarget`/`MakeWindowAssociation` theories).
+
+**New hypothesis**: the crash might be on a **different thread** than the one running `CreateDevice`, with the "right after CreateDevice returns" correlation being coincidental timing (both happen ~140-160ms into the process, independently) rather than causal -- e.g. an asset-loading or watchdog thread the game spins up on its own schedule, crashing on a genuine game-side (or unrelated) issue. Added `GetCurrentThreadId()` to the crash handler's log line, to `CreateDevice`'s "returning device to caller" checkpoint, and as a new breadcrumb on `DLL_THREAD_ATTACH` (so any thread the game creates around this time shows up in the log). **If the next log shows the crash on a different thread ID than `CreateDevice`'s, that redirects this investigation entirely** -- away from `Device`'s creation/reset sequence and toward whatever that other thread is doing.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:

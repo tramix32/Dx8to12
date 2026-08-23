@@ -300,7 +300,8 @@ HRESULT STDMETHODCALLTYPE Direct3D8::CreateDevice(
     return D3DERR_INVALIDDEVICE;
   }
   *ppReturnedDeviceInterface = device;
-  LOG(INFO) << "CreateDevice: returning device to caller\n";
+  LOG(INFO) << "CreateDevice: returning device to caller (thread "
+            << GetCurrentThreadId() << ")\n";
   return S_OK;
 }
 
