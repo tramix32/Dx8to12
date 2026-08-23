@@ -47,6 +47,23 @@ static DXGI_FORMAT ToFlipModelSwapChainFormat(DXGI_FORMAT format) {
   return format;
 }
 
+// Implements the standard D3D8 "query size, then fetch" pattern used by
+// GetVertexShaderDeclaration/GetVertexShaderFunction/GetPixelShaderFunction:
+// if pData is null, just report the required size; otherwise copy up to
+// whatever size the caller already put in *pSizeOfData.
+static HRESULT CopyOutTokenBuffer(const std::vector<DWORD> &tokens,
+                                  void *pData, DWORD *pSizeOfData) {
+  const DWORD available_bytes = safe_cast<DWORD>(tokens.size() * sizeof(DWORD));
+  if (pData == nullptr) {
+    *pSizeOfData = available_bytes;
+    return S_OK;
+  }
+  const DWORD bytes_to_copy = std::min(*pSizeOfData, available_bytes);
+  memcpy(pData, tokens.data(), bytes_to_copy);
+  *pSizeOfData = bytes_to_copy;
+  return S_OK;
+}
+
 Device::DirtyFlags &operator|=(Device::DirtyFlags &a, Device::DirtyFlags b) {
   a = static_cast<Device::DirtyFlags>(static_cast<uint32_t>(a) |
                                       static_cast<uint32_t>(b));
@@ -1246,6 +1263,13 @@ HRESULT STDMETHODCALLTYPE Device::CreateVertexShader(const DWORD *pDeclaration,
     shader = ParseProgrammableVertexShader(decl, pFunction);
   }
 
+  // Keep a copy of the original declaration token stream for
+  // GetVertexShaderDeclaration.
+  const DWORD *decl_end = pDeclaration;
+  while (*decl_end != D3DVSD_END()) ++decl_end;
+  ++decl_end;  // Include the END token itself.
+  shader.declaration_tokens.assign(pDeclaration, decl_end);
+
   ASSERT(next_shader_handle_ < UINT32_MAX);
   DWORD handle = next_shader_handle_++;
   ASSERT(handle >= kFirstShaderHandle);
@@ -1300,6 +1324,22 @@ HRESULT STDMETHODCALLTYPE Device::GetVertexShader(DWORD *pHandle) {
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetVertexShaderDeclaration(
+    DWORD Handle, void *pData, DWORD *pSizeOfData) {
+  if (Handle < kFirstShaderHandle || !vertex_shaders_.contains(Handle))
+    return D3DERR_INVALIDCALL;
+  return CopyOutTokenBuffer(vertex_shaders_.at(Handle)->declaration_tokens,
+                            pData, pSizeOfData);
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetVertexShaderFunction(
+    DWORD Handle, void *pData, DWORD *pSizeOfData) {
+  if (Handle < kFirstShaderHandle || !vertex_shaders_.contains(Handle))
+    return D3DERR_INVALIDCALL;
+  return CopyOutTokenBuffer(vertex_shaders_.at(Handle)->function_tokens,
+                            pData, pSizeOfData);
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetPixelShader(DWORD Handle) {
   if (Handle != 0 && !pixel_shaders_.contains(Handle))
     return D3DERR_INVALIDCALL;
@@ -1310,6 +1350,14 @@ HRESULT STDMETHODCALLTYPE Device::SetPixelShader(DWORD Handle) {
 HRESULT STDMETHODCALLTYPE Device::GetPixelShader(DWORD *pHandle) {
   *pHandle = bound_pixel_shader_;
   return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetPixelShaderFunction(DWORD Handle,
+                                                         void *pData,
+                                                         DWORD *pSizeOfData) {
+  if (!pixel_shaders_.contains(Handle)) return D3DERR_INVALIDCALL;
+  return CopyOutTokenBuffer(pixel_shaders_.at(Handle)->function_tokens, pData,
+                            pSizeOfData);
 }
 
 HRESULT STDMETHODCALLTYPE Device::SetVertexShaderConstant(

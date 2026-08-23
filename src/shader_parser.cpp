@@ -302,8 +302,10 @@ static const char* GetFuncStr(D3DSHADER_INSTRUCTION_OPCODE_TYPE opcode) {
   }
 }
 
-static void ParseShader(bool is_pixel_shader, const DWORD* ptr,
-                        std::stringstream& code) {
+// Returns a pointer just past the D3DSIO_END token, so callers can compute
+// the exact length (in DWORDs) of the token stream that was consumed.
+static const DWORD* ParseShader(bool is_pixel_shader, const DWORD* ptr,
+                                std::stringstream& code) {
   ASSERT(ptr != nullptr);
   // First token is always the version token.
   const int version_major = D3DSHADER_VERSION_MAJOR(*ptr);
@@ -420,6 +422,7 @@ static void ParseShader(bool is_pixel_shader, const DWORD* ptr,
       code << ";\n";
     }
   }
+  return ptr;
 }
 
 VertexShader ParseProgrammableVertexShader(const VertexShaderDeclaration& decl,
@@ -457,7 +460,7 @@ VertexShader ParseProgrammableVertexShader(const VertexShaderDeclaration& decl,
   auto fs = cmrc::Dx8to12_shaders::get_filesystem();
   auto prologue = fs.open("programmable_vs.hlsl");
   s << prologue.begin();
-  ParseShader(false, ptr, s);
+  const DWORD* function_end = ParseShader(false, ptr, s);
   s << "return OUT;\n}\n";
 
   const std::string code = s.str();
@@ -484,6 +487,7 @@ VertexShader ParseProgrammableVertexShader(const VertexShaderDeclaration& decl,
   ASSERT(errorBlob == nullptr);
 
   result.decl = decl;
+  result.function_tokens.assign(ptr, function_end);
   return result;
 }
 
@@ -491,7 +495,7 @@ PixelShader ParsePixelShader(const unsigned long* ptr) {
   std::stringstream ss;
   ss << std::dec;
   ss << "#include \"programmable_ps.hlsl\"\n";
-  ParseShader(true, ptr, ss);
+  const DWORD* function_end = ParseShader(true, ptr, ss);
   ss << "return temp_reg[0];\n}\n";
   const std::string code = ss.str();
 
@@ -517,6 +521,7 @@ PixelShader ParsePixelShader(const unsigned long* ptr) {
   }
   ASSERT(errorBlob == nullptr);
 
+  result.function_tokens.assign(ptr, function_end);
   return result;
 }
 

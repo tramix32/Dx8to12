@@ -284,9 +284,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE GetVertexShaderConstant(
       DWORD Register, void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE GetVertexShaderDeclaration(
-      DWORD Handle, void *pData, DWORD *pSizeOfData) PURE;
+      DWORD Handle, void *pData, DWORD *pSizeOfData) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetVertexShaderFunction(DWORD Handle, void *pData, DWORD *pSizeOfData) PURE;
+  GetVertexShaderFunction(DWORD Handle, void *pData, DWORD *pSizeOfData) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer8 *pStreamData,
                   UINT Stride) override;
@@ -308,7 +308,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE GetPixelShaderConstant(
       DWORD Register, void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetPixelShaderFunction(DWORD Handle, void *pData, DWORD *pSizeOfData) PURE;
+  GetPixelShaderFunction(DWORD Handle, void *pData, DWORD *pSizeOfData) override;
   virtual HRESULT STDMETHODCALLTYPE
   DrawRectPatch(UINT Handle, CONST float *pNumSegs,
                 CONST D3DRECTPATCH_INFO *pRectPatchInfo) PURE;

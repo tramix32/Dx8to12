@@ -102,10 +102,19 @@ struct VertexShader : public RefCounted {
   VertexShaderDeclaration decl;
   ComPtr<ID3DBlob> blob;
   DWORD fvf_desc;
+  // Copies of the original DX8 token streams passed to CreateVertexShader,
+  // for GetVertexShaderDeclaration/GetVertexShaderFunction. Empty for
+  // fixed-function shaders (no programmable function, and the declaration
+  // was synthesized from an FVF rather than a real token stream).
+  std::vector<DWORD> declaration_tokens;
+  std::vector<DWORD> function_tokens;
 };
 
 struct PixelShader : public RefCounted {
   ComPtr<ID3DBlob> blob;
+  // Copy of the original DX8 token stream passed to CreatePixelShader, for
+  // GetPixelShaderFunction.
+  std::vector<DWORD> function_tokens;
 };
 
 VertexShader CreateFixedFunctionVertexShader(
