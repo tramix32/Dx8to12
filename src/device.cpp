@@ -1839,25 +1839,38 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                         ? bound_depth_target_->resource_desc().Format
                         : DXGI_FORMAT_UNKNOWN};
 
-  // Some things don't get used here. (TODO: Move to PSOState constructor).
+  // Zero out/normalize every RenderState field that doesn't actually affect
+  // the D3D12_GRAPHICS_PIPELINE_STATE_DESC built below, isn't fed into any
+  // cbuffer at draw time, and doesn't influence which vertex/pixel shader
+  // gets selected (those already get their own distinct `vs`/`ps` blob
+  // pointers above, which the PSO key captures) -- otherwise every distinct
+  // value any of these fields ever take (e.g. D3DRS_ALPHAREF, commonly
+  // varied per-material for alpha-cutout objects like foliage/fences)
+  // produces a spurious *new* cache entry for what is, byte-for-byte, an
+  // identical PSO. Confirmed dead for PSO/shader-selection purposes by
+  // grepping every other use site in this file. This was previously mostly
+  // commented out (i.e. not actually applied) -- verified via a real,
+  // long GTA: Vice City session that accumulated 75,000+ live D3D12
+  // objects by the end (`pso_cache_`/`ps_cache_` never evict), degrading
+  // performance over time and eventually crashing outright.
   pso_key.rs.texture_factor = 0;
   pso_key.rs.ambient = 0;
   pso_key.rs.diffuse_material_source = pso_key.rs.specular_material_source =
       pso_key.rs.ambient_material_source = pso_key.rs.emissive_material_source =
           D3DMCS_MATERIAL;
-  // pso_key.rs.alpha_ref = 0;
-  // pso_key.rs.dither_enable = 0;
-  // pso_key.rs.fog_enable = 0;
-  // pso_key.rs.fog_color = 0;
-  // pso_key.rs.fog_table_mode = D3DFOG_NONE;
-  // pso_key.rs.fog_start = 0;
-  // pso_key.rs.fog_end = 0;
-  // pso_key.rs.fog_density = 0;
-  // pso_key.rs.range_fog_enable = 0;
-  // pso_key.rs.fog_vertex_mode = D3DFOG_NONE;
-  // pso_key.rs.color_vertex = 0;
-  // pso_key.rs.local_viewer = FALSE;
-  // pso_key.rs.normalized_normals = FALSE;
+  pso_key.rs.alpha_ref = 0;
+  pso_key.rs.dither_enable = 0;
+  pso_key.rs.fog_enable = 0;
+  pso_key.rs.fog_color = 0;
+  pso_key.rs.fog_table_mode = D3DFOG_NONE;
+  pso_key.rs.fog_start = 0;
+  pso_key.rs.fog_end = 0;
+  pso_key.rs.fog_density = 0;
+  pso_key.rs.range_fog_enable = 0;
+  pso_key.rs.fog_vertex_mode = D3DFOG_NONE;
+  pso_key.rs.color_vertex = 0;
+  pso_key.rs.local_viewer = FALSE;
+  pso_key.rs.normalized_normals = FALSE;
 
   auto pso_cache_iter = pso_cache_.find(pso_key);
   if (pso_cache_iter != pso_cache_.end()) {
