@@ -2,6 +2,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -47,6 +48,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   ID3D12Device *device() const { return d3d12_device_.get(); }
   ID3D12GraphicsCommandList *cmd_list() const { return cmd_list_.get(); }
   UINT sync_interval() const { return sync_interval_; }
+  bool tearing_supported() const { return tearing_supported_; }
   DescriptorPoolHeap &srv_heap() { return srv_heap_; }
   DescriptorPoolHeap *rtv_heap() { return &rtv_heap_; }
   DescriptorPoolHeap *dsv_heap() { return &dsv_heap_; }
@@ -356,16 +358,10 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   D3DMATRIX GetTransform(D3DTRANSFORMSTATETYPE state);
 
-  // A full snapshot of the fixed-function/shader-binding state that D3D8
-  // state blocks cover. Simplification: real D3D8 partitions state into
-  // D3DSBT_VERTEXSTATE/D3DSBT_PIXELSTATE/D3DSBT_ALL and, for a recorded
-  // (Begin/End) block, only includes states actually touched during
-  // recording. This always captures/restores everything below regardless of
-  // D3DSTATEBLOCKTYPE or what was touched during recording -- harmless for
-  // the common case (games save/restore a broad swath of state around an
-  // effect) but can restore more than a game expects if it relied on the
-  // precise partitioning.
-  struct StateBlock {
+  // Full snapshot of the fixed-function/shader-binding state, used as the
+  // "before" and "after" points that a Begin/EndStateBlock recording is
+  // diffed against -- see StateBlock below.
+  struct StateSnapshot {
     RenderState render_state;
     std::array<TextureStageState, kMaxTexStages> texture_stage_states;
     std::unordered_map<D3DTRANSFORMSTATETYPE, D3DMATRIX> transforms;
@@ -377,12 +373,46 @@ class Device : public IDirect3DDevice8, RefCounted {
     DWORD bound_pixel_shader = 0;
     std::vector<DirectX::SimpleMath::Vector4> bound_vs_cregs;
   };
-  StateBlock CaptureCurrentState() const;
+  StateSnapshot CaptureCurrentState() const;
+
+  // A sparse set of state changes, as recorded by a D3D8 state block. Real
+  // D3D8 state blocks only capture/restore the specific states that were
+  // actually Set() during recording (Begin/EndStateBlock) -- applying one
+  // must not clobber unrelated state that a game changed in between
+  // recording and applying. Building a full StateSnapshot instead (the
+  // previous implementation) restored *everything* back to how it was at
+  // recording time, which could stomp on legitimate state changes made after
+  // the block was recorded -- e.g. an ApplyStateBlock() call silently
+  // resetting D3DRS_ALPHABLENDENABLE to a stale value.
+  struct StateBlock {
+    std::unordered_map<D3DRENDERSTATETYPE, DWORD> render_state;
+    std::array<std::unordered_map<D3DTEXTURESTAGESTATETYPE, DWORD>,
+               kMaxTexStages>
+        texture_stage_states;
+    std::unordered_map<D3DTRANSFORMSTATETYPE, D3DMATRIX> transforms;
+    std::optional<D3DMATERIAL8> material;
+    std::unordered_map<DWORD, D3DLIGHT8> lights;
+    // Only present if any light's enabled/disabled status changed.
+    std::optional<std::unordered_set<DWORD>> enabled_lights;
+    std::array<std::optional<InternalPtr<GpuTexture>>, kMaxTexStages>
+        bound_textures;
+    std::optional<DWORD> bound_vertex_shader;
+    std::optional<DWORD> bound_pixel_shader;
+    std::unordered_map<UINT, DirectX::SimpleMath::Vector4> bound_vs_cregs;
+  };
+  // Every state, unconditionally marked as "touched" -- used for
+  // CreateStateBlock(), which (unlike Begin/EndStateBlock) always snapshots
+  // the full live state regardless of D3DSTATEBLOCKTYPE partitioning.
+  StateBlock CaptureFullStateBlock() const;
+  // Only the states that differ between `before` and the current live state
+  // -- used for Begin/EndStateBlock() recordings.
+  StateBlock CaptureStateBlockDelta(const StateSnapshot &before) const;
   void ApplyState(const StateBlock &block);
 
   std::unordered_map<DWORD, StateBlock> state_blocks_;
   DWORD next_state_block_token_ = 1;
   bool recording_state_block_ = false;
+  StateSnapshot state_block_recording_start_;
 
   int ref_count_;
 
@@ -406,6 +436,16 @@ class Device : public IDirect3DDevice8, RefCounted {
   int current_back_buffer_ = 0;
   std::array<uint64_t, kNumBackBuffers> fence_values_ = {};
   uint64_t next_fence_ = 1;
+
+  // TEMP DIAGNOSTIC: measuring how much of each frame's CPU time is spent
+  // blocked in WaitForSingleObjectEx (waiting on the GPU fence) vs. actually
+  // building the command list -- chasing a report of low GPU+CPU utilization
+  // (both under 50%) alongside a large FPS regression vs. the real d3d8.dll.
+  int64_t perf_last_frame_ticks_ = 0;
+  int64_t perf_wait_ticks_this_frame_ = 0;
+  int64_t perf_wait_ticks_accum_ = 0;
+  int64_t perf_frame_ticks_accum_ = 0;
+  int perf_frame_sample_count_ = 0;
 
   ComPtr<ID3D12Debug5> debug_interface_;
   ComPtr<ID3D12InfoQueue1> info_queue_;
@@ -452,6 +492,14 @@ class Device : public IDirect3DDevice8, RefCounted {
   // D3DPRESENT_PARAMETERS::FullScreen_PresentationInterval at Init()/
   // Reset() time. Defaults to 1 (vsync on), matching real D3D8's default.
   UINT sync_interval_ = 1;
+  // Whether the adapter/swap chain support tearing (DXGI_FEATURE_PRESENT_
+  // ALLOW_TEARING), checked once at Init() time. Required to actually
+  // Present() with SyncInterval=0 (D3DPRESENT_INTERVAL_IMMEDIATE) on a
+  // DXGI_SWAP_EFFECT_FLIP_DISCARD swap chain -- without it and the matching
+  // DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING/DXGI_PRESENT_ALLOW_TEARING flags,
+  // Present(0, ...) can fail outright rather than just presenting with
+  // vsync anyway.
+  bool tearing_supported_ = false;
   // Material.
   D3DMATERIAL8 material_ = {};
   // Light definitions.

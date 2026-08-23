@@ -64,7 +64,13 @@ struct LightsCBuffer {
   D3DMATERIALCOLORSOURCE ambient_material_source;
   D3DMATERIALCOLORSOURCE specular_material_source;
   int specular_enable;
-  int pad[3];
+  // D3DRS_LIGHTING. Needed so meshes with no normal stream (where diffuse/
+  // specular can't be computed) can still get ambient lighting applied --
+  // ambient doesn't depend on the surface normal, but was previously skipped
+  // entirely for such meshes since the vertex shader variant for "no normal"
+  // never called ComputeLighting at all.
+  int lighting_enabled;
+  int pad[2];
   D3DCOLORVALUE global_ambient;
 };
 struct PixelCBuffer {

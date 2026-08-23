@@ -3,6 +3,7 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
+#include <dxgi1_5.h>
 
 #include <algorithm>
 #include <sstream>
@@ -90,7 +91,11 @@ class AdditionalSwapChain : public IDirect3DSwapChain8, public RefCounted {
     // Flush the shared command list (without presenting the *primary* swap
     // chain), then present this one specifically.
     device_->SubmitAndWait(false);
-    ASSERT_HR(swap_chain_->Present(device_->sync_interval(), 0));
+    ASSERT_HR(swap_chain_->Present(
+        device_->sync_interval(),
+        device_->sync_interval() == 0 && device_->tearing_supported()
+            ? DXGI_PRESENT_ALLOW_TEARING
+            : 0));
     current_index_ = swap_chain_->GetCurrentBackBufferIndex();
     return S_OK;
   }
@@ -219,6 +224,18 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
                     const D3DPRESENT_PARAMETERS &presentParams) {
   window_ = window;
   dxgi_factory_ = std::move(factory);
+
+  {
+    ComPtr<IDXGIFactory5> factory5;
+    BOOL allow_tearing = FALSE;
+    if (SUCCEEDED(dxgi_factory_->QueryInterface(
+            IID_PPV_ARGS(factory5.GetForInit()))) &&
+        SUCCEEDED(factory5->CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
+            sizeof(allow_tearing)))) {
+      tearing_supported_ = allow_tearing;
+    }
+  }
 
   LOG(INFO) << "Creating device.\n";
 #ifdef DX8TO12_ENABLE_VALIDATION
@@ -390,6 +407,9 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
       .BufferCount = kNumBackBuffers,
       .Scaling = DXGI_SCALING_NONE,
       .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+      .Flags = tearing_supported_
+                   ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+                   : 0u,
   };
   // Don't crash if creating the swap chain fails. This might happen during
   // device reset.
@@ -504,7 +524,10 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   LOG(INFO) << "Reset: swap_chain_->ResizeBuffers()\n";
   ASSERT_HR(swap_chain_->ResizeBuffers(
       2, pPresentationParameters->BackBufferWidth,
-      pPresentationParameters->BackBufferHeight, new_format, 0));
+      pPresentationParameters->BackBufferHeight, new_format,
+      tearing_supported_
+          ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+          : 0u));
   LOG(INFO) << "Reset: swap_chain_->ResizeBuffers() done\n";
 
   DXGI_SWAP_CHAIN_DESC swap_chain_desc;
@@ -956,6 +979,9 @@ HRESULT STDMETHODCALLTYPE Device::CreateAdditionalSwapChain(
       .BufferCount = kNumBackBuffers,
       .Scaling = DXGI_SCALING_NONE,
       .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+      .Flags = tearing_supported_
+                   ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+                   : 0u,
   };
   ComPtr<IDXGISwapChain1> swap_chain1;
   HR_OR_RETURN(dxgi_factory_->CreateSwapChainForHwnd(
@@ -1464,6 +1490,7 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
     case D3DRS_ALPHAREF:
       dirty_flags_ |= DIRTY_FLAG_PS_CBUFFER;
       break;
+    case D3DRS_LIGHTING:
     case D3DRS_COLORVERTEX:
     case D3DRS_DIFFUSEMATERIALSOURCE:
     case D3DRS_AMBIENTMATERIALSOURCE:
@@ -1503,8 +1530,105 @@ HRESULT STDMETHODCALLTYPE Device::SetTextureStageState(
   return S_OK;
 }
 
-Device::StateBlock Device::CaptureCurrentState() const {
-  return StateBlock{
+namespace {
+// Mirrors the exhaustive lists of state types handled by
+// RenderState::GetEnumAtIndex / TextureStageState::GetAtIndex (excluding
+// D3DRS_WRAP0..7, which are handled separately below since they're a
+// contiguous range).
+constexpr D3DRENDERSTATETYPE kAllRenderStateTypes[] = {
+    D3DRS_ZENABLE,
+    D3DRS_ZWRITEENABLE,
+    D3DRS_SHADEMODE,
+    D3DRS_FILLMODE,
+    D3DRS_ALPHATESTENABLE,
+    D3DRS_SRCBLEND,
+    D3DRS_DESTBLEND,
+    D3DRS_CULLMODE,
+    D3DRS_ZFUNC,
+    D3DRS_ALPHAREF,
+    D3DRS_ALPHAFUNC,
+    D3DRS_DITHERENABLE,
+    D3DRS_ALPHABLENDENABLE,
+    D3DRS_FOGENABLE,
+    D3DRS_SPECULARENABLE,
+    D3DRS_FOGCOLOR,
+    D3DRS_FOGTABLEMODE,
+    D3DRS_FOGSTART,
+    D3DRS_FOGEND,
+    D3DRS_FOGDENSITY,
+    D3DRS_EDGEANTIALIAS,
+    D3DRS_ZBIAS,
+    D3DRS_RANGEFOGENABLE,
+    D3DRS_STENCILENABLE,
+    D3DRS_STENCILFAIL,
+    D3DRS_STENCILZFAIL,
+    D3DRS_STENCILPASS,
+    D3DRS_STENCILFUNC,
+    D3DRS_STENCILREF,
+    D3DRS_STENCILMASK,
+    D3DRS_STENCILWRITEMASK,
+    D3DRS_TEXTUREFACTOR,
+    D3DRS_LIGHTING,
+    D3DRS_AMBIENT,
+    D3DRS_FOGVERTEXMODE,
+    D3DRS_COLORVERTEX,
+    D3DRS_LOCALVIEWER,
+    D3DRS_NORMALIZENORMALS,
+    D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_SPECULARMATERIALSOURCE,
+    D3DRS_AMBIENTMATERIALSOURCE,
+    D3DRS_EMISSIVEMATERIALSOURCE,
+    D3DRS_POINTSIZE,
+    D3DRS_POINTSIZE_MIN,
+    D3DRS_POINTSPRITEENABLE,
+    D3DRS_POINTSCALEENABLE,
+    D3DRS_POINTSCALE_A,
+    D3DRS_POINTSCALE_B,
+    D3DRS_POINTSCALE_C,
+    D3DRS_MULTISAMPLEANTIALIAS,
+    D3DRS_POINTSIZE_MAX,
+    D3DRS_COLORWRITEENABLE,
+    D3DRS_BLENDOP,
+    D3DRS_CLIPPING,
+    D3DRS_CLIPPLANEENABLE,
+    D3DRS_LASTPIXEL,
+    D3DRS_LINEPATTERN,
+    D3DRS_ZVISIBLE,
+    D3DRS_SOFTWAREVERTEXPROCESSING,
+    D3DRS_MULTISAMPLEMASK,
+    D3DRS_PATCHEDGESTYLE,
+    D3DRS_PATCHSEGMENTS,
+    D3DRS_DEBUGMONITORTOKEN,
+    D3DRS_VERTEXBLEND,
+    D3DRS_INDEXEDVERTEXBLENDENABLE,
+    D3DRS_TWEENFACTOR,
+    D3DRS_POSITIONORDER,
+    D3DRS_NORMALORDER,
+    D3DRS_WRAP0,
+    D3DRS_WRAP1,
+    D3DRS_WRAP2,
+    D3DRS_WRAP3,
+    D3DRS_WRAP4,
+    D3DRS_WRAP5,
+    D3DRS_WRAP6,
+    D3DRS_WRAP7,
+};
+
+constexpr D3DTEXTURESTAGESTATETYPE kAllTextureStageStateTypes[] = {
+    D3DTSS_COLOROP,          D3DTSS_COLORARG1,      D3DTSS_COLORARG2,
+    D3DTSS_ALPHAOP,          D3DTSS_ALPHAARG1,      D3DTSS_ALPHAARG2,
+    D3DTSS_TEXCOORDINDEX,    D3DTSS_ADDRESSU,       D3DTSS_ADDRESSV,
+    D3DTSS_BORDERCOLOR,      D3DTSS_MAGFILTER,      D3DTSS_MINFILTER,
+    D3DTSS_MIPFILTER,        D3DTSS_MIPMAPLODBIAS,  D3DTSS_MAXANISOTROPY,
+    D3DTSS_TEXTURETRANSFORMFLAGS,                   D3DTSS_ADDRESSW,
+    D3DTSS_COLORARG0,        D3DTSS_ALPHAARG0,      D3DTSS_RESULTARG,
+    D3DTSS_BUMPENVMAT00,     D3DTSS_BUMPENVMAT01,   D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11,     D3DTSS_BUMPENVLSCALE,  D3DTSS_BUMPENVLOFFSET,
+};
+}  // namespace
+
+Device::StateSnapshot Device::CaptureCurrentState() const {
+  return StateSnapshot{
       .render_state = render_state_,
       .texture_stage_states = texture_stage_states_,
       .transforms = transforms_,
@@ -1518,17 +1642,133 @@ Device::StateBlock Device::CaptureCurrentState() const {
   };
 }
 
+Device::StateBlock Device::CaptureFullStateBlock() const {
+  StateBlock block;
+  RenderState rs = render_state_;
+  for (D3DRENDERSTATETYPE type : kAllRenderStateTypes) {
+    block.render_state[type] = rs.GetEnumAtIndex(type);
+  }
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    TextureStageState tss = texture_stage_states_[stage];
+    for (D3DTEXTURESTAGESTATETYPE type : kAllTextureStageStateTypes) {
+      block.texture_stage_states[stage][type] =
+          tss.GetAtIndex(static_cast<size_t>(type));
+    }
+  }
+  block.transforms = transforms_;
+  block.material = material_;
+  block.lights = lights_;
+  block.enabled_lights = enabled_lights_;
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    block.bound_textures[stage] = bound_textures_[stage];
+  }
+  block.bound_vertex_shader = bound_vertex_shader_;
+  block.bound_pixel_shader = bound_pixel_shader_;
+  for (UINT i = 0; i < bound_vs_cregs_.size(); ++i) {
+    block.bound_vs_cregs[i] = bound_vs_cregs_[i];
+  }
+  return block;
+}
+
+Device::StateBlock Device::CaptureStateBlockDelta(
+    const StateSnapshot &before) const {
+  StateBlock block;
+
+  RenderState before_rs = before.render_state;
+  RenderState after_rs = render_state_;
+  for (D3DRENDERSTATETYPE type : kAllRenderStateTypes) {
+    DWORD before_value = before_rs.GetEnumAtIndex(type);
+    DWORD after_value = after_rs.GetEnumAtIndex(type);
+    if (before_value != after_value) block.render_state[type] = after_value;
+  }
+
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    TextureStageState before_tss = before.texture_stage_states[stage];
+    TextureStageState after_tss = texture_stage_states_[stage];
+    for (D3DTEXTURESTAGESTATETYPE type : kAllTextureStageStateTypes) {
+      DWORD before_value = before_tss.GetAtIndex(static_cast<size_t>(type));
+      DWORD after_value = after_tss.GetAtIndex(static_cast<size_t>(type));
+      if (before_value != after_value)
+        block.texture_stage_states[stage][type] = after_value;
+    }
+  }
+
+  for (const auto &[type, matrix] : transforms_) {
+    auto before_it = before.transforms.find(type);
+    if (before_it == before.transforms.end() ||
+        memcmp(&before_it->second, &matrix, sizeof(matrix)) != 0) {
+      block.transforms[type] = matrix;
+    }
+  }
+
+  if (memcmp(&before.material, &material_, sizeof(material_)) != 0) {
+    block.material = material_;
+  }
+
+  for (const auto &[index, light] : lights_) {
+    auto before_it = before.lights.find(index);
+    if (before_it == before.lights.end() ||
+        memcmp(&before_it->second, &light, sizeof(light)) != 0) {
+      block.lights[index] = light;
+    }
+  }
+
+  if (before.enabled_lights != enabled_lights_) {
+    block.enabled_lights = enabled_lights_;
+  }
+
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    if (!(before.bound_textures[stage] == bound_textures_[stage])) {
+      block.bound_textures[stage] = bound_textures_[stage];
+    }
+  }
+
+  if (before.bound_vertex_shader != bound_vertex_shader_) {
+    block.bound_vertex_shader = bound_vertex_shader_;
+  }
+  if (before.bound_pixel_shader != bound_pixel_shader_) {
+    block.bound_pixel_shader = bound_pixel_shader_;
+  }
+
+  for (UINT i = 0; i < bound_vs_cregs_.size(); ++i) {
+    const auto &after_value = bound_vs_cregs_[i];
+    if (i >= before.bound_vs_cregs.size() ||
+        before.bound_vs_cregs[i] != after_value) {
+      block.bound_vs_cregs[i] = after_value;
+    }
+  }
+
+  return block;
+}
+
 void Device::ApplyState(const StateBlock &block) {
-  render_state_ = block.render_state;
-  texture_stage_states_ = block.texture_stage_states;
-  transforms_ = block.transforms;
-  material_ = block.material;
-  lights_ = block.lights;
-  enabled_lights_ = block.enabled_lights;
-  bound_textures_ = block.bound_textures;
-  bound_vertex_shader_ = block.bound_vertex_shader;
-  bound_pixel_shader_ = block.bound_pixel_shader;
-  bound_vs_cregs_ = block.bound_vs_cregs;
+  for (const auto &[type, value] : block.render_state) {
+    render_state_.GetEnumAtIndex(type) = value;
+  }
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    for (const auto &[type, value] : block.texture_stage_states[stage]) {
+      texture_stage_states_[stage].GetAtIndex(static_cast<size_t>(type)) =
+          value;
+    }
+  }
+  for (const auto &[type, matrix] : block.transforms) {
+    transforms_[type] = matrix;
+  }
+  if (block.material) material_ = *block.material;
+  for (const auto &[index, light] : block.lights) {
+    lights_[index] = light;
+  }
+  if (block.enabled_lights) enabled_lights_ = *block.enabled_lights;
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    if (block.bound_textures[stage]) {
+      bound_textures_[stage] = *block.bound_textures[stage];
+    }
+  }
+  if (block.bound_vertex_shader) bound_vertex_shader_ = *block.bound_vertex_shader;
+  if (block.bound_pixel_shader) bound_pixel_shader_ = *block.bound_pixel_shader;
+  for (const auto &[index, value] : block.bound_vs_cregs) {
+    bound_vs_cregs_.at(index) = value;
+  }
   // Force everything above to actually get re-bound/re-uploaded before the
   // next draw call, since we just changed it out from under the renderer.
   dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
@@ -1536,28 +1776,32 @@ void Device::ApplyState(const StateBlock &block) {
 
 HRESULT STDMETHODCALLTYPE Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type,
                                                    DWORD *pToken) {
-  // Simplification: always captures the full state snapshot regardless of
-  // Type (D3DSBT_ALL/D3DSBT_PIXELSTATE/D3DSBT_VERTEXSTATE) -- see the
-  // StateBlock comment in device.h.
+  // Simplification: always captures every state regardless of Type
+  // (D3DSBT_ALL/D3DSBT_PIXELSTATE/D3DSBT_VERTEXSTATE don't get the precise
+  // real-D3D8 partitioning), but -- unlike Begin/EndStateBlock below --
+  // capturing everything really is correct semantics for this API: it snapshots
+  // the live state at this exact point in time to restore later.
   *pToken = next_state_block_token_++;
-  state_blocks_[*pToken] = CaptureCurrentState();
+  state_blocks_[*pToken] = CaptureFullStateBlock();
   return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Device::BeginStateBlock() {
   if (recording_state_block_) return D3DERR_INVALIDCALL;
   recording_state_block_ = true;
+  state_block_recording_start_ = CaptureCurrentState();
   return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Device::EndStateBlock(DWORD *pToken) {
   if (!recording_state_block_) return D3DERR_INVALIDCALL;
   recording_state_block_ = false;
-  // Simplification: captures the full live state as of now, rather than only
-  // the states actually Set() during the Begin/End window -- see the
-  // StateBlock comment in device.h.
+  // Only the states actually Set() (i.e. changed) during the Begin/End
+  // window are captured, matching real D3D8 semantics -- ApplyStateBlock()
+  // must not clobber unrelated state a game changed in between recording and
+  // applying the block.
   *pToken = next_state_block_token_++;
-  state_blocks_[*pToken] = CaptureCurrentState();
+  state_blocks_[*pToken] = CaptureStateBlockDelta(state_block_recording_start_);
   return S_OK;
 }
 
@@ -1571,7 +1815,38 @@ HRESULT STDMETHODCALLTYPE Device::ApplyStateBlock(DWORD Token) {
 HRESULT STDMETHODCALLTYPE Device::CaptureStateBlock(DWORD Token) {
   auto it = state_blocks_.find(Token);
   if (it == state_blocks_.end()) return D3DERR_INVALIDCALL;
-  it->second = CaptureCurrentState();
+  // Per the D3D8 docs, this refreshes the values of the states already
+  // recorded in this block from the current live state -- it does not add
+  // or remove which states are tracked.
+  StateBlock &block = it->second;
+  RenderState live_rs = render_state_;
+  for (auto &[type, value] : block.render_state) {
+    value = live_rs.GetEnumAtIndex(type);
+  }
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    TextureStageState live_tss = texture_stage_states_[stage];
+    for (auto &[type, value] : block.texture_stage_states[stage]) {
+      value = live_tss.GetAtIndex(static_cast<size_t>(type));
+    }
+  }
+  for (auto &[type, matrix] : block.transforms) {
+    matrix = transforms_.contains(type) ? transforms_.at(type) : D3DMATRIX{};
+  }
+  if (block.material) block.material = material_;
+  for (auto &[index, light] : block.lights) {
+    if (lights_.contains(index)) light = lights_.at(index);
+  }
+  if (block.enabled_lights) block.enabled_lights = enabled_lights_;
+  for (int stage = 0; stage < kMaxTexStages; ++stage) {
+    if (block.bound_textures[stage]) {
+      block.bound_textures[stage] = bound_textures_[stage];
+    }
+  }
+  if (block.bound_vertex_shader) block.bound_vertex_shader = bound_vertex_shader_;
+  if (block.bound_pixel_shader) block.bound_pixel_shader = bound_pixel_shader_;
+  for (auto &[index, value] : block.bound_vs_cregs) {
+    value = bound_vs_cregs_.at(index);
+  }
   return S_OK;
 }
 
@@ -1924,7 +2199,6 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   // Now that we know our pixel shader, try to look into the PSO cache.
   PSOState pso_key{
       .rs = render_state_,
-      .input_elements = vertex_shader->decl.input_elements,
       .vs = vertex_shader->blob.get(),
       .ps = pixel_shader.get(),
       .prim_type = d3d8_prim_type,
@@ -2241,6 +2515,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
         render_state_.color_vertex ? render_state_.specular_material_source
                                    : D3DMCS_MATERIAL;
     cbuffer->specular_enable = render_state_.specular_enable;
+    cbuffer->lighting_enabled = render_state_.lighting;
     cbuffer->global_ambient = Dx8::Color(render_state_.ambient).ToValue();
     ASSERT_HR(lights_cbuffer_->Unlock());
     dirty_flags_ ^= DIRTY_FLAG_LIGHTS;
@@ -2579,6 +2854,35 @@ HRESULT STDMETHODCALLTYPE Device::Present(CONST RECT *pSourceRect,
 
 // Only used during reset. Does not clean up fence state.
 void Device::SubmitAndWait(bool should_present) {
+  // TEMP DIAGNOSTIC: see perf_wait_ticks_accum_ comment in device.h.
+  LARGE_INTEGER perf_now;
+  QueryPerformanceCounter(&perf_now);
+  if (should_present) {
+    if (perf_last_frame_ticks_ != 0) {
+      perf_frame_ticks_accum_ += perf_now.QuadPart - perf_last_frame_ticks_;
+      perf_wait_ticks_accum_ += perf_wait_ticks_this_frame_;
+      ++perf_frame_sample_count_;
+      if (perf_frame_sample_count_ >= 120) {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        double avg_frame_ms = 1000.0 * perf_frame_ticks_accum_ /
+                              perf_frame_sample_count_ / freq.QuadPart;
+        double avg_wait_ms = 1000.0 * perf_wait_ticks_accum_ /
+                             perf_frame_sample_count_ / freq.QuadPart;
+        LOG(AixLog::Severity::error)
+            << "Perf: avg frame=" << avg_frame_ms
+            << "ms (fps=" << (1000.0 / avg_frame_ms)
+            << ") avg GPU-fence-wait=" << avg_wait_ms << "ms ("
+            << (100.0 * avg_wait_ms / avg_frame_ms) << "% of frame)\n";
+        perf_frame_ticks_accum_ = 0;
+        perf_wait_ticks_accum_ = 0;
+        perf_frame_sample_count_ = 0;
+      }
+    }
+    perf_last_frame_ticks_ = perf_now.QuadPart;
+    perf_wait_ticks_this_frame_ = 0;
+  }
+
   ASSERT(!(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED));
   // Fine-grained checkpoints while chasing a crash that lands somewhere in
   // this function with no other diagnosable cause -- see ROADMAP.md. Remove
@@ -2608,7 +2912,10 @@ void Device::SubmitAndWait(bool should_present) {
   // Present!
   if (should_present) {
     LOG(INFO) << "SubmitAndWait: swap_chain_->Present()\n";
-    ASSERT_HR(swap_chain_->Present(sync_interval_, 0));
+    ASSERT_HR(swap_chain_->Present(
+        sync_interval_, sync_interval_ == 0 && tearing_supported_
+                             ? DXGI_PRESENT_ALLOW_TEARING
+                             : 0));
   }
 
   // Grab a new fence value, set it at the end of the command queue execution.
@@ -2654,8 +2961,13 @@ void Device::WaitForFrame(uint64_t frame_number) {
       LOG(TRACE) << "Waiting for fence " << frame_number << ".\n";
       ASSERT_HR(cmd_list_done_fence_->SetEventOnCompletion(
           frame_number, cmd_list_done_event_handle_));
+      // TEMP DIAGNOSTIC: see perf_wait_ticks_accum_ comment in device.h.
+      LARGE_INTEGER wait_start, wait_end;
+      QueryPerformanceCounter(&wait_start);
       DWORD wait_result =
           WaitForSingleObjectEx(cmd_list_done_event_handle_, 60 * 1000, FALSE);
+      QueryPerformanceCounter(&wait_end);
+      perf_wait_ticks_this_frame_ += wait_end.QuadPart - wait_start.QuadPart;
       LOG(INFO) << "WaitForFrame: fence event signaled/timed out\n";
       if (wait_result != WAIT_OBJECT_0) {
         // The fence never signaled -- most likely the GPU driver hung and

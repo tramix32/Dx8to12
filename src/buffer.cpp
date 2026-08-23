@@ -1,5 +1,6 @@
 #include "buffer.h"
 
+#include <cstring>
 #include <sstream>
 
 #include "aixlog.hpp"

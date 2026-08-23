@@ -150,9 +150,18 @@ struct TextureStageState {
 };
 
 // This object is used purely to cache pipeline state objects.
+//
+// Deliberately does NOT store input_elements: it's fully determined by which
+// VertexShader is bound (each VertexShader's decl.input_elements is fixed at
+// shader-creation time and never varies per-draw), and `vs` (that shader's
+// compiled blob pointer) already uniquely identifies it -- one VertexShader
+// per blob, never two different declarations sharing a blob pointer. Since
+// this key is rebuilt on every single draw call (CreatePSO has no way to
+// know in advance whether anything PSO-relevant changed), copying/hashing
+// the full input_elements vector here would mean a fresh heap allocation
+// every draw purely to answer a question `vs` alone already answers.
 struct PSOState {
   RenderState rs;
-  std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
   ID3DBlob *vs;
   ID3DBlob *ps;
   D3DPRIMITIVETYPE prim_type;
@@ -160,11 +169,7 @@ struct PSOState {
   // TODO: Add RTV format and DSV format when we support SetRenderTarget.
   bool operator==(const PSOState &other) const {
     return vs == other.vs && ps == other.ps && rs == other.rs &&
-           input_elements.size() == other.input_elements.size() &&
-           dsv_format == other.dsv_format &&
-           memcmp(input_elements.data(), other.input_elements.data(),
-                  sizeof(D3D12_INPUT_ELEMENT_DESC) * input_elements.size()) ==
-               0;
+           prim_type == other.prim_type && dsv_format == other.dsv_format;
   }
 };
 

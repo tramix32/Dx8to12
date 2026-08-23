@@ -27,6 +27,21 @@ FFVertexOutput VSMain(VertexInput IN) {
   OUT.oViewReflect = normalize(reflect(view_pos, view_normal));
   vertex_diffuse = ComputeLighting(view_pos, view_normal, vertex_diffuse,
                                    vertex_specular, specular_lighting);
+#else
+  // No normal stream, so per-light diffuse/specular can't be computed (their
+  // formulas need a surface orientation) -- but ambient lighting doesn't
+  // depend on the normal at all, and D3DRS_LIGHTING still applies it on real
+  // D3D8. Passing a zero normal makes ComputeLighting's dot(normal, ...)
+  // terms zero out diffuse/specular on their own, leaving just ambient.
+  // Without this, meshes with baked-black/dark vertex colors and no normals
+  // (common for unlit-looking static geometry) rendered solid black instead
+  // of getting lit by the scene's ambient term.
+  if (lighting_enabled) {
+    float3 view_pos = mul(world_view, float4(IN.input_reg0, 1.f)).xyz;
+    float4 unused_specular;
+    vertex_diffuse = ComputeLighting(view_pos, float3(0, 0, 0), vertex_diffuse,
+                                     vertex_specular, unused_specular);
+  }
 #endif
 #else
   OUT.oPos = IN.input_reg0;

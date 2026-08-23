@@ -276,13 +276,19 @@ size_t std::hash<Dx8to12::PSOState>::operator()(
   using ::Dx8to12::MurmurHashTo32;
   using ::Dx8to12::RenderState;
 
+  // `&pso_state.vs`/`&pso_state.ps`, not `pso_state.vs`/`pso_state.ps` --
+  // these are meant to hash the *pointer value* (an opaque per-shader
+  // identity), not the bytes at the address the pointer points to. Passing
+  // the pointer itself made MurmurHashTo32 read sizeof(pointer) bytes from
+  // inside the pointed-to ID3DBlob (effectively its vtable pointer, which is
+  // identical across every ID3DBlob instance), so every PSOState's vs/ps
+  // terms collapsed to nearly the same hash contribution regardless of which
+  // shader was actually bound -- silently degrading pso_cache_ into mostly
+  // linear buckets keyed on `rs` alone.
   uint32_t hash_elements[] = {
       std::hash<RenderState>()(pso_state.rs),
-      MurmurHashTo32(
-          pso_state.input_elements.data(),
-          pso_state.input_elements.size() * sizeof(D3D12_INPUT_ELEMENT_DESC)),
-      MurmurHashTo32(pso_state.vs, sizeof(pso_state.vs)),
-      MurmurHashTo32(pso_state.ps, sizeof(pso_state.ps)),
+      MurmurHashTo32(&pso_state.vs, sizeof(pso_state.vs)),
+      MurmurHashTo32(&pso_state.ps, sizeof(pso_state.ps)),
       MurmurHashTo32(&pso_state.prim_type, sizeof(pso_state.prim_type)),
       static_cast<uint32_t>(pso_state.dsv_format)};
   return MurmurHashTo32(hash_elements, sizeof(hash_elements));

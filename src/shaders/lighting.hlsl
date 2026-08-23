@@ -29,7 +29,8 @@ cbuffer Lights : register(b2) {
   int ambient_material_source;
   int specular_material_source;
   int specular_enable;
-  int3 pad1;
+  int lighting_enabled;
+  int2 pad1;
   float4 global_ambient;
 };
 
