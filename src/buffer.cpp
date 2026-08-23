@@ -259,7 +259,11 @@ void DynamicBuffer::PersistDynamicChanges() {
   GetGpuPtr();
   ASSERT(current_ring_alloc_.frame == device_->CurrentFrame());
   ASSERT(current_ring_alloc_.size > 0);
-  ASSERT(written_ranges_.ranges.size() == 1);
+  // Multiple non-contiguous written ranges are a real, legitimate case (e.g.
+  // repeated D3DLOCK_NOOVERWRITE appends to disjoint sub-regions within one
+  // frame) -- RangeSet::insert only coalesces adjacent/overlapping ranges,
+  // so ranges.size() > 1 is expected here, not a bug. The loop below already
+  // handles any number of ranges correctly.
   for (auto [offset, size] : written_ranges_.ranges) {
     device_->CopyBuffer(this, 0,
                         device_->dynamic_ring_buffer()->GetBackingResource(),
