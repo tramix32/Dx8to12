@@ -27,6 +27,12 @@ Skipped, not implementable as a cheap mirror — their `Set*` counterpart is its
 
 These four need their `Set*` implemented first (small features in their own right), so they've been pushed to Phase 6.
 
+## Real-game feedback (2026-08-23): swap chain creation crash on `D3DFMT_X8R8G8B8`
+
+Second reported crash, deeper into device init than the MSAA one: `ASSERT_HR(Init(presentParams))` in `Device::Create` (`device.cpp`) failing. Root cause: `Device::Init`'s `HR_OR_RETURN(dxgi_factory_->CreateSwapChainForHwnd(...))` was passing `DXGIFromD3DFormat(presentParams.BackBufferFormat)` straight through as the swap chain format. `D3DFMT_X8R8G8B8` — the single most common DX8 backbuffer format, used by nearly every game including both test titles — maps to `DXGI_FORMAT_B8G8R8X8_UNORM`, which `DXGI_SWAP_EFFECT_FLIP_DISCARD` swap chains (what this code uses) reject outright with `DXGI_ERROR_INVALID_CALL`; only the alpha-having variants (`R8G8B8A8_UNORM`, `B8G8R8A8_UNORM`, `R16G16B16A16_FLOAT`) are valid for flip-model. This meant essentially every game requesting the default 32-bit backbuffer format would fail at device creation. `Device::Reset` had the identical bug in its `ResizeBuffers` call.
+
+Fixed with a small `ToFlipModelSwapChainFormat` helper in `device.cpp` that substitutes `DXGI_FORMAT_B8G8R8A8_UNORM` whenever `DXGIFromD3DFormat` would otherwise produce the rejected X8 variant, applied at both call sites (`Init`'s `CreateSwapChainForHwnd` and `Reset`'s `ResizeTarget`/`ResizeBuffers`). Harmless for compatibility: `DXGIToD3DFormat` already maps `B8G8R8A8_UNORM` back to `D3DFMT_A8R8G8B8` for anything that queries the backbuffer format afterward (`GetAdapterDisplayMode`, `GetBackBuffer`'s surface desc, etc.) — the app simply never reads/writes the backbuffer's alpha channel through the X8 format, so gaining one it doesn't ask for is a no-op in practice. This is the standard trick used by essentially every DX8/DX9-on-DX12 or DX8/DX9-on-Vulkan wrapper for exactly this reason.
+
 ## Real-game feedback (2026-08-23): `CheckDeviceMultiSampleType`
 
 Reported crash from an actual test run: `IDirect3D8::CheckDeviceMultiSampleType` was a bare `NOT_IMPLEMENTED()` stub, and a real game's adapter-capability probing hit it before device creation even started — this jumps ahead of the phased plan below because it's an empirically confirmed blocker, not a guess.
@@ -42,11 +48,13 @@ Was the highest functional-impact gap: `BaseSurface` only implemented `GetDesc`,
 - `BackbufferSurface::LockRect` and `GpuSurface::LockRect` (default-pool case) share `BaseSurface::LockGpuReadback`/`UnlockGpuReadback` (`surface.cpp`): create a `D3D12_HEAP_TYPE_READBACK` buffer sized via the new `BaseTexture::GetFootprint` accessor, `CopyTextureRegion` the subresource into it, then call `Device::SubmitAndWait(false)` to flush and block until done (reusing the exact flush-mid-frame path `Device::WaitForFrame` already relies on — no new fence code), then `Map` it. Read-path only; a locked render target is not expected to be written back through `Unlock`.
 - `QueryInterface`, `GetDevice` on surfaces — implemented, mirror the equivalent `Device`/`Texture` patterns. `SetPrivateData`/`GetPrivateData`/`FreePrivateData` return `D3DERR_NOTAVAILABLE` (same choice already made for the palette APIs — no private-data storage exists, and returning a clean error is preferable to a fake success). `GetContainer` is still unimplemented (rare, pushed to Phase 6).
 
-## Phase 3 — Standalone surface creation
+## Phase 3 — Standalone surface creation (done, 2026-08-23)
 
-`CreateRenderTarget`, `CreateDepthStencilSurface`, `CreateImageSurface` are stubs. Blocks shadow maps, extra render targets, offscreen buffers. Depends on Phase 2 (locking) to be useful.
+Was blocking shadow maps, extra render targets, offscreen buffers.
 
-Build on `BaseTexture::Create` + `GpuTexture::GetSurfaceLevel` — these are a single-mip-level, texture-less-wrapper variant of what `CreateTexture` already does; don't duplicate resource-desc/footprint logic.
+All three (`CreateRenderTarget`, `CreateDepthStencilSurface`, `CreateImageSurface`) build directly on `BaseTexture::Create` (single mip level, `D3DUSAGE_RENDERTARGET`/`D3DUSAGE_DEPTHSTENCIL`/`D3DPOOL_SYSTEMMEM` respectively) + `GetSurfaceLevel(0, ppSurface)` — no duplicated resource-desc/footprint logic. Requested `MultiSample != D3DMULTISAMPLE_NONE` logs and silently falls back to single-sample rather than failing, consistent with `CheckDeviceMultiSampleType` (see above) telling callers up front that only no-AA is available.
+
+One easy-to-miss lifetime detail: `BaseTexture::Create` returns an object with an initial refcount of 1 that the app is normally expected to own directly (e.g. `CreateTexture`'s `*ppTexture = BaseTexture::Create(...)`). Here the app never sees the texture, only the surface wrapping it, and `GetSurfaceLevel` internally takes its *own* ref on the texture (`ComWrap` inside the `GpuSurface`/`CpuSurface` constructor) rather than adopting the caller's — so the initial ref has to be explicitly dropped (`ComOwn(texture)` locally, released when it goes out of scope) once the surface has taken its own, or the texture (and its GPU resource / descriptor slots) leaks for the lifetime of the process every single call.
 
 ## Phase 4 — State blocks
 

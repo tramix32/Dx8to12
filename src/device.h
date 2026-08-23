@@ -147,13 +147,13 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE
   CreateRenderTarget(UINT Width, UINT Height, D3DFORMAT Format,
                      D3DMULTISAMPLE_TYPE MultiSample, BOOL Lockable,
-                     IDirect3DSurface8 **ppSurface) PURE;
+                     IDirect3DSurface8 **ppSurface) override;
   virtual HRESULT STDMETHODCALLTYPE CreateDepthStencilSurface(
       UINT Width, UINT Height, D3DFORMAT Format,
-      D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface) PURE;
+      D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface) override;
   virtual HRESULT STDMETHODCALLTYPE
   CreateImageSurface(UINT Width, UINT Height, D3DFORMAT Format,
-                     IDirect3DSurface8 **ppSurface) PURE;
+                     IDirect3DSurface8 **ppSurface) override;
   virtual HRESULT STDMETHODCALLTYPE
   CopyRects(IDirect3DSurface8 *pSourceSurface, CONST RECT *pSourceRectsArray,
             UINT cRects, IDirect3DSurface8 *pDestinationSurface,

@@ -35,6 +35,18 @@ namespace Dx8to12 {
 
 // static_assert(sizeof(void *) == 4, "Does not support 64-bit.");
 
+// DXGI_SWAP_EFFECT_FLIP_DISCARD swap chains only accept a handful of formats,
+// none of which lack an alpha channel. D3DFMT_X8R8G8B8 -- by far the most
+// common DX8 backbuffer format -- maps to DXGI_FORMAT_B8G8R8X8_UNORM via
+// DXGIFromD3DFormat, which CreateSwapChainForHwnd/ResizeBuffers reject
+// outright (DXGI_ERROR_INVALID_CALL), aborting device creation. Swap in the
+// alpha variant for the swap chain itself; games never read/write backbuffer
+// alpha through the X8 format anyway.
+static DXGI_FORMAT ToFlipModelSwapChainFormat(DXGI_FORMAT format) {
+  if (format == DXGI_FORMAT_B8G8R8X8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM;
+  return format;
+}
+
 Device::DirtyFlags &operator|=(Device::DirtyFlags &a, Device::DirtyFlags b) {
   a = static_cast<Device::DirtyFlags>(static_cast<uint32_t>(a) |
                                       static_cast<uint32_t>(b));
@@ -220,7 +232,8 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
   DXGI_SWAP_CHAIN_DESC1 swap_chain_desc{
       .Width = presentParams.BackBufferWidth,
       .Height = presentParams.BackBufferHeight,
-      .Format = DXGIFromD3DFormat(presentParams.BackBufferFormat),
+      .Format = ToFlipModelSwapChainFormat(
+          DXGIFromD3DFormat(presentParams.BackBufferFormat)),
       .SampleDesc = {.Count = 1, .Quality = 0},
       .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
       .BufferCount = kNumBackBuffers,
@@ -278,8 +291,8 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   }
   back_buffers_.clear();
   depth_stencil_tex_.Reset();
-  DXGI_FORMAT new_format =
-      DXGIFromD3DFormat(pPresentationParameters->BackBufferFormat);
+  DXGI_FORMAT new_format = ToFlipModelSwapChainFormat(
+      DXGIFromD3DFormat(pPresentationParameters->BackBufferFormat));
 
   DXGI_MODE_DESC mode_desc{.Width = pPresentationParameters->BackBufferWidth,
                            .Height = pPresentationParameters->BackBufferHeight,
@@ -569,6 +582,62 @@ HRESULT STDMETHODCALLTYPE Device::CreateCubeTexture(
       BaseTexture::Create(this, TextureKind::Cube, EdgeLength, EdgeLength, 6,
                           Levels, Usage, Format, Pool);
   return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::CreateRenderTarget(
+    UINT Width, UINT Height, D3DFORMAT Format,
+    D3DMULTISAMPLE_TYPE MultiSample, BOOL Lockable,
+    IDirect3DSurface8 **ppSurface) {
+  TRACE_ENTRY(Width, Height, Format, MultiSample, Lockable, ppSurface);
+  if (MultiSample != D3DMULTISAMPLE_NONE) {
+    // Matches CheckDeviceMultiSampleType: the pipeline never builds a
+    // multisampled PSO, so fall back to a regular single-sample target
+    // instead of failing outright.
+    LOG_ERROR() << "Multisampled render targets are not supported; creating "
+                  "a single-sample target instead.\n";
+  }
+  // Render targets are always D3DPOOL_DEFAULT; Lockable only affects whether
+  // the resulting surface supports Lock/Unlock. GpuSurface::LockRect already
+  // handles D3DPOOL_DEFAULT via a GPU readback, so both cases work the same.
+  BaseTexture *texture = BaseTexture::Create(
+      this, TextureKind::Texture2d, Width, Height, 1, 1, D3DUSAGE_RENDERTARGET,
+      Format, D3DPOOL_DEFAULT);
+  if (!texture) return D3DERR_INVALIDCALL;
+  // The app never sees the texture object directly, only the surface -- drop
+  // our initial ref once the surface (created below) has taken its own, so
+  // the texture's lifetime is tied purely to the surface's.
+  ComPtr<BaseTexture> owned_texture = ComOwn(texture);
+  return owned_texture->GetSurfaceLevel(0, ppSurface);
+}
+
+HRESULT STDMETHODCALLTYPE Device::CreateDepthStencilSurface(
+    UINT Width, UINT Height, D3DFORMAT Format,
+    D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface) {
+  TRACE_ENTRY(Width, Height, Format, MultiSample, ppSurface);
+  if (MultiSample != D3DMULTISAMPLE_NONE) {
+    LOG_ERROR() << "Multisampled depth-stencil surfaces are not supported; "
+                  "creating a single-sample surface instead.\n";
+  }
+  BaseTexture *texture = BaseTexture::Create(
+      this, TextureKind::Texture2d, Width, Height, 1, 1, D3DUSAGE_DEPTHSTENCIL,
+      Format, D3DPOOL_DEFAULT);
+  if (!texture) return D3DERR_INVALIDCALL;
+  ComPtr<BaseTexture> owned_texture = ComOwn(texture);
+  return owned_texture->GetSurfaceLevel(0, ppSurface);
+}
+
+HRESULT STDMETHODCALLTYPE Device::CreateImageSurface(
+    UINT Width, UINT Height, D3DFORMAT Format, IDirect3DSurface8 **ppSurface) {
+  TRACE_ENTRY(Width, Height, Format, ppSurface);
+  // Image surfaces are always plain system memory (D3DPOOL_SYSTEMMEM); they
+  // exist to be filled by the app and pushed to a real resource via
+  // CopyRects/UpdateTexture, not to be usable as a render target or texture.
+  BaseTexture *texture =
+      BaseTexture::Create(this, TextureKind::Texture2d, Width, Height, 1, 1, 0,
+                          Format, D3DPOOL_SYSTEMMEM);
+  if (!texture) return D3DERR_INVALIDCALL;
+  ComPtr<BaseTexture> owned_texture = ComOwn(texture);
+  return owned_texture->GetSurfaceLevel(0, ppSurface);
 }
 
 HRESULT STDMETHODCALLTYPE
