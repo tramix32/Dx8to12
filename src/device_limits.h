@@ -19,7 +19,12 @@ static constexpr int kMaxSamplerStates = 64;
 static constexpr int kMaxNumSrvs = 8192;
 static constexpr int kMaxNumRtvs = 32;
 
-static constexpr int kDynamicRingBufferSize = 40 * 1024 * 1024;
+// Was 40MB -- bumped since modern GPUs have far more VRAM to spare than
+// when this was originally sized, and this buffer holds every dynamic
+// vertex/index upload, DrawPrimitiveUP/DrawIndexedPrimitiveUP data, and
+// CopyRects staging for the whole frame (see DynamicRingBuffer::Allocate's
+// FAIL("OOM...") if it doesn't fit).
+static constexpr int kDynamicRingBufferSize = 128 * 1024 * 1024;
 
 static constexpr int kNumVsConstRegs = 96;
 static constexpr int kNumPsConstRegs = 8;

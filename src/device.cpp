@@ -90,7 +90,7 @@ class AdditionalSwapChain : public IDirect3DSwapChain8, public RefCounted {
     // Flush the shared command list (without presenting the *primary* swap
     // chain), then present this one specifically.
     device_->SubmitAndWait(false);
-    ASSERT_HR(swap_chain_->Present(1, 0));
+    ASSERT_HR(swap_chain_->Present(device_->sync_interval(), 0));
     current_index_ = swap_chain_->GetCurrentBackBufferIndex();
     return S_OK;
   }
@@ -278,9 +278,35 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   return true;
 }
 
+namespace {
+// Present() previously always used SyncInterval=1 (vsync forced on)
+// regardless of what the app actually requested, leaving the GPU idle
+// waiting for vblank between frames -- observed in practice as low
+// GPU/CPU utilization alongside a mediocre framerate. Map the app's real
+// request instead.
+UINT SyncIntervalFromD3DPresentInterval(DWORD present_interval) {
+  switch (present_interval) {
+    case D3DPRESENT_INTERVAL_IMMEDIATE:
+      return 0;
+    case D3DPRESENT_INTERVAL_TWO:
+      return 2;
+    case D3DPRESENT_INTERVAL_THREE:
+      return 3;
+    case D3DPRESENT_INTERVAL_FOUR:
+      return 4;
+    case D3DPRESENT_INTERVAL_DEFAULT:
+    case D3DPRESENT_INTERVAL_ONE:
+    default:
+      return 1;
+  }
+}
+}  // namespace
+
 HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
   fence_values_ = {};
   next_fence_ = 1;
+  sync_interval_ = SyncIntervalFromD3DPresentInterval(
+      presentParams.FullScreen_PresentationInterval);
 
   srv_heap_ = DescriptorPoolHeap(
       d3d12_device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kMaxNumSrvs);
@@ -425,6 +451,8 @@ Device::~Device() { WaitForFrame(next_fence_ - 1); }
 HRESULT STDMETHODCALLTYPE
 Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   TRACE_ENTRY(pPresentationParameters);
+  sync_interval_ = SyncIntervalFromD3DPresentInterval(
+      pPresentationParameters->FullScreen_PresentationInterval);
   if (!(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED)) {
     LOG(INFO) << "Resetting device: Submitting commands..\n";
     SubmitAndWait(false);
@@ -828,7 +856,16 @@ HRESULT STDMETHODCALLTYPE Device::CreateTexture(UINT Width, UINT Height,
   TRACE_ENTRY(Width, Height, Levels, Usage, Format, Pool, ppTexture);
   *ppTexture = BaseTexture::Create(this, TextureKind::Texture2d, Width, Height,
                                    1, Levels, Usage, Format, Pool);
-  return *ppTexture != nullptr;
+  // BaseTexture::Create's only silent-failure path is an invalid usage/pool
+  // combo (D3DUSAGE_DYNAMIC without D3DPOOL_DEFAULT). Was previously
+  // `return *ppTexture != nullptr;` -- inverted: that's 0 (S_OK) exactly
+  // when creation *failed* (null) and a nonzero/failure-looking value when
+  // it *succeeded*, so a caller checking SUCCEEDED()/FAILED() on the
+  // returned HRESULT could never actually detect either outcome correctly
+  // (0 and 1 both satisfy SUCCEEDED()) -- a game could easily end up
+  // treating a failed creation as successful and later binding a null
+  // texture wherever it expected one.
+  return *ppTexture != nullptr ? S_OK : D3DERR_INVALIDCALL;
 }
 
 HRESULT STDMETHODCALLTYPE Device::CreateCubeTexture(
@@ -2571,7 +2608,7 @@ void Device::SubmitAndWait(bool should_present) {
   // Present!
   if (should_present) {
     LOG(INFO) << "SubmitAndWait: swap_chain_->Present()\n";
-    ASSERT_HR(swap_chain_->Present(1, 0));
+    ASSERT_HR(swap_chain_->Present(sync_interval_, 0));
   }
 
   // Grab a new fence value, set it at the end of the command queue execution.

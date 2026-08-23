@@ -46,6 +46,7 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   ID3D12Device *device() const { return d3d12_device_.get(); }
   ID3D12GraphicsCommandList *cmd_list() const { return cmd_list_.get(); }
+  UINT sync_interval() const { return sync_interval_; }
   DescriptorPoolHeap &srv_heap() { return srv_heap_; }
   DescriptorPoolHeap *rtv_heap() { return &rtv_heap_; }
   DescriptorPoolHeap *dsv_heap() { return &dsv_heap_; }
@@ -447,6 +448,10 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   // Viewport.
   D3D12_VIEWPORT viewport_ = {.MaxDepth = 1.f};
+  // Present()'s SyncInterval, derived from the app's requested
+  // D3DPRESENT_PARAMETERS::FullScreen_PresentationInterval at Init()/
+  // Reset() time. Defaults to 1 (vsync on), matching real D3D8's default.
+  UINT sync_interval_ = 1;
   // Material.
   D3DMATERIAL8 material_ = {};
   // Light definitions.
