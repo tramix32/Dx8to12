@@ -118,6 +118,30 @@ D3DSURFACE_DESC BaseTexture::GetSurfaceDesc(uint32_t subresource) const {
   return *pDesc;
 }
 
+HRESULT STDMETHODCALLTYPE BaseTexture::QueryInterface(REFIID riid,
+                                                       void **ppvObj) {
+  if (riid == IID_IUnknown || riid == IID_IDirect3DResource8 ||
+      riid == IID_IDirect3DBaseTexture8 ||
+      (kind_ == TextureKind::Texture2d && riid == IID_IDirect3DTexture8)) {
+    *ppvObj = static_cast<IDirect3DTexture8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  if (kind_ == TextureKind::Cube && riid == IID_IDirect3DCubeTexture8) {
+    *ppvObj = static_cast<IDirect3DCubeTexture8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  *ppvObj = nullptr;
+  return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE BaseTexture::GetDevice(IDirect3DDevice8 **ppDevice) {
+  *ppDevice = device_;
+  device_->AddRef();
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE BaseTexture::GetLevelDesc(UINT Level,
                                                     D3DSURFACE_DESC *pDesc) {
   if (Level >= resource_desc_.MipLevels) return D3DERR_INVALIDCALL;

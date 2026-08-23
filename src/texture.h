@@ -48,8 +48,8 @@ class BaseTexture : public IDirect3DTexture8,
 
  public:
   /*** IUnknown methods ***/
-  virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj)
-      VIRT_NOT_IMPLEMENTED;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void** ppvObj) override;
   virtual ULONG STDMETHODCALLTYPE AddRef(THIS) override {
     return RefCounted::AddRef();
   }
@@ -61,23 +61,40 @@ class BaseTexture : public IDirect3DTexture8,
   GetLevelDesc(UINT Level, D3DSURFACE_DESC* pDesc) override;
 
   /*** IDirect3DResource8 methods ***/
-  virtual HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice)
-      VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE
-  SetPrivateData(REFGUID refguid, CONST void* pData, DWORD SizeOfData,
-                 DWORD Flags) VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE GetPrivateData(
-      REFGUID refguid, void* pData, DWORD* pSizeOfData) VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid)
-      VIRT_NOT_IMPLEMENTED;
-  virtual DWORD STDMETHODCALLTYPE SetPriority(DWORD PriorityNew)
-      VIRT_NOT_IMPLEMENTED;
-  virtual DWORD STDMETHODCALLTYPE GetPriority() VIRT_NOT_IMPLEMENTED;
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice) override;
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, CONST void* pData,
+                                           DWORD SizeOfData,
+                                           DWORD Flags) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void* pData,
+                                           DWORD* pSizeOfData) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  DWORD STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) override {
+    // Bookkeeping only -- we don't implement resource eviction/priority.
+    DWORD previous = priority_;
+    priority_ = PriorityNew;
+    return previous;
+  }
+  DWORD STDMETHODCALLTYPE GetPriority() override { return priority_; }
   virtual void STDMETHODCALLTYPE PreLoad() override {}  // Do nothing.
-  virtual D3DRESOURCETYPE STDMETHODCALLTYPE GetType() VIRT_NOT_IMPLEMENTED;
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {
+    return kind_ == TextureKind::Cube ? D3DRTYPE_CUBETEXTURE
+                                      : D3DRTYPE_TEXTURE;
+  }
   /*** IDirect3DBaseTexture8 methods ***/
-  virtual DWORD STDMETHODCALLTYPE SetLOD(DWORD LODNew) VIRT_NOT_IMPLEMENTED;
-  virtual DWORD STDMETHODCALLTYPE GetLOD() VIRT_NOT_IMPLEMENTED;
+  DWORD STDMETHODCALLTYPE SetLOD(DWORD LODNew) override {
+    // Bookkeeping only -- managed-texture LOD clamping isn't implemented; we
+    // always upload/sample the full mip chain.
+    DWORD previous = lod_;
+    lod_ = LODNew;
+    return previous;
+  }
+  DWORD STDMETHODCALLTYPE GetLOD() override { return lod_; }
   DWORD STDMETHODCALLTYPE GetLevelCount() override;
   using IDirect3DTexture8::AddDirtyRect;
   using IDirect3DTexture8::LockRect;
@@ -98,6 +115,8 @@ class BaseTexture : public IDirect3DTexture8,
   TextureKind kind_;
   Dx8::Usage usage_;
   D3DPOOL pool_;
+  DWORD priority_ = 0;
+  DWORD lod_ = 0;
 
   D3D12_RESOURCE_DESC resource_desc_;
   // One footprint per level.
