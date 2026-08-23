@@ -64,6 +64,21 @@ endif()
 
 # target_compile_options(d3d8 PRIVATE /fsanitize=address)
 
+# Copy just the files that need to be dropped into a game install (the DLL
+# and its matching PDB, nothing else from the build tree) into build/dist/
+# after every build.
+add_custom_command(
+  TARGET d3d8
+  POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+          "${CMAKE_BINARY_DIR}/dist"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:d3d8>"
+          "${CMAKE_BINARY_DIR}/dist/"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_PDB_FILE:d3d8>"
+          "${CMAKE_BINARY_DIR}/dist/"
+  COMMENT "Copying d3d8.dll (+ pdb) to ${CMAKE_BINARY_DIR}/dist"
+  VERBATIM)
+
 if(DX8TO12_USE_ALLOCATOR)
   include(FetchContent)
   include(CMakePrintHelpers)
