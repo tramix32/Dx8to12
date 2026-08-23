@@ -44,9 +44,13 @@ struct RenderState {
   LONG z_bias = 0;
   BOOL range_fog_enable = FALSE;
   BOOL stencil_enable = FALSE;
+  D3DSTENCILOP stencil_fail = D3DSTENCILOP_KEEP;
+  D3DSTENCILOP stencil_zfail = D3DSTENCILOP_KEEP;
   D3DSTENCILOP stencil_pass = D3DSTENCILOP_KEEP;
   D3DCMPFUNC stencil_func = D3DCMP_ALWAYS;
   DWORD stencil_ref = 0;
+  DWORD stencil_mask = 0xFFFFFFFF;
+  DWORD stencil_write_mask = 0xFFFFFFFF;
   D3DCOLOR texture_factor = D3DCOLOR_ARGB(255, 255, 255, 255);
   DWORD lighting = TRUE;
   D3DCOLOR ambient = 0;
@@ -71,6 +75,25 @@ struct RenderState {
       D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN |
       D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA;
   D3DBLENDOP blend_op = D3DBLENDOP_ADD;
+
+  // The rest of these have no effect on rendering (bookkeeping only, to
+  // avoid aborting on Set/GetRenderState) -- see ROADMAP.md.
+  BOOL clipping = TRUE;
+  DWORD clip_plane_enable = 0;
+  BOOL last_pixel = TRUE;
+  DWORD line_pattern = 0;  // D3DLINEPATTERN, same size as DWORD.
+  BOOL z_visible = FALSE;  // Legacy/deprecated even in D3D8.
+  BOOL software_vertex_processing = FALSE;
+  DWORD multisample_mask = 0xFFFFFFFF;
+  D3DPATCHEDGESTYLE patch_edge_style = D3DPATCHEDGE_DISCRETE;
+  float patch_segments = 1.f;
+  DWORD debug_monitor_token = 0;
+  DWORD vertex_blend = 0;  // D3DVERTEXBLENDFLAGS, D3DVBF_DISABLE.
+  BOOL indexed_vertex_blend_enable = FALSE;
+  float tween_factor = 0.f;
+  D3DORDERTYPE position_order = D3DORDER_CUBIC;
+  D3DORDERTYPE normal_order = D3DORDER_LINEAR;
+  std::array<DWORD, 8> wrap = {};  // D3DRS_WRAP0..7, one per texcoord set.
 
   CLANG_PUSH_IGNORE_FLOAT_EQUAL
   bool operator==(const RenderState &) const = default;

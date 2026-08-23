@@ -57,12 +57,20 @@ DWORD &RenderState::GetEnumAtIndex(D3DRENDERSTATETYPE index) {
       return reinterpret_cast<DWORD &>(range_fog_enable);
     case D3DRS_STENCILENABLE:
       return reinterpret_cast<DWORD &>(stencil_enable);
+    case D3DRS_STENCILFAIL:
+      return reinterpret_cast<DWORD &>(stencil_fail);
+    case D3DRS_STENCILZFAIL:
+      return reinterpret_cast<DWORD &>(stencil_zfail);
     case D3DRS_STENCILPASS:
       return reinterpret_cast<DWORD &>(stencil_pass);
     case D3DRS_STENCILFUNC:
       return reinterpret_cast<DWORD &>(stencil_func);
     case D3DRS_STENCILREF:
       return stencil_ref;
+    case D3DRS_STENCILMASK:
+      return stencil_mask;
+    case D3DRS_STENCILWRITEMASK:
+      return stencil_write_mask;
     case D3DRS_TEXTUREFACTOR:
       return texture_factor;
     case D3DRS_LIGHTING:
@@ -107,6 +115,45 @@ DWORD &RenderState::GetEnumAtIndex(D3DRENDERSTATETYPE index) {
       return color_write_enable;
     case D3DRS_BLENDOP:
       return reinterpret_cast<DWORD &>(blend_op);
+    case D3DRS_CLIPPING:
+      return reinterpret_cast<DWORD &>(clipping);
+    case D3DRS_CLIPPLANEENABLE:
+      return clip_plane_enable;
+    case D3DRS_LASTPIXEL:
+      return reinterpret_cast<DWORD &>(last_pixel);
+    case D3DRS_LINEPATTERN:
+      return line_pattern;
+    case D3DRS_ZVISIBLE:
+      return reinterpret_cast<DWORD &>(z_visible);
+    case D3DRS_SOFTWAREVERTEXPROCESSING:
+      return reinterpret_cast<DWORD &>(software_vertex_processing);
+    case D3DRS_MULTISAMPLEMASK:
+      return multisample_mask;
+    case D3DRS_PATCHEDGESTYLE:
+      return reinterpret_cast<DWORD &>(patch_edge_style);
+    case D3DRS_PATCHSEGMENTS:
+      return reinterpret_cast<DWORD &>(patch_segments);
+    case D3DRS_DEBUGMONITORTOKEN:
+      return debug_monitor_token;
+    case D3DRS_VERTEXBLEND:
+      return vertex_blend;
+    case D3DRS_INDEXEDVERTEXBLENDENABLE:
+      return reinterpret_cast<DWORD &>(indexed_vertex_blend_enable);
+    case D3DRS_TWEENFACTOR:
+      return reinterpret_cast<DWORD &>(tween_factor);
+    case D3DRS_POSITIONORDER:
+      return reinterpret_cast<DWORD &>(position_order);
+    case D3DRS_NORMALORDER:
+      return reinterpret_cast<DWORD &>(normal_order);
+    case D3DRS_WRAP0:
+    case D3DRS_WRAP1:
+    case D3DRS_WRAP2:
+    case D3DRS_WRAP3:
+    case D3DRS_WRAP4:
+    case D3DRS_WRAP5:
+    case D3DRS_WRAP6:
+    case D3DRS_WRAP7:
+      return wrap[index - D3DRS_WRAP0];
     default:
       FAIL("Unexpected render state %d", index);
   }
