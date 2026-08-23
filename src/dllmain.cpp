@@ -8,6 +8,21 @@
 
 namespace {
 
+#if defined(_M_IX86)
+// Reads a DWORD from a possibly-invalid address without risking a second,
+// nested crash inside the crash handler itself. Needs its own function (no
+// C++ objects with destructors) because __try/__except can't be mixed with
+// C++ object unwinding in the same function under /EHsc.
+__declspec(noinline) bool SafeReadDword(const void *address, DWORD *out) {
+  __try {
+    *out = *reinterpret_cast<const DWORD *>(address);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#endif
+
 // Logs the module (and offset within it) that `address` falls in, if any --
 // this is usually enough to map a crash address back to source via the PDB
 // even without pulling in dbghelp for full symbolication.
@@ -69,14 +84,40 @@ LONG WINAPI LogCrashAndContinueSearch(EXCEPTION_POINTERS *info) {
   // actually points at the culprit. Log each frame's address and the
   // module+offset it falls in; even without symbol resolution this is
   // usually enough to identify which function made the bad call.
+  //
+  // IMPORTANT: CaptureStackBackTrace() here would capture *this handler's
+  // own* call stack (VEH dispatch -> LogCrashAndContinueSearch), not the
+  // faulted thread's stack at the point of the crash -- it produced
+  // identical-looking frames for completely different crashes before this
+  // was fixed. The actual faulting register state is in
+  // info->ContextRecord; walk the EBP chain from there instead.
+#if defined(_M_IX86)
+  LOG(AixLog::Severity::fatal) << "  call stack (EBP chain from Ebp=0x"
+                               << std::hex << info->ContextRecord->Ebp
+                               << std::dec << "):\n";
+  DWORD ebp = info->ContextRecord->Ebp;
+  for (int i = 0; i < 32 && ebp != 0; ++i) {
+    DWORD return_address = 0, prev_ebp = 0;
+    if (!SafeReadDword(reinterpret_cast<void *>(ebp + 4), &return_address))
+      break;
+    if (!SafeReadDword(reinterpret_cast<void *>(ebp), &prev_ebp)) break;
+    LOG(AixLog::Severity::fatal)
+        << "  #" << i << " " << reinterpret_cast<void *>(return_address)
+        << "\n";
+    LogModuleAndOffset(reinterpret_cast<void *>(return_address));
+    if (prev_ebp <= ebp) break;  // Stack grows down; guard against loops.
+    ebp = prev_ebp;
+  }
+#else
   void *frames[32] = {};
   const USHORT frame_count = CaptureStackBackTrace(0, 32, frames, nullptr);
   LOG(AixLog::Severity::fatal) << "  call stack (" << frame_count
-                               << " frames):\n";
+                               << " frames, approximate -- see comment):\n";
   for (USHORT i = 0; i < frame_count; ++i) {
     LOG(AixLog::Severity::fatal) << "  #" << i << " " << frames[i] << "\n";
     LogModuleAndOffset(frames[i]);
   }
+#endif
 
   return EXCEPTION_CONTINUE_SEARCH;
 }
