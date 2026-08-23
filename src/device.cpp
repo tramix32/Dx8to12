@@ -413,9 +413,13 @@ D3DCAPS8 Device::GetDefaultCaps(UINT adapter_index) {
       .DestBlendCaps = 0x1FFF,
       .AlphaCmpCaps = 0xFF,
       .ShadeCaps = 0xFFFFFFFF,
+      // Deliberately not advertising D3DPTEXTURECAPS_VOLUMEMAP/
+      // MIPVOLUMEMAP: CreateVolumeTexture is an unimplemented stub, and a
+      // compliant game that checks capabilities before using a feature
+      // (rather than just trying it) would otherwise get a clean "yes,
+      // supported" answer here and then abort on the actual create call.
       .TextureCaps = D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_ALPHA |
-                     D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP |
-                     D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP |
+                     D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_MIPMAP |
                      D3DPTEXTURECAPS_MIPCUBEMAP,
       .TextureFilterCaps =
           D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR |
@@ -455,7 +459,12 @@ D3DCAPS8 Device::GetDefaultCaps(UINT adapter_index) {
                               D3DVTXPCAPS_POSITIONALLIGHTS,
       .MaxActiveLights = kMaxActiveLights,
       .MaxUserClipPlanes = 8,
-      .MaxVertexBlendMatrices = 4,
+      // 0, not 4: CreateFixedFunctionVertexShader (vertex_shader.cpp)
+      // explicitly rejects D3DFVF_XYZB1..5 (FVF-based vertex blending) --
+      // advertising real blend-matrix support here would invite a
+      // compliant game doing fixed-function skinning to hit that assert
+      // instead of falling back to shader-based skinning.
+      .MaxVertexBlendMatrices = 0,
       .MaxVertexBlendMatrixIndex = 0,  // ??
 
       .MaxPointSize = 1.f,
