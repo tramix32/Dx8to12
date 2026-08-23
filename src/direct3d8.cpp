@@ -226,7 +226,16 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceFormat(
     ASSERT(Usage == 0);
   } else if (RType == D3DRTYPE_TEXTURE) {
     is_valid &= HasFlag(support.Support1, D3D12_FORMAT_SUPPORT1_TEXTURE2D);
-    ASSERT(Usage == 0);
+    // D3DUSAGE_DYNAMIC textures aren't actually implemented (CreateTexture
+    // FAILs on it -- see BaseTexture::Create) -- report it as unsupported
+    // here too, rather than crashing on the mere capability query. A
+    // well-behaved game checks this before creating a dynamic texture and
+    // falls back to a static one; previously it would never get that far.
+    if (HasFlag(Usage, D3DUSAGE_DYNAMIC)) {
+      is_valid = false;
+      Usage &= ~D3DUSAGE_DYNAMIC;
+    }
+    if (Usage != 0) FAIL("More usage: 0x%X", Usage);
   } else if (RType == D3DRTYPE_CUBETEXTURE) {
     // Cube textures are actually implemented (unlike volume textures, see
     // below) -- this was previously falling into the FAIL default, meaning
@@ -235,7 +244,11 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceFormat(
     // environment maps) would crash on the mere capability query, despite
     // the feature working fine.
     is_valid &= HasFlag(support.Support1, D3D12_FORMAT_SUPPORT1_TEXTURECUBE);
-    ASSERT(Usage == 0);
+    if (HasFlag(Usage, D3DUSAGE_DYNAMIC)) {
+      is_valid = false;
+      Usage &= ~D3DUSAGE_DYNAMIC;
+    }
+    if (Usage != 0) FAIL("More usage: 0x%X", Usage);
   } else {
     // Anything else (D3DRTYPE_VOLUMETEXTURE, D3DRTYPE_VERTEXBUFFER, etc.) --
     // genuinely not implemented. Answer gracefully rather than crashing on a
