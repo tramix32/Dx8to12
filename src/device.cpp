@@ -485,7 +485,7 @@ void Device::InitRootSignatures() {
   }
 
   D3D12_ROOT_SIGNATURE_DESC sig_desc{
-      .NumParameters = root_params.size(),
+      .NumParameters = static_cast<UINT>(root_params.size()),
       .pParameters = root_params.data(),
       .NumStaticSamplers = 0,
       .pStaticSamplers = nullptr,
@@ -736,6 +736,16 @@ HRESULT STDMETHODCALLTYPE Device::SetViewport(const D3DVIEWPORT8 *pViewport) {
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetViewport(D3DVIEWPORT8 *pViewport) {
+  pViewport->X = static_cast<DWORD>(viewport_.TopLeftX);
+  pViewport->Y = static_cast<DWORD>(viewport_.TopLeftY);
+  pViewport->Width = static_cast<DWORD>(viewport_.Width);
+  pViewport->Height = static_cast<DWORD>(viewport_.Height);
+  pViewport->MinZ = viewport_.MinDepth;
+  pViewport->MaxZ = viewport_.MaxDepth;
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetTransform(D3DTRANSFORMSTATETYPE State,
                                                CONST D3DMATRIX *pMatrix) {
   if (State > 511 || State < D3DTS_VIEW ||
@@ -781,12 +791,28 @@ HRESULT STDMETHODCALLTYPE Device::SetMaterial(const D3DMATERIAL8 *pMaterial) {
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetMaterial(D3DMATERIAL8 *pMaterial) {
+  *pMaterial = material_;
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetLight(DWORD Index,
                                            CONST D3DLIGHT8 *light) {
   lights_[Index] = *light;
   if (enabled_lights_.contains(Index)) {
     dirty_flags_ |= DIRTY_FLAG_LIGHTS;
   }
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetLight(DWORD Index, D3DLIGHT8 *light) {
+  if (!lights_.contains(Index)) return D3DERR_INVALIDCALL;
+  *light = lights_[Index];
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetLightEnable(DWORD Index, BOOL *pEnable) {
+  *pEnable = enabled_lights_.contains(Index);
   return S_OK;
 }
 
@@ -835,6 +861,12 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetRenderState(D3DRENDERSTATETYPE State,
+                                                 DWORD *pValue) {
+  *pValue = render_state_.GetEnumAtIndex(State);
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::GetTextureStageState(
     DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD *pValue) {
   NOT_IMPLEMENTED();
@@ -861,6 +893,15 @@ HRESULT STDMETHODCALLTYPE Device::SetTexture(DWORD Stage,
   GpuTexture *texture = dynamic_cast<GpuTexture *>(pTexture);
   bound_textures_[Stage] = InternalPtr(texture);
   dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetTexture(DWORD Stage,
+                                             IDirect3DBaseTexture8 **ppTexture) {
+  if (Stage >= bound_textures_.size()) return D3DERR_INVALIDCALL;
+  GpuTexture *texture = bound_textures_[Stage].Get();
+  *ppTexture = static_cast<IDirect3DTexture8 *>(texture);
+  if (texture) texture->AddRef();
   return S_OK;
 }
 
@@ -931,6 +972,17 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE
+Device::GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) {
+  if (bound_render_target_) {
+    *ppRenderTarget = new GpuSurface(this, bound_render_target_.Get(), 0);
+  } else {
+    *ppRenderTarget =
+        new BackbufferSurface(0, back_buffers_[0]->resource_desc());
+  }
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::CreateVertexShader(const DWORD *pDeclaration,
                                                      const DWORD *pFunction,
                                                      DWORD *pHandle,
@@ -993,10 +1045,20 @@ HRESULT STDMETHODCALLTYPE Device::SetVertexShader(DWORD handle) {
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetVertexShader(DWORD *pHandle) {
+  *pHandle = bound_vertex_shader_;
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetPixelShader(DWORD Handle) {
   if (Handle != 0 && !pixel_shaders_.contains(Handle))
     return D3DERR_INVALIDCALL;
   bound_pixel_shader_ = Handle;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetPixelShader(DWORD *pHandle) {
+  *pHandle = bound_pixel_shader_;
   return S_OK;
 }
 
@@ -1011,6 +1073,16 @@ HRESULT STDMETHODCALLTYPE Device::SetVertexShaderConstant(
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::GetVertexShaderConstant(
+    DWORD Register, void *pConstantData, DWORD ConstantCount) {
+  if ((Register + ConstantCount) >= kNumVsConstRegs || pConstantData == nullptr)
+    return D3DERR_INVALIDCALL;
+
+  memcpy(pConstantData, &bound_vs_cregs_.at(Register),
+         ConstantCount * sizeof(float[4]));
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetStreamSource(
     UINT StreamNumber, IDirect3DVertexBuffer8 *pStreamData, UINT Stride) {
   TRACE_ENTRY(StreamNumber, pStreamData, Stride);
@@ -1018,6 +1090,17 @@ HRESULT STDMETHODCALLTYPE Device::SetStreamSource(
   if (Stride > caps_.MaxStreamStride) return D3DERR_INVALIDCALL;
   Buffer *buffer = static_cast<Buffer *>(pStreamData);
   bound_vertex_streams_[StreamNumber] = InternalPtr(buffer);
+  bound_vertex_stream_strides_[StreamNumber] = Stride;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetStreamSource(
+    UINT StreamNumber, IDirect3DVertexBuffer8 **ppStreamData, UINT *pStride) {
+  if (StreamNumber >= kMaxVertexStreams) return D3DERR_INVALIDCALL;
+  Buffer *buffer = bound_vertex_streams_[StreamNumber].Get();
+  *ppStreamData = buffer;
+  if (buffer) buffer->AddRef();
+  *pStride = bound_vertex_stream_strides_[StreamNumber];
   return S_OK;
 }
 
@@ -1025,6 +1108,15 @@ HRESULT STDMETHODCALLTYPE Device::SetIndices(IDirect3DIndexBuffer8 *pIndexData,
                                              UINT BaseVertexIndex) {
   bound_index_buffer_ = InternalPtr(static_cast<Buffer *>(pIndexData));
   bound_base_vertex_ = BaseVertexIndex;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetIndices(
+    IDirect3DIndexBuffer8 **ppIndexData, UINT *pBaseVertexIndex) {
+  Buffer *buffer = bound_index_buffer_.Get();
+  *ppIndexData = buffer;
+  if (buffer) buffer->AddRef();
+  *pBaseVertexIndex = bound_base_vertex_;
   return S_OK;
 }
 
@@ -1156,7 +1248,8 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
           },
       .InputLayout = {.pInputElementDescs =
                           vertex_shader->decl.input_elements.data(),
-                      .NumElements = vertex_shader->decl.input_elements.size()},
+                      .NumElements = static_cast<UINT>(
+                          vertex_shader->decl.input_elements.size())},
       .PrimitiveTopologyType = d3d12_prim_type,
       .NumRenderTargets = 1,
       .RTVFormats = {back_buffers_[0]->resource_desc().Format},

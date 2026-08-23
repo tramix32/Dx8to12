@@ -167,7 +167,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   SetRenderTarget(IDirect3DSurface8 *pRenderTarget,
                   IDirect3DSurface8 *pNewZStencil) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) PURE;
+  GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) override;
   virtual HRESULT STDMETHODCALLTYPE
   GetDepthStencilSurface(IDirect3DSurface8 **ppZStencilSurface) override;
   virtual HRESULT STDMETHODCALLTYPE BeginScene(THIS) override;
@@ -183,17 +183,17 @@ class Device : public IDirect3DDevice8, RefCounted {
                                                       CONST D3DMATRIX *) PURE;
   virtual HRESULT STDMETHODCALLTYPE
   SetViewport(CONST D3DVIEWPORT8 *pViewport) override;
-  virtual HRESULT STDMETHODCALLTYPE GetViewport(D3DVIEWPORT8 *pViewport) PURE;
+  virtual HRESULT STDMETHODCALLTYPE GetViewport(D3DVIEWPORT8 *pViewport) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetMaterial(CONST D3DMATERIAL8 *pMaterial) override;
-  virtual HRESULT STDMETHODCALLTYPE GetMaterial(D3DMATERIAL8 *pMaterial) PURE;
+  virtual HRESULT STDMETHODCALLTYPE GetMaterial(D3DMATERIAL8 *pMaterial) override;
   virtual HRESULT STDMETHODCALLTYPE SetLight(DWORD Index,
                                              CONST D3DLIGHT8 *) override;
-  virtual HRESULT STDMETHODCALLTYPE GetLight(DWORD Index, D3DLIGHT8 *) PURE;
+  virtual HRESULT STDMETHODCALLTYPE GetLight(DWORD Index, D3DLIGHT8 *) override;
   virtual HRESULT STDMETHODCALLTYPE LightEnable(DWORD Index,
                                                 BOOL Enable) override;
   virtual HRESULT STDMETHODCALLTYPE GetLightEnable(DWORD Index,
-                                                   BOOL *pEnable) PURE;
+                                                   BOOL *pEnable) override;
   virtual HRESULT STDMETHODCALLTYPE SetClipPlane(DWORD Index,
                                                  CONST float *pPlane) PURE;
   virtual HRESULT STDMETHODCALLTYPE GetClipPlane(DWORD Index,
@@ -201,7 +201,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE State,
                                                    DWORD Value) override;
   virtual HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State,
-                                                   DWORD *pValue) PURE;
+                                                   DWORD *pValue) override;
   virtual HRESULT STDMETHODCALLTYPE BeginStateBlock(THIS) PURE;
   virtual HRESULT STDMETHODCALLTYPE EndStateBlock(DWORD *pToken) PURE;
   virtual HRESULT STDMETHODCALLTYPE ApplyStateBlock(DWORD Token) PURE;
@@ -216,7 +216,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE
   GetClipStatus(D3DCLIPSTATUS8 *pClipStatus) PURE;
   virtual HRESULT STDMETHODCALLTYPE
-  GetTexture(DWORD Stage, IDirect3DBaseTexture8 **ppTexture) PURE;
+  GetTexture(DWORD Stage, IDirect3DBaseTexture8 **ppTexture) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture) override;
   virtual HRESULT STDMETHODCALLTYPE GetTextureStageState(
@@ -262,12 +262,12 @@ class Device : public IDirect3DDevice8, RefCounted {
   CreateVertexShader(CONST DWORD *pDeclaration, CONST DWORD *pFunction,
                      DWORD *pHandle, DWORD Usage) override;
   virtual HRESULT STDMETHODCALLTYPE SetVertexShader(DWORD Handle) override;
-  virtual HRESULT STDMETHODCALLTYPE GetVertexShader(DWORD *pHandle) PURE;
+  virtual HRESULT STDMETHODCALLTYPE GetVertexShader(DWORD *pHandle) override;
   HRESULT STDMETHODCALLTYPE DeleteVertexShader(DWORD Handle) override;
   HRESULT STDMETHODCALLTYPE SetVertexShaderConstant(
       DWORD Register, CONST void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE GetVertexShaderConstant(
-      DWORD Register, void *pConstantData, DWORD ConstantCount) PURE;
+      DWORD Register, void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE GetVertexShaderDeclaration(
       DWORD Handle, void *pData, DWORD *pSizeOfData) PURE;
   virtual HRESULT STDMETHODCALLTYPE
@@ -277,15 +277,16 @@ class Device : public IDirect3DDevice8, RefCounted {
                   UINT Stride) override;
   virtual HRESULT STDMETHODCALLTYPE
   GetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer8 **ppStreamData,
-                  UINT *pStride) PURE;
+                  UINT *pStride) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetIndices(IDirect3DIndexBuffer8 *pIndexData, UINT BaseVertexIndex) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetIndices(IDirect3DIndexBuffer8 **ppIndexData, UINT *pBaseVertexIndex) PURE;
+  GetIndices(IDirect3DIndexBuffer8 **ppIndexData,
+             UINT *pBaseVertexIndex) override;
   HRESULT STDMETHODCALLTYPE CreatePixelShader(CONST DWORD *pFunction,
                                               DWORD *pHandle) override;
   HRESULT STDMETHODCALLTYPE SetPixelShader(DWORD Handle) override;
-  virtual HRESULT STDMETHODCALLTYPE GetPixelShader(DWORD *pHandle) PURE;
+  virtual HRESULT STDMETHODCALLTYPE GetPixelShader(DWORD *pHandle) override;
   HRESULT STDMETHODCALLTYPE DeletePixelShader(DWORD Handle) override;
   virtual HRESULT STDMETHODCALLTYPE SetPixelShaderConstant(
       DWORD Register, CONST void *pConstantData, DWORD ConstantCount) PURE;
@@ -392,6 +393,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   std::array<InternalPtr<Buffer>, kMaxVertexStreams>
       bound_vertex_streams_;  // Have to store as vertex buffer because of
                               // ambiguous cast.
+  std::array<UINT, kMaxVertexStreams> bound_vertex_stream_strides_ = {};
   InternalPtr<Buffer> bound_index_buffer_;
   uint32_t bound_base_vertex_ = 0;
 

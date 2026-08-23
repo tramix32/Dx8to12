@@ -1,0 +1,90 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Dx8to12 implements the Direct3D 8 API (`d3d8.dll`) as a shim on top of Direct3D 12. It's a drop-in replacement DLL: a DX8 game loads `d3d8.dll`, calls `Direct3DCreate8` (the sole export, see `src/d3d8.def`), and every DX8 call gets translated into D3D12 command lists/resources under the hood.
+
+Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below.
+
+## Build
+
+Requires Windows + MSVC (Visual Studio toolchain) and the Windows SDK (`DXGI.lib`, `D3D12.lib`, `D3DCompiler.lib`, `dxguid.lib`). CMake ≥ 3.11.
+
+**Must be built as x86 (Win32), not x64.** DX8-era games (Battlefield 1942, Age of Mythology) are 32-bit processes, and a 64-bit `d3d8.dll` cannot be loaded into a 32-bit process — Windows rejects it at `LoadLibrary` time regardless of anything in the code. This is a pure architecture-of-the-binary constraint, not a D3D12 capability limit: `d3d12.dll`/`D3D12.lib` fully support x86 client processes via SysWOW64 on x64 Windows, so the graphics layer itself is not the bottleneck. Always pass `-arch=x86` to `VsDevCmd.bat` (or otherwise select the x86 toolset) before configuring — an x64 build will compile and link cleanly with zero code changes, which makes the mistake easy to make and easy to miss until you try to actually load the DLL into a game.
+
+From an x86 Developer Command Prompt (or after running `VsDevCmd.bat -arch=x86`):
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build
+```
+
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5` is required with CMake ≥4.0 because the vendored `CMakeRC.cmake` (third-party resource-embedding helper) declares an old `cmake_minimum_required` that newer CMake rejects outright without it.
+
+Output is `build/d3d8.dll` (target name `d3d8`). There is no test suite — validation is "run a real DX8 game against the built DLL."
+
+Notable CMake options (top of `CMakeLists.txt`):
+- `DX8TO12_USE_ALLOCATOR` (default OFF) — pulls in D3D12MemoryAllocator via `FetchContent` instead of manual suballocation.
+- `DX8TO12_ENABLE_VALIDATION` (default ON) — enables extra internal validation/assertions.
+
+On Clang, warnings are treated as errors (`-Werror`); MSVC uses `/W4` with a couple of disabled warnings. Precompiled header covers `aixlog.hpp` and `<d3d12.h>`.
+
+Logging goes to `log.txt` next to the source tree (`CURRENT_SOURCE_DIR` baked in at compile time), via AixLog (`third_party/aixlog.hpp`).
+
+## Architecture
+
+### Layer mapping
+
+Each DX8 COM interface has a corresponding implementation class, all under `namespace Dx8to12`:
+
+| DX8 interface | Implementation | File |
+|---|---|---|
+| `IDirect3D8` | `Direct3D8` | `direct3d8.h/.cpp` |
+| `IDirect3DDevice8` | `Device` | `device.h/.cpp` |
+| `IDirect3DSurface8` | `BaseSurface` + `GpuSurface` / `CpuSurface` / `BackbufferSurface` | `surface.h/.cpp` |
+| `IDirect3DTexture8` / `IDirect3DCubeTexture8` | `BaseTexture` + `GpuTexture` / `CpuTexture` / `DynamicTexture` | `texture.h/.cpp` |
+| `IDirect3DVertexBuffer8` / `IDirect3DIndexBuffer8` | `Buffer` | `buffer.h/.cpp` |
+
+`Device` (`device.cpp`, ~1600 lines) is the center of gravity: it owns the D3D12 device, command queue/lists, root signatures, and all fixed-function state, and does the actual translation from DX8 draw calls into D3D12 PSOs and command list submission (`CreatePSO`, `PrepareDrawCall`, `SubmitAndWait`).
+
+### Resource variants (Gpu / Cpu / Dynamic)
+
+Textures and surfaces come in three flavors reflecting DX8 memory pools and usage flags, each with its own D3D12 backing strategy:
+- **Gpu** (`GpuTexture`/`GpuSurface`) — default-pool GPU-resident resource.
+- **Cpu** (`CpuTexture`/`CpuSurface`) — CPU-visible copy kept alongside (used for `D3DPOOL_MANAGED`/lockable resources); `CpuTexture::CopyToGpuTexture` / `CopySubresourceToGpuTexture` push updates to the GPU-side twin.
+- **Dynamic** (`DynamicTexture`) — discard-write-only GPU resource for `D3DUSAGE_DYNAMIC`, simpler than the general dynamic buffer path since it only supports discard.
+
+`Buffer` (vertex/index buffers) has an analogous dynamic path via `DynamicRingBuffer` (`dynamic_ring_buffer.h/.cpp`) for `D3DUSAGE_DYNAMIC` buffers that get remapped every frame.
+
+`PoolHeap` (`pool_heap.h/.cpp`) manages descriptor heap suballocation for SRV/RTV/DSV/sampler descriptors (limits in `device_limits.h`: `kMaxNumSrvs`, `kMaxNumRtvs`, `kMaxSamplerStates`, etc.).
+
+### Shader translation
+
+- Fixed-function pipeline: DX8 render state (lighting, fog, texture stage state) drives dynamically-selected/generated HLSL in `src/shaders/` (`ff_vertex_shader.hlsl`, `lighting.hlsl`, `ps_common.hlsl`), assembled by `ff_pixel_shader.cpp` based on active `TextureStageState`. Shaders are compiled at build time into a CMakeRC resource archive (`Dx8to12_shaders` target, `src/shaders/CMakeLists.txt`) and loaded from memory at runtime — there is no runtime file I/O for shaders.
+- Programmable shaders: DX8 vertex shader bytecode (`vs_1_1`) is parsed and transpiled by `shader_parser.cpp`/`shader_parser.h` (see `vertex_shader.cpp` for the vertex declaration/shader object) into HLSL matching `programmable_vs.hlsl`/`programmable_ps.hlsl` conventions, then compiled via `D3DCompiler`. Only a subset of `ps_1_3` is supported — extend `shader_parser.cpp` and the `common.hlsl`/`ps_common.hlsl` templates together when adding opcodes.
+
+### Command submission model
+
+`Device::SubmitAndWait` drives frame submission; `WaitForFrame` / `FreeFrameResources` manage a fence-based `kNumBackBuffers`-deep (2) frame pipeline. `MarkBufferForPersist` tracks buffers that must outlive the current command list until the GPU has consumed them.
+
+### Root signatures
+
+`Device::InitRootSignatures` builds the D3D12 root signature(s) once at device init/reset time: constant buffers for VS/PS constants + per-stage descriptor tables for textures and samplers (`kMaxTexStages` = 8). PSOs are created/cached per draw-call shape in `CreatePSO`.
+
+### Implementation-coverage pattern (important when adding methods)
+
+Every unimplemented DX8 method is marked with the `PURE`/`VIRT_NOT_IMPLEMENTED` macro pair (`src/utils/asserts.h`) instead of being silently missing:
+
+```cpp
+#define VIRT_NOT_IMPLEMENTED override { NOT_IMPLEMENTED(); }
+```
+
+In `device.h`, `#define PURE VIRT_NOT_IMPLEMENTED` is active for the whole `IDirect3DDevice8` method block, then `#undef`'d and redefined to `= 0` afterward for the class's own abstract-ish private helpers. `NOT_IMPLEMENTED()` shows a message box and `abort()`s at runtime — it's a loud, file/line/function-tagged crash, not a silent no-op. When implementing a previously-stubbed method, change its trailing `PURE` to `override` and give it a body in the corresponding `.cpp`. This pattern is also used in `surface.h`, `texture.h`, and `buffer.h` for their respective interfaces.
+
+Known gap areas (see `ROADMAP.md` for the prioritized plan): most `Get*` accessors that mirror an implemented `Set*` are stubbed even though the backing state (`RenderState` in `render_state.h`, `lights_` map, etc.) is already tracked on `Device`; `IDirect3DSurface8::LockRect`/`UnlockRect` are stubbed on all surface types even though the equivalent texture-level `LockRect` is implemented; state blocks (`Begin/End/Apply/Capture/DeleteStateBlock`) are unimplemented while `CreateStateBlock` misleadingly returns `S_OK`.
+
+### Utilities
+
+`util.h` defines `ComPtr` (COM ref-counted wrapper, distinct from `Microsoft::WRL::ComPtr`), `RefCounted`/`InternalPtr` (this project's own non-COM ref-counting for internal-only objects), and `ComWrap`. `utils/dx_utils.h/.cpp` has DX8↔DXGI format conversion and misc D3D12 helpers. `utils/asserts.h` defines `ASSERT`, `ASSERT_HR`, `HR_OR_RETURN`, `FAIL`, `NOT_IMPLEMENTED` — the project's only error-handling vocabulary (no exceptions).

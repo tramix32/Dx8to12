@@ -3,6 +3,7 @@ vsbuild/
 private/
 dumps/
 build/
+build-x86/
 
 CMakeLists.txt.user
 CMakeCache.txt
