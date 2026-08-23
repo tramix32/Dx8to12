@@ -249,6 +249,7 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   // ASSERT(options12.EnhancedBarriersSupported);
 
   ASSERT_HR(Init(presentParams));
+  LOG(INFO) << "Create: done, returning to Direct3D8::CreateDevice()\n";
   return true;
 }
 
@@ -376,6 +377,7 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
   ASSERT_HR(Reset(&params));
 
   InitRootSignatures();
+  LOG(INFO) << "Init: done, returning to Create()\n";
   return S_OK;
 }
 
@@ -583,6 +585,7 @@ D3DCAPS8 Device::GetDefaultCaps(UINT adapter_index) {
 }
 
 void Device::InitRootSignatures() {
+  LOG(INFO) << "InitRootSignatures: start\n";
   std::vector<D3D12_ROOT_PARAMETER> root_params{
       {
           // Cbuffer 0: Transforms cbuffer.
@@ -645,6 +648,7 @@ void Device::InitRootSignatures() {
       .pStaticSamplers = nullptr,
       .Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
 
+  LOG(INFO) << "InitRootSignatures: D3D12SerializeRootSignature\n";
   ComPtr<ID3DBlob> sig_blob, error_blob;
   HRESULT hr = D3D12SerializeRootSignature(
       &sig_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, sig_blob.GetForInit(),
@@ -654,11 +658,13 @@ void Device::InitRootSignatures() {
          (const char *)error_blob->GetBufferPointer());
   }
 
+  LOG(INFO) << "InitRootSignatures: CreateRootSignature\n";
   ASSERT_HR(d3d12_device_->CreateRootSignature(
       0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
       IID_PPV_ARGS(main_root_sig_.GetForInit())));
 
   // Create the cbuffers.
+  LOG(INFO) << "InitRootSignatures: creating cbuffers\n";
   vs_cbuffer_ = ComOwn(new DynamicBuffer());
   vs_cbuffer_->InitAsBuffer(this, sizeof(VertexCBuffer), Dx8::Usage::Dynamic,
                             D3DPOOL_SYSTEMMEM);
@@ -677,6 +683,7 @@ void Device::InitRootSignatures() {
   ps_creg_cbuffer_ = ComOwn(new DynamicBuffer());
   ps_creg_cbuffer_->InitAsBuffer(this, sizeof(float[4]) * kNumPsConstRegs,
                                  Dx8::Usage::Dynamic, D3DPOOL_SYSTEMMEM);
+  LOG(INFO) << "InitRootSignatures: done\n";
 }
 
 HRESULT STDMETHODCALLTYPE Device::GetDeviceCaps(D3DCAPS8 *pCaps) {

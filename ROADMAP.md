@@ -203,6 +203,14 @@ Noted in passing: `Reset()` calls `WaitForFrame(next_fence_ - 1)` a second time 
 
 Added checkpoints through the rest of `Reset()`: after releasing old back buffers/depth-stencil, around `ResizeBuffers`, around depth-stencil texture (re)creation, around re-acquiring the new back buffers, and around the final allocator/command-list reset. The next crash log will show exactly which of these is the last one logged before the fault.
 
+## Major breakthrough: the crash is AFTER `Reset()` returns successfully -- likely not our bug at all
+
+The `Reset()` checkpoints from the last commit resolved it: the log showed `"Reset: done"` -- **`Reset()` completed entirely successfully**, all the way through the final allocator/command-list reset. The crash happens *after* that, with nothing else logged, meaning it's in `Device::Init()`'s remaining two lines (`InitRootSignatures(); return S_OK;`), or -- more likely given `InitRootSignatures()` does nothing but internal D3D12 root-signature/cbuffer setup with zero interaction with the game or its window -- **after control returns all the way back to the game**, through `Init()` → `Create()` → `Direct3D8::CreateDevice()` → back into `gta-vc.exe`'s own `CreateDevice` wrapper.
+
+This reframes the whole investigation: every crash signature seen so far (small-offset-from-near-null reads: `0x28`, `0x1`, `0x20`; faulting addresses in unmapped memory or inside `gta-vc.exe`'s own code) is consistent with **the game's own code, immediately after `CreateDevice` returns a valid device, dereferencing something that's null on its side** -- not necessarily anything we're doing wrong. Added `LOG(INFO)` checkpoints at the exact returns of `InitRootSignatures()`, `Init()`, `Create()`, and `Direct3D8::CreateDevice()` (the last line before control returns to the game) to nail down definitively whether the crash is before or after that handoff.
+
+**If the next log shows `"CreateDevice: returning device to caller"` before the crash, this is very likely a bug on the game's side (or a real-vs-our-implementation behavioral difference the game depends on) rather than something in our `Reset`/`Init` sequence** -- would need to shift focus to *what the game does immediately after `CreateDevice` succeeds* (per the earlier static call-site analysis: likely `GetDeviceCaps`, `SetRenderState`, or one of the many `Create*` calls RenderWare makes during its own post-device-creation setup) rather than continuing to suspect `Reset()`/`SubmitAndWait()`, which are now confirmed innocent.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
