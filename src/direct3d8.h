@@ -62,9 +62,7 @@ class Direct3D8 : public IDirect3D8, RefCounted {
 
   virtual __declspec(nothrow) HRESULT __stdcall CheckDeviceMultiSampleType(
       UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat,
-      BOOL Windowed, D3DMULTISAMPLE_TYPE MultiSampleType) override {
-    NOT_IMPLEMENTED();
-  }
+      BOOL Windowed, D3DMULTISAMPLE_TYPE MultiSampleType) override;
 
   virtual __declspec(nothrow) HRESULT
       __stdcall CheckDepthStencilMatch(UINT Adapter, D3DDEVTYPE DeviceType,

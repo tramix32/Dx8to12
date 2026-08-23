@@ -27,14 +27,20 @@ Skipped, not implementable as a cheap mirror — their `Set*` counterpart is its
 
 These four need their `Set*` implemented first (small features in their own right), so they've been pushed to Phase 6.
 
-## Phase 2 — Surface LockRect/UnlockRect
+## Real-game feedback (2026-08-23): `CheckDeviceMultiSampleType`
 
-Highest functional-impact gap. `BaseSurface` only implements `GetDesc`; `LockRect`/`UnlockRect`/`QueryInterface`/`GetDevice`/`Set/GetPrivateData`/`FreePrivateData` all abort. Breaks: screenshots, render-target readback, anything using `CreateImageSurface`.
+Reported crash from an actual test run: `IDirect3D8::CheckDeviceMultiSampleType` was a bare `NOT_IMPLEMENTED()` stub, and a real game's adapter-capability probing hit it before device creation even started — this jumps ahead of the phased plan below because it's an empirically confirmed blocker, not a guess.
 
-- `GpuSurface::LockRect/UnlockRect` — delegate to the owning `GpuTexture`'s per-subresource `LockRect`/`UnlockRect` (already implemented in `texture.cpp`), don't duplicate the staging logic.
-- `CpuSurface::LockRect/UnlockRect` — delegate to `CpuTexture`, data is already CPU-resident (`data_ptr_`).
-- `BackbufferSurface::LockRect` — needs a staging-heap readback path (D3D12 copy + fence wait); implement `D3DLOCK_READONLY` first.
-- `QueryInterface`, `GetDevice`, `Set/GetPrivateData`, `FreePrivateData` on surfaces — trivial, mirror the equivalent already-implemented `Device`/`Texture` versions.
+Fixed in `direct3d8.cpp`: only `D3DMULTISAMPLE_NONE` reports as available (`S_OK`); any actual multisample level returns `D3DERR_NOTAVAILABLE`. This isn't a stopgap — `Device::CreatePSO` always builds PSOs with `SampleDesc.Count = 1`, so there is no real MSAA implementation to honestly report "yes" for. Games probing MSAA levels top-down will fall back to no-AA and continue, instead of believing they got antialiasing they silently didn't. True MSAA support (rendering to a multisampled RT + resolve) would be new work, not covered by this fix — add it here as a later phase if a game turns out to depend on it rather than falling back gracefully.
+
+## Phase 2 — Surface LockRect/UnlockRect (done, 2026-08-23)
+
+Was the highest functional-impact gap: `BaseSurface` only implemented `GetDesc`, so screenshots, render-target readback, and `CreateImageSurface` all aborted.
+
+- `GpuSurface::LockRect/UnlockRect` — on a `D3DPOOL_MANAGED` texture, delegates straight to the owning `GpuTexture`'s per-subresource `LockRect`/`UnlockRect` (already implemented in `texture.cpp`). On `D3DPOOL_DEFAULT` (lockable render targets), goes through the new GPU readback path below.
+- `CpuSurface::LockRect/UnlockRect` — reads straight from the footprint/pointer captured at `GetSurfaceLevel` time (`compact_pitch_`/`data_ptr_`), no delegation needed.
+- `BackbufferSurface::LockRect` and `GpuSurface::LockRect` (default-pool case) share `BaseSurface::LockGpuReadback`/`UnlockGpuReadback` (`surface.cpp`): create a `D3D12_HEAP_TYPE_READBACK` buffer sized via the new `BaseTexture::GetFootprint` accessor, `CopyTextureRegion` the subresource into it, then call `Device::SubmitAndWait(false)` to flush and block until done (reusing the exact flush-mid-frame path `Device::WaitForFrame` already relies on — no new fence code), then `Map` it. Read-path only; a locked render target is not expected to be written back through `Unlock`.
+- `QueryInterface`, `GetDevice` on surfaces — implemented, mirror the equivalent `Device`/`Texture` patterns. `SetPrivateData`/`GetPrivateData`/`FreePrivateData` return `D3DERR_NOTAVAILABLE` (same choice already made for the palette APIs — no private-data storage exists, and returning a clean error is preferable to a fake success). `GetContainer` is still unimplemented (rare, pushed to Phase 6).
 
 ## Phase 3 — Standalone surface creation
 

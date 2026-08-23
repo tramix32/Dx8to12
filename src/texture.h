@@ -34,7 +34,13 @@ class BaseTexture : public IDirect3DTexture8,
 
   D3DSURFACE_DESC GetSurfaceDesc(uint32_t subresource) const;
 
+  const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& GetFootprint(
+      uint32_t subresource) const {
+    return footprints_[subresource];
+  }
+
   TextureKind kind() const { return kind_; }
+  Device* device() const { return device_; }
 
  protected:
   BaseTexture(Device* device, TextureKind kind, Dx8::Usage usage, D3DPOOL pool,

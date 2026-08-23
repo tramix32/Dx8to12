@@ -540,7 +540,7 @@ Device::GetBackBuffer(UINT BackBuffer, D3DBACKBUFFER_TYPE Type,
   ASSERT(BackBuffer == 0);
   ASSERT(ppBackBuffer);
   *ppBackBuffer =
-      new BackbufferSurface(BackBuffer, back_buffers_[0]->resource_desc());
+      new BackbufferSurface(this, BackBuffer, back_buffers_[0].get());
   return S_OK;
 }
 
@@ -978,7 +978,7 @@ Device::GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) {
     *ppRenderTarget = new GpuSurface(this, bound_render_target_.Get(), 0);
   } else {
     *ppRenderTarget =
-        new BackbufferSurface(0, back_buffers_[0]->resource_desc());
+        new BackbufferSurface(this, 0, back_buffers_[0].get());
   }
   return S_OK;
 }

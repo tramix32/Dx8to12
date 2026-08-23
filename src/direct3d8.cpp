@@ -231,6 +231,23 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceFormat(
 }
 
 HRESULT
+STDMETHODCALLTYPE Direct3D8::CheckDeviceMultiSampleType(
+    UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT SurfaceFormat,
+    BOOL Windowed, D3DMULTISAMPLE_TYPE MultiSampleType) {
+  if (Adapter >= adapters_.size())
+    return D3DERR_INVALIDCALL;
+  else if (DeviceType != D3DDEVTYPE_HAL)
+    return D3DERR_NOTAVAILABLE;
+  // The rasterization pipeline always builds PSOs with a sample count of 1
+  // (see Device::CreatePSO) -- there is no multisampling implementation to
+  // back a "yes" answer here. Only report the no-AA case as available so
+  // callers fall back cleanly instead of believing MSAA is active when it
+  // silently isn't.
+  if (MultiSampleType == D3DMULTISAMPLE_NONE) return S_OK;
+  return D3DERR_NOTAVAILABLE;
+}
+
+HRESULT
 STDMETHODCALLTYPE Direct3D8::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType,
                                            D3DCAPS8 *pCaps) {
   *pCaps = Device::GetDefaultCaps(Adapter);

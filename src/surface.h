@@ -22,8 +22,8 @@ class BaseSurface : public IDirect3DSurface8, public RefCounted {
 
  public:
   /*** IUnknown methods ***/
-  virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj)
-      VIRT_NOT_IMPLEMENTED;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void** ppvObj) override;
   virtual ULONG STDMETHODCALLTYPE AddRef(THIS) override {
     return RefCounted::AddRef();
   }
@@ -34,15 +34,19 @@ class BaseSurface : public IDirect3DSurface8, public RefCounted {
   /*** IDirect3DSurface8 methods ***/
   HRESULT STDMETHODCALLTYPE GetDesc(D3DSURFACE_DESC* pDesc) override;
 
-  virtual HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice)
-      VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE
-  SetPrivateData(REFGUID refguid, CONST void* pData, DWORD SizeOfData,
-                 DWORD Flags) VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE GetPrivateData(
-      REFGUID refguid, void* pData, DWORD* pSizeOfData) VIRT_NOT_IMPLEMENTED;
-  virtual HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid)
-      VIRT_NOT_IMPLEMENTED;
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice) override;
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, CONST void* pData,
+                                           DWORD SizeOfData,
+                                           DWORD Flags) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void* pData,
+                                           DWORD* pSizeOfData) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override {
+    return D3DERR_NOTAVAILABLE;
+  }
   virtual HRESULT STDMETHODCALLTYPE
   GetContainer(REFIID riid, void** ppContainer) VIRT_NOT_IMPLEMENTED;
 
@@ -52,10 +56,19 @@ class BaseSurface : public IDirect3DSurface8, public RefCounted {
   virtual HRESULT STDMETHODCALLTYPE UnlockRect(THIS) VIRT_NOT_IMPLEMENTED;
 
  protected:
-  BaseSurface(SurfaceKind kind) : kind_(kind) {}
+  BaseSurface(SurfaceKind kind, Device* device) : kind_(kind), device_(device) {}
+
+  // Shared GPU->CPU readback path for surfaces backed by a non-lockable
+  // (D3DPOOL_DEFAULT) GPU texture, e.g. lockable render targets and the
+  // backbuffer. Blocks until the copy has completed on the GPU.
+  HRESULT LockGpuReadback(GpuTexture* texture, uint32_t subresource,
+                          D3DLOCKED_RECT* pLockedRect, DWORD Flags);
+  HRESULT UnlockGpuReadback();
 
   SurfaceKind kind_;
+  Device* device_;
   D3DSURFACE_DESC desc_;
+  ComPtr<ID3D12Resource> readback_resource_;
 };
 
 class GpuSurface : public BaseSurface {
@@ -65,9 +78,11 @@ class GpuSurface : public BaseSurface {
   GpuTexture* texture() { return texture_.get(); }
   uint32_t subresource() const { return subresource_; }
 
- private:
-  Device* device_;  // texture_ already holds device ref.
+  HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT* pLockedRect,
+                                     CONST RECT* pRect, DWORD Flags) override;
+  HRESULT STDMETHODCALLTYPE UnlockRect(THIS) override;
 
+ private:
   D3DSURFACE_DESC desc_;
   ComPtr<GpuTexture> texture_;
   uint32_t subresource_;
@@ -82,6 +97,10 @@ class CpuSurface : public BaseSurface {
   }
 
   int compact_pitch() const { return compact_pitch_; }
+
+  HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT* pLockedRect,
+                                     CONST RECT* pRect, DWORD Flags) override;
+  HRESULT STDMETHODCALLTYPE UnlockRect(THIS) override;
 
  private:
   CpuSurface(CpuTexture* texture, int level,
@@ -101,11 +120,16 @@ class CpuSurface : public BaseSurface {
 
 class BackbufferSurface : public BaseSurface {
  public:
-  BackbufferSurface(int index, const D3D12_RESOURCE_DESC& desc);
+  BackbufferSurface(Device* device, int index, GpuTexture* texture);
 
   int index() const { return index_; }
 
+  HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT* pLockedRect,
+                                     CONST RECT* pRect, DWORD Flags) override;
+  HRESULT STDMETHODCALLTYPE UnlockRect(THIS) override;
+
  private:
   int index_;
+  ComPtr<GpuTexture> texture_;
 };
 }  // namespace Dx8to12
