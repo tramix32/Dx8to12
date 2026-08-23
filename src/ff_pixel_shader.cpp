@@ -85,6 +85,7 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
   // Prepare any temporary arguments.
   switch (op) {
     case D3DTOP_BLENDTEXTUREALPHA:
+    case D3DTOP_BLENDTEXTUREALPHAPM:
       ASSERT(s.stage_has_texture(stage));
       ss << "alpha = ";
       GenerateArgValue(stage, s.ts[stage], D3DTA_TEXTURE, ss);
@@ -95,6 +96,9 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
       break;
     case D3DTOP_BLENDCURRENTALPHA:
       ss << "alpha = result_color.a;\n";
+      break;
+    case D3DTOP_BLENDDIFFUSEALPHA:
+      ss << "alpha = diffuse_color.a;" << endl;
       break;
     default:
       break;
@@ -122,11 +126,29 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
     case D3DTOP_ADDSIGNED:
       ss << "arg1 + arg2  - 0.5f";
       break;
-    case D3DTOP_BLENDFACTORALPHA:
-      ss << "arg1*alpha + arg2*(1.f-alpha)";
+    case D3DTOP_ADDSIGNED2X:
+      ss << "(arg1 + arg2 - 0.5f) * 2.f";
       break;
+    case D3DTOP_SUBTRACT:
+      ss << "arg1 - arg2";
+      break;
+    case D3DTOP_ADDSMOOTH:
+      ss << "arg1 + arg2 - arg1*arg2";
+      break;
+    case D3DTOP_BLENDDIFFUSEALPHA:
+    case D3DTOP_BLENDFACTORALPHA:
     case D3DTOP_BLENDTEXTUREALPHA:
     case D3DTOP_BLENDCURRENTALPHA:
+      // Same "Arg1*Alpha + Arg2*(1-Alpha)" formula for all four -- they only
+      // differ in where `alpha` comes from (set above). Pre-existing bug fix:
+      // BLENDTEXTUREALPHA/BLENDCURRENTALPHA previously used "arg1 +
+      // arg2*(1-alpha)" (missing the *alpha on arg1), which is actually the
+      // formula for the *premultiplied* variant, D3DTOP_BLENDTEXTUREALPHAPM.
+      ss << "arg1*alpha + arg2*(1.f-alpha)";
+      break;
+    case D3DTOP_BLENDTEXTUREALPHAPM:
+      // Arg1 is assumed pre-multiplied by alpha already, so it isn't
+      // multiplied by alpha again here.
       ss << "arg1 + arg2*(1.f-alpha)";
       break;
     case D3DTOP_DOTPRODUCT3:
@@ -179,6 +201,15 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
         break;
       case D3DCMP_GREATER:
         ss << "> alpha_ref";
+        break;
+      case D3DCMP_EQUAL:
+        ss << "== alpha_ref";
+        break;
+      case D3DCMP_NOTEQUAL:
+        ss << "!= alpha_ref";
+        break;
+      case D3DCMP_GREATEREQUAL:
+        ss << ">= alpha_ref";
         break;
       default:
         FAIL("Unexpected alpha func %d", s.alpha_func());
