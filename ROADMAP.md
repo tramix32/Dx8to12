@@ -153,6 +153,12 @@ Fixed: every outcome except `IDRETRY` (kept as `__debugbreak()` for interactive 
 
 **This is very likely the actual explanation for the imprecise, hard-to-pin-down crash reports from the last several builds** -- worth treating any *future* crash as a genuinely new symptom now that this is fixed, rather than assuming it's the same recurring issue.
 
+## Proactive audit (2026-08-23): `D3DRS_ZBIAS` tracked but never wired to the PSO
+
+`RenderState::z_bias` is correctly read/written via `Set/GetRenderState` (`D3DRS_ZBIAS`), but `Device::CreatePSO`'s `RasterizerState.DepthBias`/`DepthBiasClamp` are hardcoded to `0`/`0.f` with a bare `// TODO.` (`device.cpp`, not introduced this session). This means Z-bias — the standard D3D8 mechanism for rendering decals/detail overlays coplanar with another surface without z-fighting (bullet holes, blood, ground clutter over terrain, etc.) — is a complete no-op: any game using it will see z-fighting/flickering instead of a clean offset.
+
+**Why this wasn't guessed at**: D3D8's `D3DRS_ZBIAS` is a 0-16 integer scale with no standardized numeric meaning — even on real D3D8 drivers it was implementation-defined how much actual depth offset each unit represented. D3D12's `DepthBias` has a precise, format-dependent formula (`final_depth = original_depth + DepthBias * r`, where `r` is the smallest representable step for the bound depth buffer format), but there's no canonical "correct" conversion from D3D8's fuzzy 0-16 scale to that -- picking a scale factor is a genuine guess, and an overly small one still z-fights while an overly large one visibly floats the decal above the surface. Both look wrong, just differently wrong, and I can't compare against a real screenshot to tune it. Worth implementing with an actual game exhibiting z-fighting decals to tune the scale against, rather than picking a number now and hoping.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
