@@ -35,6 +35,26 @@ BaseTexture *BaseTexture::Create(Device *device, TextureKind kind,
   if (HasFlag(d3d8_usage, D3DUSAGE_DYNAMIC) && pool != D3DPOOL_DEFAULT)
     return nullptr;
 
+  if (format == D3DFMT_DXT1 || format == D3DFMT_DXT2 ||
+      format == D3DFMT_DXT3 || format == D3DFMT_DXT4 ||
+      format == D3DFMT_DXT5) {
+    // Block-compressed (S3TC/DXT) textures aren't implemented: DXT1->BC1,
+    // DXT2/3->BC2, DXT4/5->BC3 is the correct DXGI mapping, but every place
+    // in this file that computes a pitch or a byte size from Width/Height
+    // (compact_pitches_/compact_offsets_ below, GetSurfaceDesc's Size field,
+    // CopySubresourceToGpuTexture's per-row copy loop) assumes a plain
+    // width*bytesPerPixel layout and would need to branch on 4x4-texel
+    // block dimensions instead. Getting that block math wrong produces
+    // silently-corrupted texture contents rather than a crash, which is a
+    // worse failure mode than this clear one -- so this is deliberately
+    // still unimplemented pending a real DXT asset to validate the fix
+    // against, rather than guessed at blind. See ROADMAP.md.
+    FAIL(
+        "D3DFORMAT %d (DXT/S3TC block-compressed texture) is not yet "
+        "supported.",
+        format);
+  }
+
   D3D12_RESOURCE_DESC resource_desc = {
       .Dimension = kTextureKindToDimension[(int)kind],
       .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,

@@ -119,6 +119,22 @@ Two things done in response:
 
 If the vectored exception handler's log entry points at a specific function next time, that's the fastest path to a real fix — far better than guessing from "the game crashed" alone.
 
+## Proactive audit (2026-08-23): DXT/S3TC compressed textures are completely unimplemented -- likely the single biggest remaining compatibility gap
+
+Continuing the enum-completeness audit into texture formats surfaced this: `DXGIFromD3DFormat` (`dx_utils.cpp`) mapped `D3DFMT_DXT1`/`DXT2`/`DXT3`/`DXT4`/`DXT5` straight to `DXGI_FORMAT_UNKNOWN` with no diagnostic. Block-compressed (S3TC/DXT) textures were the standard way games of this era saved VRAM and load-time bandwidth — this is plausibly a bigger real-world compatibility blocker than anything fixed so far this session, and worth flagging clearly even though it isn't fixed here.
+
+**Why it wasn't fixed blind**: the DXT1->BC1/DXT2,3->BC2/DXT4,5->BC3 format mapping itself is unambiguous and trivial. The hard part is everywhere else in `texture.cpp` that computes a pitch or byte size from `Width`/`Height` assumes a flat `width * bytesPerPixel` layout:
+- `BaseTexture::BaseTexture`'s `compact_pitches_`/`compact_offsets_`/`total_compact_size_` calculation (the "give games a pitch they expect, not the GPU's padded one" logic) would need to branch on 4x4-texel block dimensions (`ceil(width/4) * bytesPerBlock` instead of `width * bytesPerPixel`, and block-row counts instead of raw pixel rows).
+- `GetSurfaceDesc`'s `pDesc->Size = footprint.RowPitch * footprint.Height` multiplies an already block-aware `RowPitch` by the *raw pixel* `Height` — needs the block-row count instead.
+- `CopySubresourceToGpuTexture`'s per-row copy loop (`for (uint32_t i = 0; i < footprint.Height; ++i)`) needs verifying against exactly what `ID3D12Device::GetCopyableFootprints` reports for `Height` on a block-compressed subresource before trusting it as a "how many rows to copy" loop bound.
+
+Getting any one of these wrong produces **silently garbled texture contents**, not a crash — a strictly worse failure mode than the current clear one, and not something I can verify correct without a real DXT-compressed asset and a way to see the rendered output. So this is deliberately left as a loud, specific failure rather than a guessed-at partial implementation:
+
+- `DXGIFromD3DFormat` still returns `DXGI_FORMAT_UNKNOWN` for DXT formats (unchanged) — this is load-bearing: `Direct3D8::CheckDeviceFormat` relies on the `UNKNOWN` return to gracefully answer `D3DERR_NOTAVAILABLE` for games that politely *probe* format support before using it, rather than crashing on a mere capability query.
+- `BaseTexture::Create` (`texture.cpp`) now explicitly checks for the five DXT formats up front and `FAIL()`s with a specific, unambiguous message identifying the format — this replaces what used to be a confusing generic `FAIL("Unexpected format 0")` several calls downstream (from `DXGIFormatSize` hitting `DXGI_FORMAT_UNKNOWN`'s default case), which didn't hint at DXT being the actual cause at all.
+
+**If a future crash report mentions this specific message, that's the confirmation this is real and worth prioritizing** — implement the three block-math fixes above together (not incrementally, since a still-wrong intermediate state won't obviously look wrong), and ideally verify against a texture with recognizable content so a subtly-wrong block/row calculation shows up visually rather than passing silently.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:

@@ -133,6 +133,14 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
     case D3DFMT_DXT3:
     case D3DFMT_DXT4:
     case D3DFMT_DXT5:
+      // Block-compressed (S3TC/DXT) formats are not implemented -- see the
+      // matching comment in BaseTexture::Create (texture.cpp) for exactly
+      // what's missing and why. Deliberately still returns UNKNOWN (not a
+      // FAIL) here specifically: CheckDeviceFormat relies on this to
+      // gracefully report D3DERR_NOTAVAILABLE to games that politely probe
+      // capabilities before using a format, rather than crashing on a mere
+      // query. The loud, specific failure lives at actual texture-creation
+      // time instead, in BaseTexture::Create.
       return DXGI_FORMAT_UNKNOWN;
 
     case D3DFMT_D24S8:
