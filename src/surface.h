@@ -62,7 +62,8 @@ class BaseSurface : public IDirect3DSurface8, public RefCounted {
   // (D3DPOOL_DEFAULT) GPU texture, e.g. lockable render targets and the
   // backbuffer. Blocks until the copy has completed on the GPU.
   HRESULT LockGpuReadback(GpuTexture* texture, uint32_t subresource,
-                          D3DLOCKED_RECT* pLockedRect, DWORD Flags);
+                          D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect,
+                          DWORD Flags);
   HRESULT UnlockGpuReadback();
 
   SurfaceKind kind_;

@@ -188,9 +188,17 @@ HRESULT STDMETHODCALLTYPE CpuTexture::LockRect(UINT Level,
   TRACE_ENTRY(this, resource_desc_.Width, resource_desc_.Height, Level,
               pLockedRect, pRect, Flags);
   if (Level >= footprints_.size()) return D3DERR_INVALIDCALL;
-  ASSERT(pRect == nullptr);
-  *pLockedRect = D3DLOCKED_RECT{.Pitch = compact_pitches_[Level],
-                                .pBits = data_.get() + compact_offsets_[Level]};
+  char *level_ptr = data_.get() + compact_offsets_[Level];
+  if (pRect) {
+    const int format_size = DXGIFormatSize(resource_desc_.Format);
+    level_ptr +=
+        pRect->top * compact_pitches_[Level] + pRect->left * format_size;
+  }
+  // Pitch stays the full row pitch regardless of pRect -- the app writes
+  // into the sub-rect using that same stride, same as locking the whole
+  // level and only touching the rows/columns it cares about.
+  *pLockedRect =
+      D3DLOCKED_RECT{.Pitch = compact_pitches_[Level], .pBits = level_ptr};
   return S_OK;
 }
 
@@ -207,7 +215,7 @@ HRESULT STDMETHODCALLTYPE CpuTexture::LockRect(D3DCUBEMAP_FACES FaceType,
   if (FaceType > D3DCUBEMAP_FACE_NEGATIVE_Z ||
       Level >= resource_desc_.MipLevels)
     return D3DERR_INVALIDCALL;
-  ASSERT(pRect == nullptr && kind_ == TextureKind::Cube);
+  ASSERT(kind_ == TextureKind::Cube);
   // Hackily use 2D texture's LockRect.
   return LockRect(
       CalcSubresourceIndex(FaceType, Level, resource_desc_.MipLevels),
@@ -403,7 +411,6 @@ HRESULT STDMETHODCALLTYPE GpuTexture::LockRect(UINT Level,
   if (pool_ != D3DPOOL_MANAGED || Level >= footprints_.size()) {
     return D3DERR_INVALIDCALL;
   }
-  ASSERT(pRect == nullptr);
   if (kDisableManagedResources) {
     // Allocate the CPU texture now.
     if (!cpu_tex_)
@@ -444,7 +451,7 @@ HRESULT STDMETHODCALLTYPE GpuTexture::LockRect(D3DCUBEMAP_FACES FaceType,
   if (FaceType > D3DCUBEMAP_FACE_NEGATIVE_Z ||
       Level >= resource_desc_.MipLevels)
     return D3DERR_INVALIDCALL;
-  ASSERT(pRect == nullptr && kind_ == TextureKind::Cube);
+  ASSERT(kind_ == TextureKind::Cube);
   // Hackily use 2D texture's LockRect.
   return LockRect(
       CalcSubresourceIndex(FaceType, Level, resource_desc_.MipLevels),

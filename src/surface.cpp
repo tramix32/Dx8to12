@@ -4,6 +4,7 @@
 
 #include "device.h"
 #include "texture.h"
+#include "utils/dx_utils.h"
 
 namespace Dx8to12 {
 
@@ -33,7 +34,7 @@ HRESULT STDMETHODCALLTYPE BaseSurface::GetDevice(IDirect3DDevice8** ppDevice) {
 
 HRESULT BaseSurface::LockGpuReadback(GpuTexture* texture, uint32_t subresource,
                                      D3DLOCKED_RECT* pLockedRect,
-                                     DWORD Flags) {
+                                     CONST RECT* pRect, DWORD Flags) {
   ASSERT(!readback_resource_);
   const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint =
       texture->GetFootprint(subresource);
@@ -83,8 +84,14 @@ HRESULT BaseSurface::LockGpuReadback(GpuTexture* texture, uint32_t subresource,
   void* mapped = nullptr;
   ASSERT_HR(readback_resource_->Map(0, &read_range, &mapped));
 
+  char* level_ptr = static_cast<char*>(mapped) + footprint.Offset;
+  if (pRect) {
+    const int format_size = DXGIFormatSize(footprint.Footprint.Format);
+    level_ptr +=
+        pRect->top * footprint.Footprint.RowPitch + pRect->left * format_size;
+  }
   pLockedRect->Pitch = static_cast<INT>(footprint.Footprint.RowPitch);
-  pLockedRect->pBits = static_cast<char*>(mapped) + footprint.Offset;
+  pLockedRect->pBits = level_ptr;
   return S_OK;
 }
 
@@ -107,13 +114,13 @@ GpuSurface::GpuSurface(Device* device, GpuTexture* texture,
 HRESULT STDMETHODCALLTYPE GpuSurface::LockRect(D3DLOCKED_RECT* pLockedRect,
                                                CONST RECT* pRect,
                                                DWORD Flags) {
-  ASSERT(pRect == nullptr);
   if (texture_->d3d8_pool() == D3DPOOL_MANAGED) {
     return texture_->LockRect(subresource_, pLockedRect, pRect, Flags);
   }
   // A lockable D3DPOOL_DEFAULT render target: there is no CPU-visible copy,
   // so read the current contents back from the GPU.
-  return LockGpuReadback(texture_.get(), subresource_, pLockedRect, Flags);
+  return LockGpuReadback(texture_.get(), subresource_, pLockedRect, pRect,
+                         Flags);
 }
 
 HRESULT STDMETHODCALLTYPE GpuSurface::UnlockRect() {
@@ -137,9 +144,14 @@ CpuSurface::CpuSurface(CpuTexture* texture, int level,
 HRESULT STDMETHODCALLTYPE CpuSurface::LockRect(D3DLOCKED_RECT* pLockedRect,
                                                CONST RECT* pRect,
                                                DWORD Flags) {
-  ASSERT(pRect == nullptr);
+  char* rect_ptr = data_ptr_;
+  if (pRect) {
+    const int format_size =
+        DXGIFormatSize(DXGIFromD3DFormat(desc_.Format));
+    rect_ptr += pRect->top * compact_pitch_ + pRect->left * format_size;
+  }
   pLockedRect->Pitch = compact_pitch_;
-  pLockedRect->pBits = data_ptr_;
+  pLockedRect->pBits = rect_ptr;
   return S_OK;
 }
 
@@ -164,8 +176,7 @@ BackbufferSurface::BackbufferSurface(Device* device, int index,
 
 HRESULT STDMETHODCALLTYPE BackbufferSurface::LockRect(
     D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect, DWORD Flags) {
-  ASSERT(pRect == nullptr);
-  return LockGpuReadback(texture_.get(), 0, pLockedRect, Flags);
+  return LockGpuReadback(texture_.get(), 0, pLockedRect, pRect, Flags);
 }
 
 HRESULT STDMETHODCALLTYPE BackbufferSurface::UnlockRect() {
