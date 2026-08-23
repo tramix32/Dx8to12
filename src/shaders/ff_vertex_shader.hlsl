@@ -32,6 +32,15 @@ FFVertexOutput VSMain(VertexInput IN) {
   OUT.oPos = IN.input_reg0;
   OUT.oPos.xy = (OUT.oPos.xy + 0.5f) * invView2 - 1.f;
   OUT.oPos.y *= -1.f;
+  // D3DFVF_XYZRHW vertices are already in screen space -- real D3D8/9
+  // hardware does NOT perspective-divide them (RHW is only a per-vertex
+  // interpolation weight, never applied to position). D3D12's SV_Position
+  // always divides by .w though, and .w here still holds whatever raw RHW
+  // value the app supplied (often, but not always, 1 -- some UI/menu quads
+  // use a non-1 per-vertex RHW to fake a stylized tilt on real D3D8, which
+  // that hardware ignores for position but ours would not without this).
+  // Force it to 1 so the automatic divide is a no-op.
+  OUT.oPos.w = 1.f;
 
 #ifndef HAS_DIFFUSE
   vertex_diffuse = float4(1, 1, 1, 1);
