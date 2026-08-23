@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Dx8to12 implements the Direct3D 8 API (`d3d8.dll`) as a shim on top of Direct3D 12. It's a drop-in replacement DLL: a DX8 game loads `d3d8.dll`, calls `Direct3DCreate8` (the sole export, see `src/d3d8.def`), and every DX8 call gets translated into D3D12 command lists/resources under the hood.
 
-Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below.
+Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below. Also currently being tested against Grand Theft Auto: Vice City (not yet working — see ROADMAP.md's real-game-feedback log).
 
 ## Build
 
@@ -17,13 +17,17 @@ Requires Windows + MSVC (Visual Studio toolchain) and the Windows SDK (`DXGI.lib
 From an x86 Developer Command Prompt (or after running `VsDevCmd.bat -arch=x86`):
 
 ```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build
 ```
 
 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` is required with CMake ≥4.0 because the vendored `CMakeRC.cmake` (third-party resource-embedding helper) declares an old `cmake_minimum_required` that newer CMake rejects outright without it.
 
-Output is `build/d3d8.dll` (target name `d3d8`). There is no test suite — validation is "run a real DX8 game against the built DLL."
+**Use `RelWithDebInfo`, not `Release`, as the default build type.** `Release` produces no PDB (no `/Zi`), which means the crash-diagnostic vectored exception handler in `dllmain.cpp` can log addresses and a call stack but nothing can map them back to source — exactly the situation that came up debugging a real crash: the log had a faulting address and a full stack trace, but no way to turn `d3d8.dll+0x2af8e` into a function/line without a matching PDB. `RelWithDebInfo` is `/O2 /Ob1` (barely less aggressive inlining than Release's `/O2 /Ob2`) plus `/Zi` — essentially the same runtime performance with a usable PDB (`build/d3d8.pdb`) alongside the DLL. Only reach for plain `Release` if you specifically need to compare against a symbol-free build.
+
+Output is `build/d3d8.dll` (target name `d3d8`), with `build/d3d8.pdb` next to it when built with debug info. There is no test suite — validation is "run a real DX8 game against the built DLL."
+
+**Symbolicating a crash from `log.txt`'s vectored-exception-handler output**: the log gives `module+offset` for the faulting address and every stack frame (e.g. `d3d8.dll+0x2af8e`). This can only be resolved against the *exact* DLL binary that produced it — optimizer decisions shift code addresses between builds, so a PDB from a different (even seemingly-identical-source) build won't line up. Keep the specific `d3d8.dll`+`d3d8.pdb` pair that was actually running when a crash log was captured if you need to investigate it later; don't rebuild first and expect the old log's offsets to still resolve correctly.
 
 Notable CMake options (top of `CMakeLists.txt`):
 - `DX8TO12_USE_ALLOCATOR` (default OFF) — pulls in D3D12MemoryAllocator via `FetchContent` instead of manual suballocation.
