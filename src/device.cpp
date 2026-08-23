@@ -67,6 +67,12 @@ Device::Device(IDirect3D8 *direct3d8)
   for (size_t i = 0; i < texture_stage_states_.size(); ++i) {
     texture_stage_states_[i].texcoord_index = static_cast<DWORD>(i);
   }
+  for (int i = 0; i < 256; ++i) {
+    const WORD identity = static_cast<WORD>(i * 257);
+    gamma_ramp_.red[i] = identity;
+    gamma_ramp_.green[i] = identity;
+    gamma_ramp_.blue[i] = identity;
+  }
 }
 
 HRESULT STDMETHODCALLTYPE Device::QueryInterface(REFIID riid, void **ppvObj) {
@@ -901,6 +907,21 @@ D3DMATRIX Device::GetTransform(D3DTRANSFORMSTATETYPE state) {
   D3DMATRIX matrix;
   ASSERT_HR(GetTransform(state, &matrix));
   return matrix;
+}
+
+HRESULT STDMETHODCALLTYPE
+Device::MultiplyTransform(D3DTRANSFORMSTATETYPE State,
+                          CONST D3DMATRIX *pMatrix) {
+  D3DMATRIX current = GetTransform(State);
+  DirectX::SimpleMath::Matrix lhs, rhs;
+  memcpy(&lhs, pMatrix, sizeof(lhs));
+  memcpy(&rhs, &current, sizeof(rhs));
+  // Row-vector convention (matches D3D8): applying pMatrix first, then the
+  // state's existing matrix.
+  DirectX::SimpleMath::Matrix result = lhs * rhs;
+  D3DMATRIX result_d3d;
+  memcpy(&result_d3d, &result, sizeof(result_d3d));
+  return SetTransform(State, &result_d3d);
 }
 
 HRESULT STDMETHODCALLTYPE Device::SetMaterial(const D3DMATERIAL8 *pMaterial) {
@@ -1886,6 +1907,82 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
 
   cmd_list_->DrawIndexedInstanced(index_count, 1, startIndex,
                                   bound_base_vertex_, 0);
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
+    D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex,
+    UINT NumVertexIndices, UINT PrimitiveCount, CONST void *pIndexData,
+    D3DFORMAT IndexDataFormat, CONST void *pVertexStreamZeroData,
+    UINT VertexStreamZeroStride) {
+  if (!bound_vertex_shader_) {
+    LOG_ERROR()
+        << "Cannot use DrawIndexedPrimitiveUP without a vertex shader.\n";
+    return D3DERR_INVALIDCALL;
+  }
+  if (IndexDataFormat != D3DFMT_INDEX16 && IndexDataFormat != D3DFMT_INDEX32) {
+    LOG_ERROR() << "Invalid IndexDataFormat for DrawIndexedPrimitiveUP: "
+                << IndexDataFormat << "\n";
+    return D3DERR_INVALIDCALL;
+  }
+  // Not supported: PrepareDrawCall rejects fans outright, and rewriting a fan
+  // index list (as opposed to DrawPrimitiveUP's flat vertex list) isn't
+  // implemented.
+  ASSERT(PrimitiveType != D3DPT_TRIANGLEFAN);
+
+  int index_count;
+  switch (PrimitiveType) {
+    case D3DPT_LINELIST:
+      index_count = 2 * PrimitiveCount;
+      break;
+    case D3DPT_TRIANGLELIST:
+      index_count = 3 * PrimitiveCount;
+      break;
+    case D3DPT_TRIANGLESTRIP:
+      index_count = 2 + PrimitiveCount;
+      break;
+    default:
+      FAIL("TODO: Count number of indices for PrimitiveType of %d",
+           PrimitiveType);
+      break;
+  }
+
+  // Upload the vertex data. MinVertexIndex/NumVertexIndices describe the
+  // range of vertices this call actually touches, but pVertexStreamZeroData
+  // is indexed from element 0 (indices in pIndexData are absolute, not
+  // relative to MinVertexIndex), so we have to bring along everything up to
+  // the top of that range.
+  const size_t num_vertices_to_upload = MinVertexIndex + NumVertexIndices;
+  const size_t vertex_bytes = num_vertices_to_upload * VertexStreamZeroStride;
+  DynamicRingBuffer::Allocation vertex_alloc =
+      dynamic_ring_buffer()->Allocate(vertex_bytes);
+  memcpy(dynamic_ring_buffer()->GetCpuPtrFor(vertex_alloc),
+         pVertexStreamZeroData, vertex_bytes);
+  D3D12_VERTEX_BUFFER_VIEW vbuffer_view{
+      .BufferLocation = dynamic_ring_buffer()->GetGpuPtrFor(vertex_alloc),
+      .SizeInBytes = safe_cast<UINT>(vertex_bytes),
+      .StrideInBytes = VertexStreamZeroStride};
+
+  // Upload the index data.
+  const DXGI_FORMAT index_format = DXGIFromD3DFormat(IndexDataFormat);
+  const size_t index_bytes =
+      static_cast<size_t>(index_count) * DXGIFormatSize(index_format);
+  DynamicRingBuffer::Allocation index_alloc =
+      dynamic_ring_buffer()->Allocate(index_bytes);
+  memcpy(dynamic_ring_buffer()->GetCpuPtrFor(index_alloc), pIndexData,
+         index_bytes);
+  D3D12_INDEX_BUFFER_VIEW ib_view{
+      .BufferLocation = dynamic_ring_buffer()->GetGpuPtrFor(index_alloc),
+      .SizeInBytes = safe_cast<UINT>(index_bytes),
+      .Format = index_format};
+
+  ASSERT_HR(SetStreamSource(0, nullptr, 0));
+  HR_OR_RETURN(PrepareDrawCall(PrimitiveType, static_cast<int>(MinVertexIndex),
+                               static_cast<int>(NumVertexIndices)));
+  // Overwrite whatever vertex/index buffer the prepare set.
+  cmd_list_->IASetVertexBuffers(0, 1, &vbuffer_view);
+  cmd_list_->IASetIndexBuffer(&ib_view);
+  cmd_list_->DrawIndexedInstanced(index_count, 1, 0, 0, 0);
   return S_OK;
 }
 

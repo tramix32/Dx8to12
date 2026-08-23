@@ -128,10 +128,21 @@ class Device : public IDirect3DDevice8, RefCounted {
   GetBackBuffer(UINT BackBuffer, D3DBACKBUFFER_TYPE Type,
                 IDirect3DSurface8 **ppBackBuffer) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetRasterStatus(D3DRASTER_STATUS *pRasterStatus) PURE;
-  virtual void STDMETHODCALLTYPE SetGammaRamp(DWORD Flags,
-                                              CONST D3DGAMMARAMP *pRamp) PURE;
-  virtual void STDMETHODCALLTYPE GetGammaRamp(D3DGAMMARAMP *pRamp) PURE;
+  GetRasterStatus(D3DRASTER_STATUS *pRasterStatus) override {
+    // No access to real scanline/vblank timing through this backend; report
+    // a plausible "not in vblank, top of frame" status rather than aborting.
+    *pRasterStatus = D3DRASTER_STATUS{.InVBlank = FALSE, .ScanLine = 0};
+    return S_OK;
+  }
+  virtual void STDMETHODCALLTYPE SetGammaRamp(
+      DWORD Flags, CONST D3DGAMMARAMP *pRamp) override {
+    // Bookkeeping only -- does not touch the actual display gamma.
+    (void)Flags;
+    gamma_ramp_ = *pRamp;
+  }
+  virtual void STDMETHODCALLTYPE GetGammaRamp(D3DGAMMARAMP *pRamp) override {
+    *pRamp = gamma_ramp_;
+  }
   virtual HRESULT STDMETHODCALLTYPE CreateTexture(
       UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
       D3DPOOL Pool, IDirect3DTexture8 **ppTexture) override;
@@ -183,8 +194,8 @@ class Device : public IDirect3DDevice8, RefCounted {
   SetTransform(D3DTRANSFORMSTATETYPE State, CONST D3DMATRIX *pMatrix) override;
   virtual HRESULT STDMETHODCALLTYPE GetTransform(D3DTRANSFORMSTATETYPE State,
                                                  D3DMATRIX *pMatrix) override;
-  virtual HRESULT STDMETHODCALLTYPE MultiplyTransform(D3DTRANSFORMSTATETYPE,
-                                                      CONST D3DMATRIX *) PURE;
+  virtual HRESULT STDMETHODCALLTYPE
+  MultiplyTransform(D3DTRANSFORMSTATETYPE, CONST D3DMATRIX *) override;
   virtual HRESULT STDMETHODCALLTYPE
   SetViewport(CONST D3DVIEWPORT8 *pViewport) override;
   virtual HRESULT STDMETHODCALLTYPE GetViewport(D3DVIEWPORT8 *pViewport) override;
@@ -258,7 +269,7 @@ class Device : public IDirect3DDevice8, RefCounted {
       D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex,
       UINT NumVertexIndices, UINT PrimitiveCount, CONST void *pIndexData,
       D3DFORMAT IndexDataFormat, CONST void *pVertexStreamZeroData,
-      UINT VertexStreamZeroStride) PURE;
+      UINT VertexStreamZeroStride) override;
   virtual HRESULT STDMETHODCALLTYPE
   ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount,
                   IDirect3DVertexBuffer8 *pDestBuffer, DWORD Flags) PURE;
@@ -446,6 +457,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   D3DCLIPSTATUS8 clip_status_ = {};
 
   bool cursor_visible_ = false;
+  D3DGAMMARAMP gamma_ramp_ = {};  // Populated with an identity ramp in Device().
 
   RenderState render_state_;
   std::array<TextureStageState, kMaxTexStages> texture_stage_states_;
