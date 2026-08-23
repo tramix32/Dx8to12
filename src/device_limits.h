@@ -6,6 +6,7 @@ static constexpr int kNumBackBuffers = 2;
 static constexpr int kMaxVertexStreams = 16;
 static constexpr int kMaxTexStages = 8;
 static constexpr int kMaxActiveLights = 8;
+static constexpr int kMaxUserClipPlanes = 8;  // Matches D3DCAPS8::MaxUserClipPlanes.
 
 static constexpr int kMaxSamplerStates = 64;
 static constexpr int kMaxNumSrvs = 1024 + 512;

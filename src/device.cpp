@@ -545,6 +545,55 @@ HRESULT STDMETHODCALLTYPE Device::GetDeviceCaps(D3DCAPS8 *pCaps) {
 
 HRESULT STDMETHODCALLTYPE Device::TestCooperativeLevel() { return S_OK; }
 
+UINT STDMETHODCALLTYPE Device::GetAvailableTextureMem() {
+  // Real drivers report actual free VRAM; we don't track GPU memory usage,
+  // so report a generously large fixed budget. Games generally treat this as
+  // a rough quality/streaming heuristic, not an exact figure.
+  return 256 * 1024 * 1024;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetCreationParameters(
+    D3DDEVICE_CREATION_PARAMETERS *pParameters) {
+  // CreateDevice (direct3d8.cpp) asserts DeviceType == D3DDEVTYPE_HAL and
+  // BehaviorFlags == D3DCREATE_HARDWARE_VERTEXPROCESSING on every call, so
+  // those are safe to report as constants here.
+  *pParameters = D3DDEVICE_CREATION_PARAMETERS{
+      .AdapterOrdinal = static_cast<UINT>(adapter_index_),
+      .DeviceType = D3DDEVTYPE_HAL,
+      .hFocusWindow = window_,
+      .BehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING};
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::SetCursorProperties(
+    UINT XHotSpot, UINT YHotSpot, IDirect3DSurface8 *pCursorBitmap) {
+  // Games render their own software cursor almost universally; the
+  // hardware-cursor bitmap itself isn't wired up, but accepting the call
+  // instead of aborting is enough for the common case.
+  (void)XHotSpot;
+  (void)YHotSpot;
+  (void)pCursorBitmap;
+  return S_OK;
+}
+
+void STDMETHODCALLTYPE Device::SetCursorPosition(int X, int Y, DWORD Flags) {
+  (void)Flags;
+  SetCursorPos(X, Y);
+}
+
+BOOL STDMETHODCALLTYPE Device::ShowCursor(BOOL bShow) {
+  // IDirect3DDevice8::ShowCursor returns the *previous* visibility state,
+  // unlike Win32's ShowCursor (a display counter, not idempotent) -- track
+  // our own boolean and only touch the Win32 counter on an actual change so
+  // repeated same-value calls don't drift it.
+  BOOL previous = cursor_visible_;
+  if (static_cast<bool>(bShow) != cursor_visible_) {
+    ::ShowCursor(bShow);
+    cursor_visible_ = bShow;
+  }
+  return previous;
+}
+
 HRESULT STDMETHODCALLTYPE
 Device::GetBackBuffer(UINT BackBuffer, D3DBACKBUFFER_TYPE Type,
                       IDirect3DSurface8 **ppBackBuffer) {
@@ -907,6 +956,38 @@ HRESULT STDMETHODCALLTYPE Device::LightEnable(DWORD Index, BOOL Enable) {
   return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE Device::SetClipPlane(DWORD Index,
+                                               CONST float *pPlane) {
+  // Bookkeeping only -- no GPU-side user clip plane implementation, so this
+  // does not actually affect rendering. See the clip_planes_ comment.
+  if (Index >= clip_planes_.size()) return D3DERR_INVALIDCALL;
+  memcpy(clip_planes_[Index].data(), pPlane, sizeof(float) * 4);
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetClipPlane(DWORD Index, float *pPlane) {
+  if (Index >= clip_planes_.size()) return D3DERR_INVALIDCALL;
+  memcpy(pPlane, clip_planes_[Index].data(), sizeof(float) * 4);
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+Device::SetClipStatus(CONST D3DCLIPSTATUS8 *pClipStatus) {
+  clip_status_ = *pClipStatus;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetClipStatus(D3DCLIPSTATUS8 *pClipStatus) {
+  *pClipStatus = clip_status_;
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::ValidateDevice(DWORD *pNumPasses) {
+  // We never need more than a single pass to render the current state.
+  *pNumPasses = 1;
+  return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
                                                  DWORD Value) {
   render_state_.GetEnumAtIndex(State) = Value;
@@ -1212,7 +1293,7 @@ HRESULT STDMETHODCALLTYPE Device::GetPixelShader(DWORD *pHandle) {
 
 HRESULT STDMETHODCALLTYPE Device::SetVertexShaderConstant(
     DWORD Register, CONST void *pConstantData, DWORD ConstantCount) {
-  if ((Register + ConstantCount) >= kNumVsConstRegs || pConstantData == nullptr)
+  if ((Register + ConstantCount) > kNumVsConstRegs || pConstantData == nullptr)
     return D3DERR_INVALIDCALL;
 
   memcpy(&bound_vs_cregs_.at(Register), pConstantData,
@@ -1223,10 +1304,34 @@ HRESULT STDMETHODCALLTYPE Device::SetVertexShaderConstant(
 
 HRESULT STDMETHODCALLTYPE Device::GetVertexShaderConstant(
     DWORD Register, void *pConstantData, DWORD ConstantCount) {
-  if ((Register + ConstantCount) >= kNumVsConstRegs || pConstantData == nullptr)
+  if ((Register + ConstantCount) > kNumVsConstRegs || pConstantData == nullptr)
     return D3DERR_INVALIDCALL;
 
   memcpy(pConstantData, &bound_vs_cregs_.at(Register),
+         ConstantCount * sizeof(float[4]));
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::SetPixelShaderConstant(
+    DWORD Register, CONST void *pConstantData, DWORD ConstantCount) {
+  // Bookkeeping only -- bound_ps_cregs_ is not currently wired into the
+  // pixel shader's constant buffer (programmable_ps.hlsl reads the *vertex*
+  // shader's constant array via the shared b10 cbuffer), so ps.1.x shaders
+  // referencing these registers will not see the app's values yet. Storing
+  // them anyway means at least GetPixelShaderConstant round-trips correctly
+  // and nothing aborts.
+  if ((Register + ConstantCount) > kNumPsConstRegs || pConstantData == nullptr)
+    return D3DERR_INVALIDCALL;
+  memcpy(&bound_ps_cregs_.at(Register), pConstantData,
+         ConstantCount * sizeof(float[4]));
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Device::GetPixelShaderConstant(
+    DWORD Register, void *pConstantData, DWORD ConstantCount) {
+  if ((Register + ConstantCount) > kNumPsConstRegs || pConstantData == nullptr)
+    return D3DERR_INVALIDCALL;
+  memcpy(pConstantData, &bound_ps_cregs_.at(Register),
          ConstantCount * sizeof(float[4]));
   return S_OK;
 }

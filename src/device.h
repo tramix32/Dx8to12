@@ -92,7 +92,7 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   /*** IDirect3DDevice8 methods ***/
   virtual HRESULT STDMETHODCALLTYPE TestCooperativeLevel(THIS) override;
-  virtual UINT STDMETHODCALLTYPE GetAvailableTextureMem(THIS) PURE;
+  virtual UINT STDMETHODCALLTYPE GetAvailableTextureMem(THIS) override;
   virtual HRESULT STDMETHODCALLTYPE
   ResourceManagerDiscardBytes(DWORD Bytes) override {
     TRACE_ENTRY(Bytes);
@@ -104,14 +104,18 @@ class Device : public IDirect3DDevice8, RefCounted {
     return S_OK;
   }
   virtual HRESULT STDMETHODCALLTYPE GetDeviceCaps(D3DCAPS8 *pCaps) override;
-  virtual HRESULT STDMETHODCALLTYPE GetDisplayMode(D3DDISPLAYMODE *pMode) PURE;
   virtual HRESULT STDMETHODCALLTYPE
-  GetCreationParameters(D3DDEVICE_CREATION_PARAMETERS *pParameters) PURE;
+  GetDisplayMode(D3DDISPLAYMODE *pMode) override {
+    return direct3d8_->GetAdapterDisplayMode(
+        static_cast<UINT>(adapter_index_), pMode);
+  }
+  virtual HRESULT STDMETHODCALLTYPE
+  GetCreationParameters(D3DDEVICE_CREATION_PARAMETERS *pParameters) override;
   virtual HRESULT STDMETHODCALLTYPE SetCursorProperties(
-      UINT XHotSpot, UINT YHotSpot, IDirect3DSurface8 *pCursorBitmap) PURE;
+      UINT XHotSpot, UINT YHotSpot, IDirect3DSurface8 *pCursorBitmap) override;
   virtual void STDMETHODCALLTYPE SetCursorPosition(int X, int Y,
-                                                   DWORD Flags) PURE;
-  virtual BOOL STDMETHODCALLTYPE ShowCursor(BOOL bShow) PURE;
+                                                   DWORD Flags) override;
+  virtual BOOL STDMETHODCALLTYPE ShowCursor(BOOL bShow) override;
   virtual HRESULT STDMETHODCALLTYPE
   CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS *pPresentationParameters,
                             IDirect3DSwapChain8 **pSwapChain) PURE;
@@ -195,9 +199,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE GetLightEnable(DWORD Index,
                                                    BOOL *pEnable) override;
   virtual HRESULT STDMETHODCALLTYPE SetClipPlane(DWORD Index,
-                                                 CONST float *pPlane) PURE;
+                                                 CONST float *pPlane) override;
   virtual HRESULT STDMETHODCALLTYPE GetClipPlane(DWORD Index,
-                                                 float *pPlane) PURE;
+                                                 float *pPlane) override;
   virtual HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE State,
                                                    DWORD Value) override;
   virtual HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State,
@@ -210,9 +214,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE CreateStateBlock(D3DSTATEBLOCKTYPE Type,
                                                      DWORD *pToken) override;
   virtual HRESULT STDMETHODCALLTYPE
-  SetClipStatus(CONST D3DCLIPSTATUS8 *pClipStatus) PURE;
+  SetClipStatus(CONST D3DCLIPSTATUS8 *pClipStatus) override;
   virtual HRESULT STDMETHODCALLTYPE
-  GetClipStatus(D3DCLIPSTATUS8 *pClipStatus) PURE;
+  GetClipStatus(D3DCLIPSTATUS8 *pClipStatus) override;
   virtual HRESULT STDMETHODCALLTYPE
   GetTexture(DWORD Stage, IDirect3DBaseTexture8 **ppTexture) override;
   virtual HRESULT STDMETHODCALLTYPE
@@ -221,7 +225,7 @@ class Device : public IDirect3DDevice8, RefCounted {
       DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD *pValue) override;
   virtual HRESULT STDMETHODCALLTYPE SetTextureStageState(
       DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value) override;
-  virtual HRESULT STDMETHODCALLTYPE ValidateDevice(DWORD *pNumPasses) PURE;
+  virtual HRESULT STDMETHODCALLTYPE ValidateDevice(DWORD *pNumPasses) override;
   virtual HRESULT STDMETHODCALLTYPE
   GetInfo(DWORD DevInfoID, void *pDevInfoStruct,
           DWORD DevInfoStructSize) VIRT_NOT_IMPLEMENTED;
@@ -238,7 +242,9 @@ class Device : public IDirect3DDevice8, RefCounted {
     return D3DERR_NOTAVAILABLE;
   }
   virtual HRESULT STDMETHODCALLTYPE
-  GetCurrentTexturePalette(UINT *PaletteNumber) PURE;
+  GetCurrentTexturePalette(UINT *PaletteNumber) override {
+    return D3DERR_NOTAVAILABLE;
+  }
   virtual HRESULT STDMETHODCALLTYPE
   DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex,
                 UINT PrimitiveCount) override;
@@ -287,9 +293,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   virtual HRESULT STDMETHODCALLTYPE GetPixelShader(DWORD *pHandle) override;
   HRESULT STDMETHODCALLTYPE DeletePixelShader(DWORD Handle) override;
   virtual HRESULT STDMETHODCALLTYPE SetPixelShaderConstant(
-      DWORD Register, CONST void *pConstantData, DWORD ConstantCount) PURE;
+      DWORD Register, CONST void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE GetPixelShaderConstant(
-      DWORD Register, void *pConstantData, DWORD ConstantCount) PURE;
+      DWORD Register, void *pConstantData, DWORD ConstantCount) override;
   virtual HRESULT STDMETHODCALLTYPE
   GetPixelShaderFunction(DWORD Handle, void *pData, DWORD *pSizeOfData) PURE;
   virtual HRESULT STDMETHODCALLTYPE
@@ -429,6 +435,17 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   // Bound vertex/pixel shader constants.
   std::vector<DirectX::SimpleMath::Vector4> bound_vs_cregs_;
+  // Bookkeeping only: unlike bound_vs_cregs_, this is not currently wired
+  // into the pixel shader's constant buffer (see ps_creg_cbuffer_ below) --
+  // ps.1.x shaders reading these registers will not see the app's values.
+  std::array<DirectX::SimpleMath::Vector4, kNumPsConstRegs> bound_ps_cregs_ =
+      {};
+
+  // Bookkeeping only, no GPU-side clip-plane implementation.
+  std::array<std::array<float, 4>, kMaxUserClipPlanes> clip_planes_ = {};
+  D3DCLIPSTATUS8 clip_status_ = {};
+
+  bool cursor_visible_ = false;
 
   RenderState render_state_;
   std::array<TextureStageState, kMaxTexStages> texture_stage_states_;
