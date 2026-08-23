@@ -197,7 +197,19 @@ static void __stdcall DebugInfoQueueMessageCallback(
   }
   OutputDebugStringA(pDescription);
   LOG(log_severity) << pDescription << "\n";
-  if (severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+  // Only CORRUPTION (actual GPU/driver memory corruption -- vanishingly rare
+  // and always worth stopping for) is fatal. ERROR-severity messages used to
+  // abort too, which is right for catching *our own* bugs during
+  // development, but wrong for a game the user is actually trying to play:
+  // third-party overlays (RTSS/Afterburner-style FPS OSDs, screenshot tools)
+  // hook Present/ExecuteCommandLists and can trip the validation layer with
+  // false positives that have nothing to do with this codebase -- observed
+  // in practice as "PSO deleted while still referenced by the command list"
+  // exactly when such an overlay was active, reproducibly gone once it was
+  // closed. Logging (still visible in log.txt for real bugs) without
+  // aborting lets the game keep running through those instead of hard
+  // crashing over someone else's hook.
+  if (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
     FAIL("D3D12 Error:\r\n%s", pDescription);
   }
 }
