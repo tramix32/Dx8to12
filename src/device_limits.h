@@ -9,7 +9,14 @@ static constexpr int kMaxActiveLights = 8;
 static constexpr int kMaxUserClipPlanes = 8;  // Matches D3DCAPS8::MaxUserClipPlanes.
 
 static constexpr int kMaxSamplerStates = 64;
-static constexpr int kMaxNumSrvs = 1024 + 512;
+// A real GTA: Vice City play session was observed issuing 1875+ CreateTexture
+// calls with none released (every D3DPOOL_MANAGED texture keeps its SRV for
+// its whole lifetime, and the game evidently keeps a fully-loaded level's
+// textures all resident at once) -- comfortably exceeding the previous 1536,
+// which hit pool_heap.cpp's "!free_list_.empty()" assert partway through a
+// level load. Bumped with generous headroom rather than tuned to the exact
+// observed count, since a bigger level/more art could need more still.
+static constexpr int kMaxNumSrvs = 8192;
 static constexpr int kMaxNumRtvs = 32;
 
 static constexpr int kDynamicRingBufferSize = 40 * 1024 * 1024;
