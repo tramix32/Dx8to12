@@ -30,6 +30,7 @@ class Allocator;
 
 namespace Dx8to12 {
 class Buffer;
+class BaseSurface;
 class DynamicRingBuffer;
 class GpuTexture;
 
@@ -405,6 +406,22 @@ class Device : public IDirect3DDevice8, RefCounted {
   std::vector<ComPtr<GpuTexture>> back_buffers_;
 
   ComPtr<GpuTexture> depth_stencil_tex_;
+
+  // GetRenderTarget/GetDepthStencilSurface must return the SAME surface
+  // object (with an incremented refcount) across repeated calls as long as
+  // the underlying texture hasn't changed -- real D3D8 preserves COM
+  // identity here, and games (e.g. RenderWare-based titles) rely on it,
+  // sometimes Release()ing a previously-fetched pointer and expecting a
+  // fresh GetRenderTarget() call to still be valid/consistent with other
+  // outstanding references. Returning a brand-new independently-refcounted
+  // wrapper on every call breaks that assumption and can free the surface
+  // out from under a reference the game still expects to be live. Keyed by
+  // the backing texture pointer so a Reset() (which reallocates back
+  // buffers/depth-stencil) naturally invalidates the cache.
+  ComPtr<BaseSurface> cached_render_target_surface_;
+  void *cached_render_target_surface_key_ = nullptr;
+  ComPtr<BaseSurface> cached_depth_stencil_surface_;
+  void *cached_depth_stencil_surface_key_ = nullptr;
 
   // Shader resources/handles.
   // TODO: Don't count shader references, instead make PSO own shaders and count

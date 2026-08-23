@@ -771,7 +771,15 @@ Device::GetBackBuffer(UINT BackBuffer, D3DBACKBUFFER_TYPE Type,
 HRESULT STDMETHODCALLTYPE
 Device::GetDepthStencilSurface(IDirect3DSurface8 **ppZStencilSurface) {
   TRACE_ENTRY(ppZStencilSurface);
-  *ppZStencilSurface = new GpuSurface(this, depth_stencil_tex_.Get(), 0);
+  void *key = depth_stencil_tex_.Get();
+  if (!cached_depth_stencil_surface_ ||
+      cached_depth_stencil_surface_key_ != key) {
+    cached_depth_stencil_surface_ =
+        ComOwn<BaseSurface>(new GpuSurface(this, depth_stencil_tex_.Get(), 0));
+    cached_depth_stencil_surface_key_ = key;
+  }
+  cached_depth_stencil_surface_->AddRef();
+  *ppZStencilSurface = cached_depth_stencil_surface_.get();
   return S_OK;
 }
 
@@ -1428,12 +1436,20 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
 
 HRESULT STDMETHODCALLTYPE
 Device::GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) {
-  if (bound_render_target_) {
-    *ppRenderTarget = new GpuSurface(this, bound_render_target_.Get(), 0);
-  } else {
-    *ppRenderTarget =
-        new BackbufferSurface(this, 0, back_buffers_[0].get());
+  void *key = bound_render_target_ ? static_cast<void *>(bound_render_target_.Get())
+                                   : static_cast<void *>(back_buffers_[0].get());
+  if (!cached_render_target_surface_ || cached_render_target_surface_key_ != key) {
+    if (bound_render_target_) {
+      cached_render_target_surface_ = ComOwn<BaseSurface>(
+          new GpuSurface(this, bound_render_target_.Get(), 0));
+    } else {
+      cached_render_target_surface_ = ComOwn<BaseSurface>(
+          new BackbufferSurface(this, 0, back_buffers_[0].get()));
+    }
+    cached_render_target_surface_key_ = key;
   }
+  cached_render_target_surface_->AddRef();
+  *ppRenderTarget = cached_render_target_surface_.get();
   return S_OK;
 }
 
