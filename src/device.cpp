@@ -1926,14 +1926,17 @@ HRESULT STDMETHODCALLTYPE Device::EndScene() { return S_OK; }
 HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
                                         DWORD Flags, D3DCOLOR Color, float Z,
                                         DWORD Stencil) {
-  D3D12_RECT rect, *rects = nullptr;
+  std::vector<D3D12_RECT> rect_storage;
+  D3D12_RECT *rects = nullptr;
   if (pRects) {
-    ASSERT(Count == 1);
-    rect.left = pRects->x1;
-    rect.top = pRects->y1;
-    rect.right = pRects->x2;
-    rect.bottom = pRects->y2;
-    rects = &rect;
+    rect_storage.resize(Count);
+    for (DWORD i = 0; i < Count; ++i) {
+      rect_storage[i] = {.left = pRects[i].x1,
+                         .top = pRects[i].y1,
+                         .right = pRects[i].x2,
+                         .bottom = pRects[i].y2};
+    }
+    rects = rect_storage.data();
   }
 
   if (Flags & D3DCLEAR_TARGET) {
@@ -1946,7 +1949,8 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
     float color[4] = {((Color >> 16) & 0xFF) / 255.f,
                       ((Color >> 8) & 0xFF) / 255.f, (Color & 0xFF) / 255.f,
                       ((Color >> 24) & 0xFF) / 255.f};
-    cmd_list_->ClearRenderTargetView(render_target->rtv_handle(), color, 0,
+    cmd_list_->ClearRenderTargetView(render_target->rtv_handle(), color,
+                                     static_cast<UINT>(rect_storage.size()),
                                      rects);
   }
   if (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) {
@@ -1958,9 +1962,10 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
     D3D12_CLEAR_FLAGS clear_flags = {};
     if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D12_CLEAR_FLAG_DEPTH;
     if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D12_CLEAR_FLAG_STENCIL;
-    cmd_list_->ClearDepthStencilView(bound_depth_target_->dsv_handle(),
-                                     clear_flags, Z,
-                                     static_cast<UINT8>(Stencil), 0, rects);
+    cmd_list_->ClearDepthStencilView(
+        bound_depth_target_->dsv_handle(), clear_flags, Z,
+        static_cast<UINT8>(Stencil), static_cast<UINT>(rect_storage.size()),
+        rects);
   }
   return S_OK;
 }
@@ -2056,7 +2061,6 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     for (auto light_index : enabled_lights_) {
       // ASSERT(render_state_.lighting);
       cbuffer->lights[i] = ShaderLightMarshall(view, lights_[light_index]);
-      ASSERT(cbuffer->lights[i].type != D3DLIGHT_SPOT);
       ++i;
     }
     cbuffer->num_lights = i;

@@ -85,7 +85,19 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
         attenuation = 0;
         break;
     }
-    if (light.type == D3DLIGHT_SPOT) attenuation = 0;
+    if (light.type == D3DLIGHT_SPOT) {
+      // D3D8 spotlight cone falloff: full intensity inside the inner cone
+      // (half-angle theta/2), zero outside the outer cone (half-angle
+      // phi/2), interpolated by Falloff in between. light.direction points
+      // FROM the light INTO the scene, so the angle between it and the
+      // (light-to-surface) direction is the angle off the spotlight's aim.
+      float cos_rho = dot(normalize(light.direction), -dir_to_light);
+      float cos_inner = cos(light.theta * 0.5f);
+      float cos_outer = cos(light.phi * 0.5f);
+      float spot = saturate((cos_rho - cos_outer) /
+                            max(cos_inner - cos_outer, 0.0001f));
+      attenuation *= pow(spot, max(light.falloff, 0.0001f));
+    }
 
     diffuse_lighting += saturate(dot(view_normal, dir_to_light)) * attenuation *
                         light.diffuse.xyz;
