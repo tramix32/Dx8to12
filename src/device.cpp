@@ -412,6 +412,19 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     LOG(INFO) << "Resetting device. Commands already submitted.\n";
   }
   LOG(INFO) << "Reset: releasing old back buffers/depth-stencil\n";
+  // These caches (see the comment on their declaration in device.h) hold
+  // their own ref on the depth-stencil/render-target texture via the
+  // GpuSurface they wrap, on top of the refs checked below. Left in place
+  // across a Reset, that extra ref keeps the old texture's total_ref_count()
+  // at 2 forever, which silently defeats the asserts right after this (the
+  // user can Ignore through the message box) and, worse, means the old
+  // GpuTexture's destructor -- and the DSV/RTV descriptor it frees -- never
+  // runs. Repeated Reset() calls then permanently burn one dsv_heap_/
+  // rtv_heap_ slot each, eventually exhausting the 32-slot pool.
+  cached_render_target_surface_.Reset();
+  cached_render_target_surface_key_ = nullptr;
+  cached_depth_stencil_surface_.Reset();
+  cached_depth_stencil_surface_key_ = nullptr;
   bound_render_target_.Reset();
   bound_depth_target_.Reset();
   ASSERT(depth_stencil_tex_->total_ref_count() == 1);
