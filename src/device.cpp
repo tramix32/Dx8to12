@@ -221,6 +221,14 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
         this, TextureKind::Texture2d, presentParams.BackBufferWidth,
         presentParams.BackBufferHeight, 1, 1, D3DUSAGE_DEPTHSTENCIL,
         depth_format, D3DPOOL_DEFAULT)));
+    // Per the D3D8 spec, D3DRS_ZENABLE's default value is D3DZB_TRUE when
+    // EnableAutoDepthStencil is set (D3DZB_FALSE otherwise, which is
+    // RenderState's default member value already). A game that doesn't
+    // explicitly SetRenderState(D3DRS_ZENABLE, ...) -- reasonable, since it
+    // asked for an auto depth-stencil buffer specifically to get this
+    // default -- would otherwise silently render with depth testing off:
+    // no crash, just badly wrong draw order/z-fighting.
+    render_state_.zbuffer_type = D3DZB_TRUE;
   }
 
   viewport_.Width = static_cast<float>(presentParams.BackBufferWidth);
@@ -338,6 +346,9 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
         D3DUSAGE_DEPTHSTENCIL, depth_format, D3DPOOL_DEFAULT)));
     depth_stencil_tex_->SetName("depth_stencil_tex");
     bound_depth_target_ = InternalPtr(depth_stencil_tex_.Get());
+    // See the matching comment in Init(): D3DRS_ZENABLE defaults to
+    // D3DZB_TRUE when EnableAutoDepthStencil is set.
+    render_state_.zbuffer_type = D3DZB_TRUE;
   }
 
   ASSERT(back_buffers_.empty());
