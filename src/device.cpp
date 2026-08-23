@@ -1048,12 +1048,73 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
   TRACE_ENTRY(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface,
               pDestPointsArray);
 
-  ASSERT(static_cast<BaseSurface *>(pSourceSurface)->kind() ==
-         SurfaceKind::Cpu);
-  CpuSurface *source_surface = static_cast<CpuSurface *>(pSourceSurface);
   ASSERT(static_cast<BaseSurface *>(pDestinationSurface)->kind() ==
          SurfaceKind::Gpu);
   GpuSurface *dest_surface = static_cast<GpuSurface *>(pDestinationSurface);
+
+  SurfaceKind source_kind = static_cast<BaseSurface *>(pSourceSurface)->kind();
+  if (source_kind == SurfaceKind::Gpu ||
+      source_kind == SurfaceKind::Backbuffer) {
+    // GPU-to-GPU: no CPU staging needed, just a direct region copy per rect.
+    GpuTexture *src_texture;
+    uint32_t src_subresource;
+    if (source_kind == SurfaceKind::Gpu) {
+      GpuSurface *src_gpu_surface = static_cast<GpuSurface *>(pSourceSurface);
+      src_texture = src_gpu_surface->texture();
+      src_subresource = src_gpu_surface->subresource();
+    } else {
+      src_texture =
+          static_cast<BackbufferSurface *>(pSourceSurface)->texture();
+      src_subresource = 0;
+    }
+    const D3D12_RESOURCE_DESC &src_desc = src_texture->resource_desc();
+    RECT whole_surface_rect{.left = 0,
+                            .top = 0,
+                            .right = static_cast<LONG>(src_desc.Width),
+                            .bottom = static_cast<LONG>(src_desc.Height)};
+    const bool copy_whole_surface = pSourceRectsArray == nullptr;
+    const UINT num_rects = copy_whole_surface ? 1 : cRects;
+
+    const D3D12_RESOURCE_STATES src_prior_state = src_texture->current_state();
+    TransitionTexture(src_texture, src_subresource,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+    TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
+                      D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst_location{
+        .pResource = dest_surface->texture()->resource(),
+        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        .SubresourceIndex = dest_surface->subresource()};
+    D3D12_TEXTURE_COPY_LOCATION src_location{
+        .pResource = src_texture->resource(),
+        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        .SubresourceIndex = src_subresource};
+    for (UINT i = 0; i < num_rects; ++i) {
+      const RECT &rect =
+          copy_whole_surface ? whole_surface_rect : pSourceRectsArray[i];
+      const POINT dest_point = pDestPointsArray
+                                    ? pDestPointsArray[i]
+                                    : POINT{.x = rect.left, .y = rect.top};
+      D3D12_BOX src_box{.left = static_cast<UINT>(rect.left),
+                        .top = static_cast<UINT>(rect.top),
+                        .front = 0,
+                        .right = static_cast<UINT>(rect.right),
+                        .bottom = static_cast<UINT>(rect.bottom),
+                        .back = 1};
+      cmd_list_->CopyTextureRegion(&dst_location,
+                                   safe_cast<uint32_t>(dest_point.x),
+                                   safe_cast<uint32_t>(dest_point.y), 0,
+                                   &src_location, &src_box);
+    }
+    TransitionTexture(src_texture, src_subresource, src_prior_state);
+    TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
+                      D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    MarkResourceAsUsed(InternalPtr(src_texture));
+    MarkResourceAsUsed(InternalPtr(dest_surface));
+    return S_OK;
+  }
+
+  ASSERT(source_kind == SurfaceKind::Cpu);
+  CpuSurface *source_surface = static_cast<CpuSurface *>(pSourceSurface);
 
   const D3D12_SUBRESOURCE_FOOTPRINT &source_footprint =
       source_surface->footprint().Footprint;

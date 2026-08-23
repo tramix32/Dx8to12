@@ -124,6 +124,7 @@ class BackbufferSurface : public BaseSurface {
   BackbufferSurface(Device* device, int index, GpuTexture* texture);
 
   int index() const { return index_; }
+  GpuTexture* texture() { return texture_.get(); }
 
   HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT* pLockedRect,
                                      CONST RECT* pRect, DWORD Flags) override;
