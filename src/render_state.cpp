@@ -245,6 +245,18 @@ DWORD &TextureStageState::GetAtIndex(size_t index) {
       return alpha_arg0;
     case D3DTSS_RESULTARG:
       return result_arg;
+    case D3DTSS_BUMPENVMAT00:
+      return reinterpret_cast<DWORD &>(bump_env_mat00);
+    case D3DTSS_BUMPENVMAT01:
+      return reinterpret_cast<DWORD &>(bump_env_mat01);
+    case D3DTSS_BUMPENVMAT10:
+      return reinterpret_cast<DWORD &>(bump_env_mat10);
+    case D3DTSS_BUMPENVMAT11:
+      return reinterpret_cast<DWORD &>(bump_env_mat11);
+    case D3DTSS_BUMPENVLSCALE:
+      return reinterpret_cast<DWORD &>(bump_env_lscale);
+    case D3DTSS_BUMPENVLOFFSET:
+      return reinterpret_cast<DWORD &>(bump_env_loffset);
     default:
       FAIL("Unexpected texture stage state %zu", index);
   }
