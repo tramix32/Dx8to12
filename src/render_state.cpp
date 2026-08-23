@@ -237,6 +237,12 @@ DWORD &TextureStageState::GetAtIndex(size_t index) {
       return reinterpret_cast<DWORD &>(transform_flags);
     case D3DTSS_ADDRESSW:
       return reinterpret_cast<DWORD &>(address_w);
+    case D3DTSS_COLORARG0:
+      return color_arg0;
+    case D3DTSS_ALPHAARG0:
+      return alpha_arg0;
+    case D3DTSS_RESULTARG:
+      return result_arg;
     default:
       FAIL("Unexpected texture stage state %zu", index);
   }
