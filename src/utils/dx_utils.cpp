@@ -123,9 +123,21 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
       return DXGI_FORMAT_R8G8B8A8_SNORM;
     case D3DFMT_V16U16:
       return DXGI_FORMAT_R16G16_SNORM;
-    case D3DFMT_P8:
     case D3DFMT_L8:
+      // NOTE: prevents a crash (DXGIFormatSize previously had no case for
+      // this either) and lets the texture actually be created/uploaded
+      // correctly, but sampling it in a shader still just returns the
+      // luminance value in the red channel with 0 in green/blue --
+      // GenerateArgValue (ff_pixel_shader.cpp) doesn't know this texture is
+      // luminance-semantic and needs an .rrr swizzle. Correctness gap, not
+      // attempted here since it needs per-stage format info threaded into
+      // shader codegen, which isn't tracked anywhere currently.
+      return DXGI_FORMAT_R8_UNORM;
     case D3DFMT_A8L8:
+      // Same luminance-swizzle gap as D3DFMT_L8 above (here R=luminance,
+      // G=alpha, needs .rrrg not raw .rgba).
+      return DXGI_FORMAT_R8G8_UNORM;
+    case D3DFMT_P8:
     case D3DFMT_A4L4:
     case D3DFMT_A8R3G3B2:
     case D3DFMT_X4R4G4B4:
@@ -183,6 +195,10 @@ int DXGIFormatSize(DXGI_FORMAT format) {
       // This is tricky. We need to make sure DX8 can never lock R8G8B8
       // textures.
       return 4;
+    case DXGI_FORMAT_R8_UNORM:
+      return 1;
+    case DXGI_FORMAT_R8G8_UNORM:
+      return 2;
     default:
       FAIL("Unexpected format %d", format);
   }
