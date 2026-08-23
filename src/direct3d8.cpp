@@ -49,8 +49,11 @@ HRESULT STDMETHODCALLTYPE Direct3D8::QueryInterface(REFIID riid,
     *ppvObj = static_cast<IDirect3D8 *>(this);
     return S_OK;
   } else {
-    FAIL("Invalid Direct3D8::QueryInterface.");
-    // return E_NOINTERFACE;
+    // Querying for an interface this object doesn't implement is normal COM
+    // usage (e.g. defensive interface probing by middleware) -- it isn't an
+    // error condition worth crashing over.
+    *ppvObj = nullptr;
+    return E_NOINTERFACE;
   }
 }
 

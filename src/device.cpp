@@ -100,8 +100,11 @@ HRESULT STDMETHODCALLTYPE Device::QueryInterface(REFIID riid, void **ppvObj) {
     *ppvObj = static_cast<IDirect3DDevice8 *>(this);
     return S_OK;
   } else {
-    FAIL("Invalid Device::QueryInterface.");
-    // return E_NOINTERFACE;
+    // Querying for an interface this object doesn't implement is normal COM
+    // usage (e.g. defensive interface probing by middleware) -- it isn't an
+    // error condition worth crashing over.
+    *ppvObj = nullptr;
+    return E_NOINTERFACE;
   }
 }
 

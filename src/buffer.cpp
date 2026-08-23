@@ -15,6 +15,51 @@ namespace Dx8to12 {
 
 static AixLog::Severity kLog = AixLog::Severity::trace;
 
+HRESULT STDMETHODCALLTYPE Buffer::QueryInterface(REFIID riid, void **ppvObj) {
+  if (riid == IID_IUnknown || riid == IID_IDirect3DResource8) {
+    *ppvObj = static_cast<IDirect3DVertexBuffer8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  if (!IsIndexBuffer() && riid == IID_IDirect3DVertexBuffer8) {
+    *ppvObj = static_cast<IDirect3DVertexBuffer8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  if (IsIndexBuffer() && riid == IID_IDirect3DIndexBuffer8) {
+    *ppvObj = static_cast<IDirect3DIndexBuffer8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  *ppvObj = nullptr;
+  return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE Buffer::GetDevice(IDirect3DDevice8 **ppDevice) {
+  *ppDevice = device_;
+  device_->AddRef();
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Buffer::GetDesc(D3DVERTEXBUFFER_DESC *pDesc) {
+  *pDesc = D3DVERTEXBUFFER_DESC{.Format = D3DFMT_VERTEXDATA,
+                                .Type = D3DRTYPE_VERTEXBUFFER,
+                                .Usage = static_cast<DWORD>(usage_),
+                                .Pool = d3d8_pool_,
+                                .Size = safe_cast<UINT>(size_),
+                                .FVF = fvf_};
+  return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Buffer::GetDesc(D3DINDEXBUFFER_DESC *pDesc) {
+  *pDesc = D3DINDEXBUFFER_DESC{.Format = DXGIToD3DFormat(index_buffer_fmt_),
+                               .Type = D3DRTYPE_INDEXBUFFER,
+                               .Usage = static_cast<DWORD>(usage_),
+                               .Pool = d3d8_pool_,
+                               .Size = safe_cast<UINT>(size_)};
+  return S_OK;
+}
+
 void Buffer::InitAsBuffer(Device* device, size_t size_in_bytes,
                           Dx8::Usage usage, D3DPOOL pool) {
   ASSERT(pool != D3DPOOL_SCRATCH);

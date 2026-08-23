@@ -49,6 +49,8 @@ class Buffer : public IDirect3DVertexBuffer8,
     return index_buffer_fmt_;
   }
 
+  bool IsIndexBuffer() const { return index_buffer_fmt_ != DXGI_FORMAT_UNKNOWN; }
+
 #ifdef DX8TO12_ENABLE_VALIDATION
   const std::wstring& name() const { return name_; }
 #endif
@@ -57,8 +59,8 @@ class Buffer : public IDirect3DVertexBuffer8,
 #undef PURE
 #define PURE VIRT_NOT_IMPLEMENTED
   /*** IUnknown methods ***/
-  virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
-                                                   void** ppvObj) PURE;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void** ppvObj) override;
   virtual ULONG STDMETHODCALLTYPE AddRef(THIS) override {
     return RefCounted::AddRef();
   }
@@ -67,24 +69,36 @@ class Buffer : public IDirect3DVertexBuffer8,
   }
 
   /*** IDirect3DResource8 methods ***/
-  virtual HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice) PURE;
-  virtual HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid,
-                                                   CONST void* pData,
-                                                   DWORD SizeOfData,
-                                                   DWORD Flags) PURE;
-  virtual HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void* pData,
-                                                   DWORD* pSizeOfData) PURE;
-  virtual HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) PURE;
-  virtual DWORD STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) PURE;
-  virtual DWORD STDMETHODCALLTYPE GetPriority(THIS) PURE;
-  virtual void STDMETHODCALLTYPE PreLoad(THIS) PURE;
-  virtual D3DRESOURCETYPE STDMETHODCALLTYPE GetType(THIS) PURE;
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice8** ppDevice) override;
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, CONST void* pData,
+                                           DWORD SizeOfData,
+                                           DWORD Flags) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void* pData,
+                                           DWORD* pSizeOfData) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override {
+    return D3DERR_NOTAVAILABLE;
+  }
+  DWORD STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) override {
+    // Bookkeeping only -- we don't implement resource eviction/priority.
+    DWORD previous = priority_;
+    priority_ = PriorityNew;
+    return previous;
+  }
+  DWORD STDMETHODCALLTYPE GetPriority(THIS) override { return priority_; }
+  void STDMETHODCALLTYPE PreLoad(THIS) override {}  // Do nothing.
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType(THIS) override {
+    return IsIndexBuffer() ? D3DRTYPE_INDEXBUFFER : D3DRTYPE_VERTEXBUFFER;
+  }
 
   virtual HRESULT STDMETHODCALLTYPE Lock(UINT OffsetToLock, UINT SizeToLock,
                                          BYTE** ppbData, DWORD Flags) override;
   virtual HRESULT STDMETHODCALLTYPE Unlock(THIS) override;
-  virtual HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC* pDesc) PURE;
-  virtual HRESULT STDMETHODCALLTYPE GetDesc(D3DINDEXBUFFER_DESC* pDesc) PURE;
+  HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC* pDesc) override;
+  HRESULT STDMETHODCALLTYPE GetDesc(D3DINDEXBUFFER_DESC* pDesc) override;
 
  protected:
   Device* device_;
@@ -99,6 +113,7 @@ class Buffer : public IDirect3DVertexBuffer8,
   Dx8::Usage usage_;
   DXGI_FORMAT index_buffer_fmt_ = DXGI_FORMAT_UNKNOWN;
   int size_ = 0;
+  DWORD priority_ = 0;
 
 #ifdef DX8TO12_ENABLE_VALIDATION
   std::wstring name_;

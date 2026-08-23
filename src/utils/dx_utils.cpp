@@ -83,6 +83,10 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format) {
       return D3DFMT_D16;
     case DXGI_FORMAT_A8_UNORM:
       return D3DFMT_A8;
+    case DXGI_FORMAT_R16_UINT:
+      return D3DFMT_INDEX16;
+    case DXGI_FORMAT_R32_UINT:
+      return D3DFMT_INDEX32;
     default:
       FAIL("Unimplemented DXGI_FORMAT %d\n", dxgi_format);
   }
@@ -111,6 +115,8 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
       return DXGI_FORMAT_D16_UNORM;
     case D3DFMT_INDEX16:
       return DXGI_FORMAT_R16_UINT;
+    case D3DFMT_INDEX32:
+      return DXGI_FORMAT_R32_UINT;
     case D3DFMT_V8U8:
       return DXGI_FORMAT_R8G8_SNORM;
     case D3DFMT_Q8W8V8U8:
