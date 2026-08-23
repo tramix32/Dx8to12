@@ -378,6 +378,7 @@ void GpuTexture::InitViews() {
 GpuTexture::~GpuTexture() {
   if (srv_handle_.ptr != 0) device_->srv_heap().Free(srv_handle_);
   if (rtv_handle_.ptr != 0) device_->rtv_heap()->Free(rtv_handle_);
+  if (dsv_handle_.ptr != 0) device_->dsv_heap()->Free(dsv_handle_);
   srv_handle_ = {};
 }
 
