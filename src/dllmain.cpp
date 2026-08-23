@@ -62,6 +62,22 @@ LONG WINAPI LogCrashAndContinueSearch(EXCEPTION_POINTERS *info) {
         << record->ExceptionInformation[1] << std::dec << "\n";
   }
   LogModuleAndOffset(record->ExceptionAddress);
+
+  // The faulting instruction address itself is sometimes in unmapped memory
+  // (e.g. a call through a corrupted/garbage function pointer) and can't be
+  // mapped back to a module at all -- in that case the call stack is what
+  // actually points at the culprit. Log each frame's address and the
+  // module+offset it falls in; even without symbol resolution this is
+  // usually enough to identify which function made the bad call.
+  void *frames[32] = {};
+  const USHORT frame_count = CaptureStackBackTrace(0, 32, frames, nullptr);
+  LOG(AixLog::Severity::fatal) << "  call stack (" << frame_count
+                               << " frames):\n";
+  for (USHORT i = 0; i < frame_count; ++i) {
+    LOG(AixLog::Severity::fatal) << "  #" << i << " " << frames[i] << "\n";
+    LogModuleAndOffset(frames[i]);
+  }
+
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
