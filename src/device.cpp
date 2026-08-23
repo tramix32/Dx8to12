@@ -282,6 +282,17 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
       swap_chain1.GetForInit()));
   ASSERT_HR(swap_chain1->QueryInterface(swap_chain_.GetForInit()));
 
+  // Without this, DXGI keeps monitoring `window_` itself -- intercepting
+  // Alt+Enter and reacting to window state changes -- which real D3D8 never
+  // did. A game written against real D3D8 doesn't expect DXGI to be
+  // synchronously interacting with its window at all, and unexpected
+  // reentrancy into the game's own WndProc during our swap chain setup is a
+  // plausible source of otherwise-unexplained corruption/crashes shortly
+  // afterward. Opt out of all of DXGI's automatic window handling.
+  ASSERT_HR(dxgi_factory_->MakeWindowAssociation(
+      window_, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER |
+                   DXGI_MWA_NO_PRINT_SCREEN));
+
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
 
   // Create the back buffer.
