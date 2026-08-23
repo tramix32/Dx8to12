@@ -135,6 +135,24 @@ Getting any one of these wrong produces **silently garbled texture contents**, n
 
 **If a future crash report mentions this specific message, that's the confirmation this is real and worth prioritizing** — implement the three block-math fixes above together (not incrementally, since a still-wrong intermediate state won't obviously look wrong), and ideally verify against a texture with recognizable content so a subtly-wrong block/row calculation shows up visually rather than passing silently.
 
+## Real-game feedback (2026-08-23): `ASSERT` was not reliably fatal -- probable root cause of the "silent crash" reports
+
+Investigating the "crashes with its own error, possibly memory violation, nothing from D3D12" report led to `MessageBoxFmt` (`utils/asserts.cpp`), which backs the `ASSERT`/`ASSERT_HR` macros used **pervasively** across this codebase for invariants (including on D3D12 API call results). Its old behavior:
+
+```cpp
+switch (clicked) {
+  case IDOK: case IDABORT: exit(1);
+  case IDRETRY: __debugbreak(); break;
+  default: break;  // <-- IDIGNORE, or the dialog never being seen/clicked at all
+}
+```
+
+**Only explicitly clicking "Abort" actually terminated the process.** Any other outcome — clicking "Ignore," or the modal dialog never being seen or properly dismissed at all (very plausible for a fullscreen game: the box can render off-screen or behind the game surface, and a stray keypress/click meant for the game can dismiss it via whichever button that input happens to map to) — fell through to `default: break;`, and **execution continued with the violated invariant**. Given `ASSERT_HR` wraps essentially every D3D12 resource-creation call in this codebase, that means a failed `CreateCommittedResource`/`CreateCommandList`/etc. could be silently waved through, leaving a null/garbage `ComPtr` in play -- and the *actual* crash happens later, at some unrelated call site that dereferences that garbage state, with no diagnostic tying it back to the real failure. This matches the reported symptom exactly: a crash that looks unrelated to anything logged, because the real failure already happened and was silently dismissed earlier.
+
+Fixed: every outcome except `IDRETRY` (kept as `__debugbreak()` for interactive use under an attached debugger) now calls `exit(1)`, matching `FAIL`'s `abort()`. There is no invariant in this codebase's actual usage of `ASSERT` where "continue anyway" is safe -- it was never designed as a soft/recoverable warning, this was a latent bug in the dialog-button handling, not an intentional escape hatch.
+
+**This is very likely the actual explanation for the imprecise, hard-to-pin-down crash reports from the last several builds** -- worth treating any *future* crash as a genuinely new symptom now that this is fixed, rather than assuming it's the same recurring issue.
+
 ## Phase 6 — Long tail (in progress, reactive)
 
 Second pass (2026-08-23) knocked out the remaining cheap/self-contained ones:
