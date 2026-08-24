@@ -87,6 +87,21 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format) {
       return D3DFMT_INDEX16;
     case DXGI_FORMAT_R32_UINT:
       return D3DFMT_INDEX32;
+    case DXGI_FORMAT_BC1_UNORM:
+      return D3DFMT_DXT1;
+    // BC2/BC3 don't distinguish the premultiplied-alpha DXT2/DXT4 variants
+    // from their non-premultiplied DXT3/DXT5 counterparts -- premultiplied
+    // vs. not is purely an app-side contract about what the encoded alpha
+    // means, not something recoverable from the DXGI format alone. This
+    // reverse mapping (reachable via GetSurfaceDesc/GetLevelDesc reporting
+    // a format back to the app) picks the more common non-premultiplied
+    // variant; it never affects how the texture is actually sampled, since
+    // that's driven by DXGIFromD3DFormat (the forward direction, which reads
+    // the app's real original format at CreateTexture time).
+    case DXGI_FORMAT_BC2_UNORM:
+      return D3DFMT_DXT3;
+    case DXGI_FORMAT_BC3_UNORM:
+      return D3DFMT_DXT5;
     default:
       FAIL("Unimplemented DXGI_FORMAT %d\n", dxgi_format);
   }
@@ -151,19 +166,20 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
       return DXGI_FORMAT_UNKNOWN;
 
     case D3DFMT_DXT1:
+      return DXGI_FORMAT_BC1_UNORM;
     case D3DFMT_DXT2:
     case D3DFMT_DXT3:
+      // BC2 doesn't distinguish DXT2's premultiplied alpha from DXT3's
+      // straight alpha -- that's purely an app-side interpretation of what
+      // the encoded alpha channel means, not something the GPU format
+      // itself encodes differently. An app using DXT2 already committed to
+      // premultiplied-alpha blending on its own end; we just store/sample
+      // the same bits BC2 would for DXT3.
+      return DXGI_FORMAT_BC2_UNORM;
     case D3DFMT_DXT4:
     case D3DFMT_DXT5:
-      // Block-compressed (S3TC/DXT) formats are not implemented -- see the
-      // matching comment in BaseTexture::Create (texture.cpp) for exactly
-      // what's missing and why. Deliberately still returns UNKNOWN (not a
-      // FAIL) here specifically: CheckDeviceFormat relies on this to
-      // gracefully report D3DERR_NOTAVAILABLE to games that politely probe
-      // capabilities before using a format, rather than crashing on a mere
-      // query. The loud, specific failure lives at actual texture-creation
-      // time instead, in BaseTexture::Create.
-      return DXGI_FORMAT_UNKNOWN;
+      // Same premultiplied-alpha caveat as DXT2/DXT3 above, for BC3.
+      return DXGI_FORMAT_BC3_UNORM;
 
     case D3DFMT_D24S8:
     case D3DFMT_D24X8:
@@ -201,6 +217,29 @@ int DXGIFormatSize(DXGI_FORMAT format) {
       return 2;
     default:
       FAIL("Unexpected format %d", format);
+  }
+}
+
+bool IsBlockCompressedFormat(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC3_UNORM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+int DXGIBlockSize(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_BC1_UNORM:
+      return 8;
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC3_UNORM:
+      return 16;
+    default:
+      FAIL("DXGIBlockSize: %d is not a block-compressed format", format);
   }
 }
 

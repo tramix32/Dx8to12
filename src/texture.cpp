@@ -35,26 +35,6 @@ BaseTexture *BaseTexture::Create(Device *device, TextureKind kind,
   if (HasFlag(d3d8_usage, D3DUSAGE_DYNAMIC) && pool != D3DPOOL_DEFAULT)
     return nullptr;
 
-  if (format == D3DFMT_DXT1 || format == D3DFMT_DXT2 ||
-      format == D3DFMT_DXT3 || format == D3DFMT_DXT4 ||
-      format == D3DFMT_DXT5) {
-    // Block-compressed (S3TC/DXT) textures aren't implemented: DXT1->BC1,
-    // DXT2/3->BC2, DXT4/5->BC3 is the correct DXGI mapping, but every place
-    // in this file that computes a pitch or a byte size from Width/Height
-    // (compact_pitches_/compact_offsets_ below, GetSurfaceDesc's Size field,
-    // CopySubresourceToGpuTexture's per-row copy loop) assumes a plain
-    // width*bytesPerPixel layout and would need to branch on 4x4-texel
-    // block dimensions instead. Getting that block math wrong produces
-    // silently-corrupted texture contents rather than a crash, which is a
-    // worse failure mode than this clear one -- so this is deliberately
-    // still unimplemented pending a real DXT asset to validate the fix
-    // against, rather than guessed at blind. See ROADMAP.md.
-    FAIL(
-        "D3DFORMAT %d (DXT/S3TC block-compressed texture) is not yet "
-        "supported.",
-        format);
-  }
-
   D3D12_RESOURCE_DESC resource_desc = {
       .Dimension = kTextureKindToDimension[(int)kind],
       .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
@@ -102,16 +82,31 @@ BaseTexture::BaseTexture(Device *device, TextureKind kind, Dx8::Usage usage,
       gpu_slice_sizes_.data(), gpu_row_strides.get(), nullptr);
   compact_pitches_.resize(footprints_.size());
   compact_offsets_.resize(footprints_.size());
-  const int format_size = DXGIFormatSize(resource_desc_.Format);
+  const bool is_block_compressed = IsBlockCompressedFormat(resource_desc_.Format);
+  const int format_size =
+      is_block_compressed ? 0 : DXGIFormatSize(resource_desc_.Format);
+  const int block_size =
+      is_block_compressed ? DXGIBlockSize(resource_desc_.Format) : 0;
   size_t num_bytes = 0;
   for (size_t i = 0; i < footprints_.size(); ++i) {
     compact_offsets_[i] = num_bytes;
     // SOME games choose not to respect the row pitch that you give them, and
     // decide to compute their own pitch values.
-    compact_pitches_[i] = footprints_[i].Footprint.Width * format_size;
+    // Block-compressed formats are addressed in 4x4-texel blocks -- a "row"
+    // here is a row of blocks, each block_size bytes, covering 4 texel rows
+    // at once (see IsBlockCompressedFormat's declaration comment).
+    uint32_t row_count;
+    if (is_block_compressed) {
+      compact_pitches_[i] =
+          BlockCountForDimension(footprints_[i].Footprint.Width) * block_size;
+      row_count = BlockCountForDimension(footprints_[i].Footprint.Height);
+    } else {
+      compact_pitches_[i] = footprints_[i].Footprint.Width * format_size;
+      row_count = footprints_[i].Footprint.Height;
+    }
     gpu_slice_sizes_[i] *= (uint32_t)gpu_row_strides[i];
 
-    num_bytes += compact_pitches_[i] * footprints_[i].Footprint.Height;
+    num_bytes += compact_pitches_[i] * row_count;
   }
   total_compact_size_ = num_bytes;
 }
@@ -131,7 +126,14 @@ D3DSURFACE_DESC BaseTexture::GetSurfaceDesc(uint32_t subresource) const {
   pDesc->Pool = pool_;
   // TODO: This isn't technically correct - we should report the real surface
   // size.
-  pDesc->Size = footprint.RowPitch * footprint.Height;
+  // footprint.RowPitch is already block-aware (GetCopyableFootprints knows
+  // the format), but footprint.Height is always the raw texel height -- for
+  // a block-compressed format that has to be converted to a block-row count
+  // first, or this overcounts by up to 4x.
+  pDesc->Size = footprint.RowPitch *
+                (IsBlockCompressedFormat(resource_desc_.Format)
+                     ? BlockCountForDimension(footprint.Height)
+                     : footprint.Height);
   pDesc->MultiSampleType = D3DMULTISAMPLE_NONE;
   pDesc->Width = footprint.Width;
   pDesc->Height = footprint.Height;
@@ -190,6 +192,19 @@ HRESULT STDMETHODCALLTYPE CpuTexture::LockRect(UINT Level,
   if (Level >= footprints_.size()) return D3DERR_INVALIDCALL;
   char *level_ptr = data_.get() + compact_offsets_[Level];
   if (pRect) {
+    // Partial-rect locking of a block-compressed texture would need pRect's
+    // texel coordinates converted to 4x4-block coordinates -- games load
+    // DXT/S3TC data as a single whole-level blit essentially universally
+    // (that's the point of shipping it pre-compressed), so this is
+    // deliberately not guessed at blind for the sake of a case that's
+    // vanishingly unlikely to ever actually run. Loud failure instead of
+    // silently reading from the wrong offset if it ever does.
+    if (IsBlockCompressedFormat(resource_desc_.Format)) {
+      FAIL(
+          "CpuTexture::LockRect: partial-rect lock of a block-compressed "
+          "(DXT/S3TC) texture is not supported -- lock the whole level "
+          "instead.");
+    }
     const int format_size = DXGIFormatSize(resource_desc_.Format);
     level_ptr +=
         pRect->top * compact_pitches_[Level] + pRect->left * format_size;
@@ -272,8 +287,16 @@ void CpuTexture::CopySubresourceToGpuTexture(
   // the GPU expects (and also to the upload heap).
   const D3D12_SUBRESOURCE_FOOTPRINT &footprint =
       footprints_[subresource].Footprint;
+  // Block-compressed formats are addressed in 4x4-texel blocks -- a "row"
+  // here means a row of blocks (compact_pitch/footprint.RowPitch bytes,
+  // covering 4 texel rows), not a row of individual texels, so the copy loop
+  // below must iterate block rows instead of footprint.Height for them.
+  const uint32_t row_count =
+      IsBlockCompressedFormat(resource_desc_.Format)
+          ? BlockCountForDimension(footprint.Height)
+          : footprint.Height;
   const size_t num_bytes =
-      static_cast<size_t>(footprint.RowPitch * footprint.Height);
+      static_cast<size_t>(footprint.RowPitch) * row_count;
   DynamicRingBuffer::Allocation ring_alloc =
       device_->dynamic_ring_buffer()->Allocate(num_bytes);
   char *source_ring_ptr =
@@ -284,7 +307,7 @@ void CpuTexture::CopySubresourceToGpuTexture(
     memcpy(source_ring_ptr, data_.get() + compact_offsets_[subresource],
            num_bytes);
   else {
-    for (uint32_t i = 0; i < footprint.Height; ++i) {
+    for (uint32_t i = 0; i < row_count; ++i) {
       memcpy(source_ring_ptr + i * footprint.RowPitch,
              data_.get() + compact_offsets_[subresource] + i * compact_pitch,
              compact_pitch);

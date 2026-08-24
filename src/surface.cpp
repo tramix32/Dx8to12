@@ -146,8 +146,18 @@ HRESULT STDMETHODCALLTYPE CpuSurface::LockRect(D3DLOCKED_RECT* pLockedRect,
                                                DWORD Flags) {
   char* rect_ptr = data_ptr_;
   if (pRect) {
-    const int format_size =
-        DXGIFormatSize(DXGIFromD3DFormat(desc_.Format));
+    // See the matching guard in CpuTexture::LockRect (texture.cpp) --
+    // partial-rect locking of block-compressed (DXT/S3TC) data would need
+    // pRect's texel coordinates converted to 4x4-block coordinates, which
+    // isn't implemented; whole-surface locks work fine.
+    DXGI_FORMAT dxgi_format = DXGIFromD3DFormat(desc_.Format);
+    if (IsBlockCompressedFormat(dxgi_format)) {
+      FAIL(
+          "CpuSurface::LockRect: partial-rect lock of a block-compressed "
+          "(DXT/S3TC) surface is not supported -- lock the whole surface "
+          "instead.");
+    }
+    const int format_size = DXGIFormatSize(dxgi_format);
     rect_ptr += pRect->top * compact_pitch_ + pRect->left * format_size;
   }
   pLockedRect->Pitch = compact_pitch_;

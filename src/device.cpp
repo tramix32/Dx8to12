@@ -1141,6 +1141,20 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
 
     const D3D12_RESOURCE_DESC &dst_desc =
         dest_surface->texture()->resource_desc();
+    // CopyRects' rect/point math throughout this function operates in raw
+    // texel coordinates; block-compressed (DXT/S3TC) resources need those
+    // converted to (and D3D12-required to be aligned to) 4x4-block
+    // coordinates instead, which isn't implemented -- CopyRects onto/from
+    // static compressed texture data essentially never happens in practice
+    // (it's almost always used for render-target/backbuffer blits and
+    // dynamic surface updates), so this is a loud, specific failure rather
+    // than guessed-at block math that could silently corrupt the copy.
+    if (IsBlockCompressedFormat(src_desc.Format) ||
+        IsBlockCompressedFormat(dst_desc.Format)) {
+      FAIL(
+          "CopyRects: block-compressed (DXT/S3TC) source/destination "
+          "surfaces are not supported.");
+    }
     // D3D12 requires an exact (or explicitly-equivalent, per the small set
     // the validation layer recognizes -- BC[1|4], BC[2|3|5|6|7],
     // R9G9B9E5_SHAREDEXP) format match for a direct texture-to-texture
@@ -1240,6 +1254,12 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
       source_surface->footprint().Footprint;
   const uint32_t compact_pitch =
       safe_cast<uint32_t>(source_surface->compact_pitch());
+  // See the matching guard/comment on the GPU-source path above.
+  if (IsBlockCompressedFormat(source_footprint.Format)) {
+    FAIL(
+        "CopyRects: block-compressed (DXT/S3TC) source surface is not "
+        "supported.");
+  }
   const int format_size = DXGIFormatSize(source_footprint.Format);
 
   // No source rects means "copy the whole surface", per the D3D8 docs; a

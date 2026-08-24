@@ -18,6 +18,24 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format);
 DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format);
 int DXGIFormatSize(DXGI_FORMAT format);
 
+// Block-compressed (S3TC/DXT -> BC1/BC2/BC3) formats are addressed in 4x4
+// texel blocks, not individual texels -- DXGIFormatSize's "bytes per pixel"
+// contract doesn't apply to them at all (BC1 averages 0.5 bytes/texel, which
+// isn't representable as an int). Anything that computes a pitch or a byte
+// size from a texture's Width/Height must check IsBlockCompressedFormat
+// first and branch to block-aware math using these instead.
+bool IsBlockCompressedFormat(DXGI_FORMAT format);
+// Bytes per 4x4 texel block (8 for BC1, 16 for BC2/BC3). Only meaningful
+// when IsBlockCompressedFormat(format) is true.
+int DXGIBlockSize(DXGI_FORMAT format);
+// The number of 4x4 blocks needed to cover `texels` in one dimension --
+// equivalently, the "row"/"column" count to iterate for block-compressed
+// pitch/copy math, in place of the raw pixel Width/Height a linear format
+// would use.
+inline uint32_t BlockCountForDimension(uint32_t texels) {
+  return (texels + 3) / 4;
+}
+
 struct GpuPtr {
  public:
   GpuPtr() : ptr(0) {}
