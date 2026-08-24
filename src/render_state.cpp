@@ -290,7 +290,8 @@ size_t std::hash<Dx8to12::PSOState>::operator()(
       MurmurHashTo32(&pso_state.vs, sizeof(pso_state.vs)),
       MurmurHashTo32(&pso_state.ps, sizeof(pso_state.ps)),
       MurmurHashTo32(&pso_state.prim_type, sizeof(pso_state.prim_type)),
-      static_cast<uint32_t>(pso_state.dsv_format)};
+      static_cast<uint32_t>(pso_state.dsv_format),
+      static_cast<uint32_t>(pso_state.rtv_format)};
   return MurmurHashTo32(hash_elements, sizeof(hash_elements));
 }
 

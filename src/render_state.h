@@ -166,10 +166,11 @@ struct PSOState {
   ID3DBlob *ps;
   D3DPRIMITIVETYPE prim_type;
   DXGI_FORMAT dsv_format;
-  // TODO: Add RTV format and DSV format when we support SetRenderTarget.
+  DXGI_FORMAT rtv_format;
   bool operator==(const PSOState &other) const {
     return vs == other.vs && ps == other.ps && rs == other.rs &&
-           prim_type == other.prim_type && dsv_format == other.dsv_format;
+           prim_type == other.prim_type && dsv_format == other.dsv_format &&
+           rtv_format == other.rtv_format;
   }
 };
 

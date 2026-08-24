@@ -83,8 +83,19 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   template <typename T>
   void MarkResourceAsUsed(InternalPtr<T> resource) {
+    // See RefCounted::last_marked_generation_ for the full reasoning. This
+    // is purely a same-slot-since-last-clear dedup -- independent of
+    // frame/fence numbering -- so it can't be fooled by mid-frame flushes or
+    // anything else that advances next_fence_ without clearing this slot.
+    RefCounted *ptr = resource.Get();
+    if (ptr->last_marked_generation_[current_back_buffer_] ==
+        slot_generation_[current_back_buffer_]) {
+      return;
+    }
+    ptr->last_marked_generation_[current_back_buffer_] =
+        slot_generation_[current_back_buffer_];
     frame_resources_to_free_.at(current_back_buffer_)
-        .push_back(InternalPtr<RefCounted>(resource.Get()));
+        .push_back(InternalPtr<RefCounted>(ptr));
   }
 
 #ifdef DX8TO12_USE_ALLOCATOR
@@ -584,6 +595,14 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   std::array<std::vector<InternalPtr<RefCounted>>, kNumBackBuffers>
       frame_resources_to_free_;
+  // See RefCounted::last_marked_generation_. Starts at 1 (not the array's
+  // default 0) so a freshly-constructed resource's zero-initialized stamp
+  // can never spuriously match before it's ever been marked.
+  std::array<uint64_t, kNumBackBuffers> slot_generation_ = [] {
+    std::array<uint64_t, kNumBackBuffers> a;
+    a.fill(1);
+    return a;
+  }();
   std::unordered_set<ComPtr<Buffer>> buffers_to_persist_;
 
   // TODO: Make macro for this. Or just make dirty_flags_ an int.

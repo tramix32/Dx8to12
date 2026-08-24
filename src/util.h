@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <array>
 #include <cassert>
 #include <concepts>
 #include <cstdarg>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <limits>
 
+#include "device_limits.h"
 #include "utils/asserts.h"
 
 #ifdef __clang__
@@ -28,6 +30,19 @@ class RefCounted {
   int total_ref_count() const {
     return static_cast<int>(ref_count_) + internal_ref_count_;
   }
+
+  // Used by Device::MarkResourceAsUsed for O(1) dedup: for each back-buffer
+  // slot, the generation of Device::frame_resources_to_free_[slot] this
+  // resource was last added to. Comparing against Device::slot_generation_
+  // (bumped every time that slot's list is cleared, in FreeFrameResources)
+  // says whether this resource has already been added since that slot's
+  // list was last cleared -- entirely local to "has this specific slot's
+  // in-flight list already got an entry for me", with no dependency on
+  // frame/fence numbering, so a resource referenced by hundreds of draws
+  // targeting the same slot only needs one AddRef+push_back, not one per
+  // draw. Default-initialized to 0; Device::slot_generation_ starts at 1
+  // specifically so a never-marked resource can't spuriously match it.
+  std::array<uint64_t, kNumBackBuffers> last_marked_generation_ = {};
 
   ULONG AddInternalRef() {
     ASSERT(internal_ref_count_ < INT16_MAX);

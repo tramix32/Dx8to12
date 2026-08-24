@@ -1894,8 +1894,12 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
       case SurfaceKind::Gpu:
         texture = static_cast<GpuSurface *>(base_surface)->texture();
         resource_desc = texture->resource_desc();
-        ASSERT(resource_desc.Format ==
-               back_buffers_.at(0)->resource_desc().Format);
+        // Real D3D8 games commonly render to an off-screen target with a
+        // different format than the backbuffer (radar map, menu blur/
+        // reflection effects, etc.) -- CreatePSO reads the *actual* bound
+        // render target's format (see its RTVFormats comment) rather than
+        // assuming it always matches the backbuffer, so this no longer needs
+        // to be true.
         TransitionTexture(texture, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
         break;
       case SurfaceKind::Backbuffer:
@@ -2196,6 +2200,19 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
     pixel_shader = iter->second->blob;
   }
 
+  // Matches the render target BeginScene actually binds via
+  // OMSetRenderTargets -- the bound target if one's set, otherwise the
+  // current back buffer. Games commonly render to an off-screen target with
+  // a different format than the backbuffer (radar map, menu blur/reflection
+  // effects, etc.), so the PSO's declared output format has to track
+  // whichever target is actually bound rather than assuming it's always the
+  // backbuffer's format.
+  const DXGI_FORMAT current_rtv_format =
+      (bound_render_target_ ? bound_render_target_.Get()
+                            : back_buffers_.at(current_back_buffer_).Get())
+          ->resource_desc()
+          .Format;
+
   // Now that we know our pixel shader, try to look into the PSO cache.
   PSOState pso_key{
       .rs = render_state_,
@@ -2204,7 +2221,8 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
       .prim_type = d3d8_prim_type,
       .dsv_format = bound_depth_target_
                         ? bound_depth_target_->resource_desc().Format
-                        : DXGI_FORMAT_UNKNOWN};
+                        : DXGI_FORMAT_UNKNOWN,
+      .rtv_format = current_rtv_format};
 
   // Zero out/normalize every RenderState field that doesn't actually affect
   // the D3D12_GRAPHICS_PIPELINE_STATE_DESC built below, isn't fed into any
@@ -2316,7 +2334,7 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                           vertex_shader->decl.input_elements.size())},
       .PrimitiveTopologyType = d3d12_prim_type,
       .NumRenderTargets = 1,
-      .RTVFormats = {back_buffers_[0]->resource_desc().Format},
+      .RTVFormats = {current_rtv_format},
       .DSVFormat = bound_depth_target_
                        ? bound_depth_target_->resource_desc().Format
                        : DXGI_FORMAT_UNKNOWN,
@@ -2998,6 +3016,9 @@ void Device::FreeFrameResources(uint64_t frame_number) {
   for (size_t i = 0; i < frame_resources_to_free_.size(); ++i) {
     if (fence_values_[i] <= frame_number) {
       frame_resources_to_free_[i].clear();
+      // Invalidate every resource's "already marked for this slot" stamp --
+      // see RefCounted::last_marked_generation_ / MarkResourceAsUsed.
+      ++slot_generation_[i];
     }
   }
 
