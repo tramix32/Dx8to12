@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.11...3.26)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(DX8TO12_USE_ALLOCATOR OFF)
-set(DX8TO12_ENABLE_VALIDATION ON)
+option(DX8TO12_USE_ALLOCATOR "Use D3D12MemoryAllocator instead of manual suballocation" OFF)
+option(DX8TO12_ENABLE_VALIDATION "Enable the D3D12 debug layer and TRACE_ENTRY logging (dev builds)" ON)
 
 project(
   Dx8to12

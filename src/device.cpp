@@ -1860,10 +1860,22 @@ HRESULT STDMETHODCALLTYPE Device::SetTexture(DWORD Stage,
                                              IDirect3DBaseTexture8 *pTexture) {
   TRACE_ENTRY(Stage, pTexture);
   if (Stage >= bound_textures_.size()) return D3DERR_INVALIDCALL;
-  if (pTexture)
-    ASSERT(dynamic_cast<BaseTexture *>(pTexture)->GetSurfaceDesc(0).Pool !=
-           D3DPOOL_SYSTEMMEM);
-  GpuTexture *texture = dynamic_cast<GpuTexture *>(pTexture);
+  // Profiled hot path (WPA CPU sampling, see the session that added this
+  // comment): SetTexture alone accounted for more sampled CPU time than
+  // DrawPrimitive and SetStreamSource combined, almost entirely from doing
+  // *two* separate dynamic_casts of the same pointer. BaseTexture multiply-
+  // inherits IDirect3DTexture8/IDirect3DCubeTexture8 (both of which derive
+  // from IDirect3DBaseTexture8), so casting from the IDirect3DBaseTexture8*
+  // the app hands us requires a real dynamic_cast (a static_cast across that
+  // diamond isn't well-defined) -- but that's only true for *this* first
+  // step. BaseTexture -> GpuTexture is a plain single-inheritance downcast
+  // (same pattern already used in CopyRects below), so reuse the one
+  // dynamic_cast's result via static_cast instead of paying for RTTI twice.
+  BaseTexture *base_texture = dynamic_cast<BaseTexture *>(pTexture);
+  if (base_texture) {
+    ASSERT(base_texture->GetSurfaceDesc(0).Pool != D3DPOOL_SYSTEMMEM);
+  }
+  GpuTexture *texture = static_cast<GpuTexture *>(base_texture);
   bound_textures_[Stage] = InternalPtr(texture);
   dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
   return S_OK;
