@@ -1,3 +1,12 @@
 LIBRARY d3d8
 EXPORTS
     Direct3DCreate8
+
+    ; Dx8to12 mod-facing settings API -- see MODDING.md.
+    Dx8to12_GetApiVersion
+    Dx8to12_GetSettingInt
+    Dx8to12_SetSettingInt
+    Dx8to12_GetSettingFloat
+    Dx8to12_SetSettingFloat
+    Dx8to12_GetSettingBool
+    Dx8to12_SetSettingBool

@@ -5,6 +5,7 @@
 #include <iomanip>
 
 #include "aixlog.hpp"
+#include "config.h"
 
 namespace {
 
@@ -142,6 +143,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                                   LogCrashAndContinueSearch);
       LOG(AixLog::Severity::info)
           << "DLL_PROCESS_ATTACH on thread " << GetCurrentThreadId() << "\n";
+      Dx8to12::LoadConfig(hModule);
       break;
     case DLL_THREAD_ATTACH:
       // Cheap breadcrumb for the thread-ID cross-referencing above -- lets

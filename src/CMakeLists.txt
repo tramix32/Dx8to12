@@ -26,7 +26,10 @@ target_sources(
           dynamic_ring_buffer.cpp
           render_state.h
           render_state.cpp
-          device_limits.h)
+          device_limits.h
+          config.h
+          config.cpp
+          dx8to12_api.cpp)
 
 add_subdirectory(utils)
 add_subdirectory(shaders)
