@@ -110,15 +110,25 @@ __declspec(nothrow) HRESULT
   LOG(TRACE) << "EnumAdapterModes(" << Adapter << "," << Mode << ");\n";
   if (Adapter >= adapter_outputs_.size() || adapter_outputs_[Adapter].empty())
     return 0;
-  // TODO: Support more than one output.
-  IDXGIOutput *output = adapter_outputs_[Adapter][0];
-  constexpr DXGI_FORMAT formats_to_check[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
-  UINT count = 0;
-  ASSERT_HR(
-      output->GetDisplayModeList(formats_to_check[0], 0, &count, nullptr));
-  std::vector<DXGI_MODE_DESC> modes(count);  // TODO: Cache this.
-  ASSERT_HR(
-      output->GetDisplayModeList(formats_to_check[0], 0, &count, modes.data()));
+  // Callers (games/mods building a resolution list for an options menu)
+  // typically call this in a loop over every Mode index -- fetch the full
+  // list from the driver once per adapter and reuse it, rather than paying
+  // for GetDisplayModeList's real driver-level cost on every single index.
+  auto cache_it = cached_adapter_modes_.find(Adapter);
+  if (cache_it == cached_adapter_modes_.end()) {
+    // TODO: Support more than one output.
+    IDXGIOutput *output = adapter_outputs_[Adapter][0];
+    constexpr DXGI_FORMAT formats_to_check[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+    UINT count = 0;
+    ASSERT_HR(
+        output->GetDisplayModeList(formats_to_check[0], 0, &count, nullptr));
+    std::vector<DXGI_MODE_DESC> modes(count);
+    ASSERT_HR(output->GetDisplayModeList(formats_to_check[0], 0, &count,
+                                         modes.data()));
+    cache_it =
+        cached_adapter_modes_.emplace(Adapter, std::move(modes)).first;
+  }
+  const std::vector<DXGI_MODE_DESC> &modes = cache_it->second;
   if (Mode >= modes.size()) return D3DERR_INVALIDCALL;
   const DXGI_MODE_DESC &mode = modes[Mode];
   pMode->Width = mode.Width;
@@ -176,10 +186,7 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceType(UINT Adapter, D3DDEVTYPE CheckType,
   else if (CheckType != D3DDEVTYPE_HAL ||
            (DisplayFormat != D3DFMT_R8G8B8 && DisplayFormat != D3DFMT_A8R8G8B8))
     return D3DERR_NOTAVAILABLE;
-  IDXGIAdapter *adapter = adapters_[Adapter];
-  ComPtr<ID3D12Device> device;
-  HR_OR_RETURN(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0,
-                                 IID_PPV_ARGS(device.GetForInit())));
+  ID3D12Device *device = GetProbeDeviceFor(Adapter);
   D3D12_FEATURE_DATA_FORMAT_SUPPORT support{
       .Format = DXGIFromD3DFormat(BackBufferFormat)};
   if (support.Format == DXGI_FORMAT_UNKNOWN) return D3DERR_NOTAVAILABLE;
@@ -188,6 +195,17 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceType(UINT Adapter, D3DDEVTYPE CheckType,
   if (!HasFlag(support.Support1, D3D12_FORMAT_SUPPORT1_DISPLAY))
     return D3DERR_NOTAVAILABLE;
   return D3D_OK;
+}
+
+ID3D12Device *Direct3D8::GetProbeDeviceFor(UINT Adapter) {
+  auto it = cached_probe_devices_.find(Adapter);
+  if (it == cached_probe_devices_.end()) {
+    ComPtr<ID3D12Device> device;
+    ASSERT_HR(D3D12CreateDevice(adapters_[Adapter], D3D_FEATURE_LEVEL_11_0,
+                                IID_PPV_ARGS(device.GetForInit())));
+    it = cached_probe_devices_.emplace(Adapter, std::move(device)).first;
+  }
+  return it->second.get();
 }
 
 HRESULT
@@ -201,10 +219,7 @@ STDMETHODCALLTYPE Direct3D8::CheckDeviceFormat(
     return D3DERR_INVALIDCALL;
   else if (DeviceType != D3DDEVTYPE_HAL)
     return D3DERR_NOTAVAILABLE;
-  IDXGIAdapter *adapter = adapters_[Adapter];
-  ComPtr<ID3D12Device> device;
-  HR_OR_RETURN(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0,
-                                 IID_PPV_ARGS(device.GetForInit())));
+  ID3D12Device *device = GetProbeDeviceFor(Adapter);
   D3D12_FEATURE_DATA_FORMAT_SUPPORT support{.Format =
                                                 DXGIFromD3DFormat(CheckFormat)};
   if (support.Format == DXGI_FORMAT_UNKNOWN) return D3DERR_NOTAVAILABLE;

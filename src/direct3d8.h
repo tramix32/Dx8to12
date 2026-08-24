@@ -1,5 +1,8 @@
 #pragma once
 
+#include <dxgi.h>
+
+#include <unordered_map>
 #include <vector>
 
 #include "d3d8.h"
@@ -90,9 +93,29 @@ class Direct3D8 : public IDirect3D8, RefCounted {
     return adapter_outputs_.at(Adapter).at(0);
   }
 
+  // CheckDeviceType/CheckDeviceFormat only need a device to ask
+  // CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) -- they don't need a
+  // *fresh* one. D3D12CreateDevice is one of the most expensive calls in the
+  // whole API (real driver/runtime initialization), and games/mods commonly
+  // call these capability queries in a loop (once per format they care
+  // about) -- profiled via WPA CPU sampling, this was the single largest
+  // cost in this codebase's own code, dwarfing every actual per-frame
+  // rendering function. Lazily create one device per adapter and reuse it
+  // for every subsequent probe on that adapter.
+  ID3D12Device *GetProbeDeviceFor(UINT Adapter);
+  std::unordered_map<UINT, ComPtr<ID3D12Device>> cached_probe_devices_;
+
   ComPtr<IDXGIFactory2> dxgi_factory_;
 
   std::vector<IDXGIAdapter *> adapters_;
   std::vector<std::vector<IDXGIOutput *>> adapter_outputs_;
+
+  // EnumAdapterModes cache, keyed by Adapter -- games/mods typically call
+  // this in a loop (Mode = 0, 1, 2, ...) to enumerate every supported
+  // resolution, e.g. to populate an options menu. GetDisplayModeList is a
+  // genuinely slow, driver-level query; querying it fresh on every single
+  // Mode index (as this used to do) turns an O(1)-per-call enumeration loop
+  // into O(n) redundant full-list re-fetches from the driver.
+  std::unordered_map<UINT, std::vector<DXGI_MODE_DESC>> cached_adapter_modes_;
 };
 }  // namespace Dx8to12
