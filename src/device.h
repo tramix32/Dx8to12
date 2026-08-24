@@ -574,6 +574,12 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   DirtyFlags dirty_flags_ = DIRTY_FLAG_ALL;
 
+  // Redundant-set check for PrepareDrawCall's IASetPrimitiveTopology --
+  // reset to UNDEFINED whenever the command list itself gets Reset() (which
+  // drops all IA state), so the next draw always re-sets it there.
+  D3D12_PRIMITIVE_TOPOLOGY last_prim_topology_ =
+      D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
   std::unique_ptr<DynamicRingBuffer> dynamic_ring_buffer_;
 
   ComPtr<Buffer> vs_cbuffer_;

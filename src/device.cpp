@@ -570,6 +570,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   ASSERT_HR(
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
+  last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
   LOG(INFO) << "Reset: done\n";
   return S_OK;
@@ -1926,6 +1927,16 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
     switch (base_surface->kind()) {
       case SurfaceKind::Gpu:
         texture = static_cast<GpuSurface *>(base_surface)->texture();
+        // A custom depth-stencil surface (from CreateDepthStencilSurface) is
+        // as legitimate a target here as the implicit one -- e.g. paired
+        // with an off-screen color render target for a menu/mirror/reflection
+        // effect. Games routinely bind these together, and the previous
+        // ASSERT below only ever allowed depth_stencil_tex_ itself, hard-
+        // failing on any such effect. GpuTexture already starts in
+        // DEPTH_WRITE for D3DUSAGE_DEPTHSTENCIL textures, but transition
+        // explicitly (a no-op if already correct) in case it was reused for
+        // something else in between.
+        TransitionTexture(texture, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         break;
       case SurfaceKind::Backbuffer:
         ASSERT(static_cast<BackbufferSurface *>(base_surface)->index() == 0);
@@ -1935,12 +1946,7 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
         LOG_ERROR() << "Cannot set SYSTEMMEM surface as render target.\n";
         return D3DERR_INVALIDCALL;
     }
-    // TODO: Support actually binding a separate depth stencil tex.
-    ASSERT(texture == depth_stencil_tex_.Get());
-    bound_depth_target_ = InternalPtr(depth_stencil_tex_.Get());
-    // TODO: Update viewport.
-    ASSERT(viewport_.Width == bound_depth_target_->resource_desc().Width);
-    ASSERT(viewport_.Height == bound_depth_target_->resource_desc().Height);
+    bound_depth_target_ = InternalPtr(texture);
   } else {
     bound_depth_target_.Reset();
   }
@@ -2443,8 +2449,17 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     BeginScene();
   }
 
-  cmd_list_->IASetPrimitiveTopology(
-      static_cast<D3D12_PRIMITIVE_TOPOLOGY>(PrimitiveType));
+  // Most draws in a row reuse the same primitive type (e.g. a long run of
+  // D3DPT_TRIANGLELIST calls) -- skip the redundant IASetPrimitiveTopology
+  // call rather than reissuing it on every single draw.
+  {
+    D3D12_PRIMITIVE_TOPOLOGY topology =
+        static_cast<D3D12_PRIMITIVE_TOPOLOGY>(PrimitiveType);
+    if (topology != last_prim_topology_) {
+      cmd_list_->IASetPrimitiveTopology(topology);
+      last_prim_topology_ = topology;
+    }
+  }
 
   ASSERT(bound_vertex_shader_ != 0);
   VertexShader *vertex_shader = vertex_shaders_.at(bound_vertex_shader_).Get();
@@ -2957,6 +2972,10 @@ void Device::SubmitAndWait(bool should_present) {
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
   dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
+  // Resetting the command list drops all IA state (topology included), so
+  // the next draw must re-set it regardless of what PrepareDrawCall's own
+  // redundant-set check (last_prim_topology_) thinks is currently bound.
+  last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
   LOG(INFO) << "SubmitAndWait: done\n";
 }
 
