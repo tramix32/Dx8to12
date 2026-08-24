@@ -110,12 +110,14 @@ class Direct3D8 : public IDirect3D8, RefCounted {
   std::vector<IDXGIAdapter *> adapters_;
   std::vector<std::vector<IDXGIOutput *>> adapter_outputs_;
 
-  // EnumAdapterModes cache, keyed by Adapter -- games/mods typically call
-  // this in a loop (Mode = 0, 1, 2, ...) to enumerate every supported
-  // resolution, e.g. to populate an options menu. GetDisplayModeList is a
-  // genuinely slow, driver-level query; querying it fresh on every single
-  // Mode index (as this used to do) turns an O(1)-per-call enumeration loop
-  // into O(n) redundant full-list re-fetches from the driver.
+  // Shared by GetAdapterModeCount/EnumAdapterModes, keyed by Adapter --
+  // games/mods typically call these in a loop (Mode = 0, 1, 2, ...) to
+  // enumerate every supported resolution, e.g. to populate an options menu.
+  // GetDisplayModeList is a genuinely slow, driver-level query; querying it
+  // fresh on every single Mode index (as this used to do) turns an
+  // O(1)-per-call enumeration loop into O(n) redundant full-list re-fetches
+  // from the driver.
+  const std::vector<DXGI_MODE_DESC> &GetCachedModesFor(UINT Adapter);
   std::unordered_map<UINT, std::vector<DXGI_MODE_DESC>> cached_adapter_modes_;
 };
 }  // namespace Dx8to12

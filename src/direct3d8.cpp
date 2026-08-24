@@ -89,31 +89,8 @@ __declspec(nothrow) HRESULT STDMETHODCALLTYPE Direct3D8::GetAdapterIdentifier(
   return S_OK;
 }
 
-UINT STDMETHODCALLTYPE Direct3D8::GetAdapterModeCount(UINT Adapter) {
-  if (Adapter >= adapter_outputs_.size() || adapter_outputs_[Adapter].empty())
-    return 0;
-  // TODO: Support more than one output.
-  IDXGIOutput *output = adapter_outputs_[Adapter][0];
-  constexpr DXGI_FORMAT formats_to_check[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
-  UINT total_count = 0;
-  for (DXGI_FORMAT format : formats_to_check) {
-    UINT count = 0;
-    ASSERT_HR(output->GetDisplayModeList(format, 0, &count, nullptr));
-    total_count += count;
-  }
-  return total_count;
-}
-
-__declspec(nothrow) HRESULT
-    __stdcall Direct3D8::EnumAdapterModes(UINT Adapter, UINT Mode,
-                                          D3DDISPLAYMODE *pMode) {
-  LOG(TRACE) << "EnumAdapterModes(" << Adapter << "," << Mode << ");\n";
-  if (Adapter >= adapter_outputs_.size() || adapter_outputs_[Adapter].empty())
-    return 0;
-  // Callers (games/mods building a resolution list for an options menu)
-  // typically call this in a loop over every Mode index -- fetch the full
-  // list from the driver once per adapter and reuse it, rather than paying
-  // for GetDisplayModeList's real driver-level cost on every single index.
+const std::vector<DXGI_MODE_DESC> &Direct3D8::GetCachedModesFor(
+    UINT Adapter) {
   auto cache_it = cached_adapter_modes_.find(Adapter);
   if (cache_it == cached_adapter_modes_.end()) {
     // TODO: Support more than one output.
@@ -128,7 +105,22 @@ __declspec(nothrow) HRESULT
     cache_it =
         cached_adapter_modes_.emplace(Adapter, std::move(modes)).first;
   }
-  const std::vector<DXGI_MODE_DESC> &modes = cache_it->second;
+  return cache_it->second;
+}
+
+UINT STDMETHODCALLTYPE Direct3D8::GetAdapterModeCount(UINT Adapter) {
+  if (Adapter >= adapter_outputs_.size() || adapter_outputs_[Adapter].empty())
+    return 0;
+  return static_cast<UINT>(GetCachedModesFor(Adapter).size());
+}
+
+__declspec(nothrow) HRESULT
+    __stdcall Direct3D8::EnumAdapterModes(UINT Adapter, UINT Mode,
+                                          D3DDISPLAYMODE *pMode) {
+  LOG(TRACE) << "EnumAdapterModes(" << Adapter << "," << Mode << ");\n";
+  if (Adapter >= adapter_outputs_.size() || adapter_outputs_[Adapter].empty())
+    return 0;
+  const std::vector<DXGI_MODE_DESC> &modes = GetCachedModesFor(Adapter);
   if (Mode >= modes.size()) return D3DERR_INVALIDCALL;
   const DXGI_MODE_DESC &mode = modes[Mode];
   pMode->Width = mode.Width;
