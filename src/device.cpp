@@ -2917,11 +2917,6 @@ void Device::SubmitAndWait(bool should_present) {
   }
 
   ASSERT(!(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED));
-  // Fine-grained checkpoints while chasing a crash that lands somewhere in
-  // this function with no other diagnosable cause -- see ROADMAP.md. Remove
-  // once that's resolved; this is deliberately noisy per-call, not meant to
-  // stay long-term.
-  LOG(INFO) << "SubmitAndWait(should_present=" << should_present << ")\n";
 
   // Transition back buffer to present.
   if (should_present) {
@@ -2936,15 +2931,12 @@ void Device::SubmitAndWait(bool should_present) {
   buffers_to_persist_.clear();
 
   // Close the command list, then execute it.
-  LOG(INFO) << "SubmitAndWait: cmd_list_->Close()\n";
   ASSERT_HR(cmd_list_->Close());
   dirty_flags_ |= DIRTY_FLAG_CMD_LIST_CLOSED;
   ID3D12CommandList *cmd_list = cmd_list_.Get();
-  LOG(INFO) << "SubmitAndWait: cmd_queue_->ExecuteCommandLists()\n";
   cmd_queue_->ExecuteCommandLists(1, &cmd_list);
   // Present!
   if (should_present) {
-    LOG(INFO) << "SubmitAndWait: swap_chain_->Present()\n";
     ASSERT_HR(swap_chain_->Present(
         sync_interval_, sync_interval_ == 0 && tearing_supported_
                              ? DXGI_PRESENT_ALLOW_TEARING
@@ -2953,20 +2945,16 @@ void Device::SubmitAndWait(bool should_present) {
 
   // Grab a new fence value, set it at the end of the command queue execution.
   fence_values_.at(current_back_buffer_) = next_fence_++;
-  LOG(INFO) << "SubmitAndWait: cmd_queue_->Signal()\n";
   ASSERT_HR(cmd_queue_->Signal(cmd_list_done_fence_.get(),
                                fence_values_[current_back_buffer_]));
 
   // Update our back buffer index.
-  LOG(INFO) << "SubmitAndWait: swap_chain_->GetCurrentBackBufferIndex()\n";
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
 
   // Wait for it.
-  LOG(INFO) << "SubmitAndWait: WaitForFrame()\n";
   WaitForFrame(fence_values_[current_back_buffer_]);
 
   // Reset the command list for the next frame.
-  LOG(INFO) << "SubmitAndWait: resetting allocator/cmd list\n";
   ASSERT_HR(cmd_allocators_[current_back_buffer_]->Reset());
   ASSERT_HR(
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
@@ -2976,12 +2964,10 @@ void Device::SubmitAndWait(bool should_present) {
   // the next draw must re-set it regardless of what PrepareDrawCall's own
   // redundant-set check (last_prim_topology_) thinks is currently bound.
   last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  LOG(INFO) << "SubmitAndWait: done\n";
 }
 
 void Device::WaitForFrame(uint64_t frame_number) {
   ASSERT(frame_number <= next_fence_);
-  LOG(INFO) << "WaitForFrame(" << frame_number << ")\n";
 
   if (cmd_list_done_fence_->GetCompletedValue() < frame_number) {
     // Is this a frame that we're currently building?
@@ -2989,13 +2975,8 @@ void Device::WaitForFrame(uint64_t frame_number) {
         !(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED)) {
       // SubmitAndWait will call us again to wait for the frame, but at that
       // point fence_values_[current_back_buffer_] will have incremented.
-      LOG(INFO) << "WaitForFrame: recursing into SubmitAndWait(false)\n";
       SubmitAndWait(false);
     } else {
-      LOG(INFO) << "WaitForFrame: waiting on fence event ("
-                << cmd_list_done_fence_->GetCompletedValue() << " < "
-                << frame_number << ")\n";
-      LOG(TRACE) << "Waiting for fence " << frame_number << ".\n";
       ASSERT_HR(cmd_list_done_fence_->SetEventOnCompletion(
           frame_number, cmd_list_done_event_handle_));
       // TEMP DIAGNOSTIC: see perf_wait_ticks_accum_ comment in device.h.
@@ -3005,7 +2986,6 @@ void Device::WaitForFrame(uint64_t frame_number) {
           WaitForSingleObjectEx(cmd_list_done_event_handle_, 60 * 1000, FALSE);
       QueryPerformanceCounter(&wait_end);
       perf_wait_ticks_this_frame_ += wait_end.QuadPart - wait_start.QuadPart;
-      LOG(INFO) << "WaitForFrame: fence event signaled/timed out\n";
       if (wait_result != WAIT_OBJECT_0) {
         // The fence never signaled -- most likely the GPU driver hung and
         // got TDR-reset (device removed), or genuinely never finished this
@@ -3028,7 +3008,6 @@ void Device::WaitForFrame(uint64_t frame_number) {
 
   // Free any frame resources.
   FreeFrameResources(frame_number);
-  LOG(INFO) << "WaitForFrame: done\n";
 }
 
 void Device::FreeFrameResources(uint64_t frame_number) {

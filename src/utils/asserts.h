@@ -60,11 +60,28 @@ inline void TraceFunctionHelper(std::ostream& out, Arg arg, Args... args) {
 
 #define TRACE_ENTRY_LEVEL TRACE
 
+// AixLog's severity filtering happens per-sink at dispatch time, not at the
+// call site -- so even though the file sink's threshold (Severity::info,
+// see dllmain.cpp) already discards TRACE_ENTRY_LEVEL output, each call
+// still pays for building the formatted line (three separate LOG(...)
+// dispatches per invocation) before it gets thrown away. Every single
+// IDirect3DDevice8 method call goes through TRACE_ENTRY, so on a game
+// issuing thousands of draws/state-changes per frame this is a real,
+// silently-paid cost for output nobody ever sees at the current threshold.
+// Compiles away entirely in a non-validation (release) build; still works
+// normally in a dev build if someone lowers the sink threshold to actually
+// see it.
+#ifdef DX8TO12_ENABLE_VALIDATION
 #define TRACE_ENTRY(...)                                      \
   do {                                                        \
     LOG(TRACE_ENTRY_LEVEL) << __func__ << "(";                \
     TraceFunctionHelper(LOG(TRACE_ENTRY_LEVEL), __VA_ARGS__); \
     LOG(TRACE_ENTRY_LEVEL) << ");\n";                         \
   } while (0)
+#else
+#define TRACE_ENTRY(...) \
+  do {                   \
+  } while (0)
+#endif
 
 }  // namespace Dx8to12

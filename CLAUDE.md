@@ -31,7 +31,24 @@ Output is `build/d3d8.dll` (target name `d3d8`), with `build/d3d8.pdb` next to i
 
 Notable CMake options (top of `CMakeLists.txt`):
 - `DX8TO12_USE_ALLOCATOR` (default OFF) — pulls in D3D12MemoryAllocator via `FetchContent` instead of manual suballocation.
-- `DX8TO12_ENABLE_VALIDATION` (default ON) — enables extra internal validation/assertions.
+- `DX8TO12_ENABLE_VALIDATION` (default ON) — enables the D3D12 debug layer (`EnableDebugLayer()`) and `TRACE_ENTRY` (a per-call trace log built into every single `IDirect3DDevice8` method, gated to compile to nothing when this is off). Both are genuinely expensive on a game issuing thousands of draws/state-changes per frame — measured, disabling this roughly doubled FPS in a light test scene. See the dev vs. release build split below.
+
+### Dev build vs. release build
+
+Two parallel build directories, same source, one CMake flag apart:
+
+```
+# Dev (default): full D3D12 debug-layer validation + TRACE_ENTRY, for active debugging.
+cmake -S . -B build-x86 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build-x86 --target d3d8
+
+# Release: same optimization level and PDB (still RelWithDebInfo, not plain Release --
+# see the PDB rationale above), but DX8TO12_ENABLE_VALIDATION off.
+cmake -S . -B build-x86-release -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DDX8TO12_ENABLE_VALIDATION=OFF
+cmake --build build-x86-release --target d3d8
+```
+
+Use `build-x86/dist/` while actively working on this codebase (a real bug is much easier to diagnose with the debug layer's resource-state/descriptor validation and a full log.txt). Use `build-x86-release/dist/` for actually playing/benchmarking, or once a change is confirmed stable and you're done debugging it for the session. Both still produce a `d3d8.pdb`, so `log.txt`'s crash handler stays symbolicatable either way -- only the debug-layer + trace-log overhead differs, not crash-diagnosability.
 
 On Clang, warnings are treated as errors (`-Werror`); MSVC uses `/W4` with a couple of disabled warnings. Precompiled header covers `aixlog.hpp` and `<d3d12.h>`.
 
