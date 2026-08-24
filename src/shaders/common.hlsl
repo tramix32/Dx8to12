@@ -9,6 +9,11 @@ cbuffer Globals : register(b0) {
   float4x4 world_view;
   float3 camera_position;
   float pad;
+  // 2/viewport.Width, 2/viewport.Height -- see the comment on
+  // VertexCBuffer::inv_viewport_size (vertex_shader.h) for why this lives
+  // here (refreshed from the current viewport every frame) instead of as a
+  // shader-compile-time constant.
+  float2 inv_viewport_size;
   // float4x4 texture_coord_transforms[8];
 };
 

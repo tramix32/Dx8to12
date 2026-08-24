@@ -177,19 +177,33 @@ void Example(HMODULE d3d8) {
 | `Dx8to12_GetNumBackBuffers` | `int __cdecl ()` | Number of buffers in the swap chain (currently always 2). |
 | `Dx8to12_RegisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Registers a per-frame render callback; see below. Returns `false` if there's no device yet. |
 | `Dx8to12_UnregisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Removes a previously registered callback. |
+| `Dx8to12_GetSwapChainGeneration` | `unsigned long long __cdecl ()` | Counter bumped once per device `Reset()`; see below. Returns 0 if there's no device yet. |
 
 **Render callback contract**: once registered, your callback is invoked once
 per presented frame, right before the backbuffer transitions to
 `D3D12_RESOURCE_STATE_PRESENT`, with that frame's still-open
 `ID3D12GraphicsCommandList*` (passed as `void*` to keep the API C-ABI-safe --
 cast it back to `ID3D12GraphicsCommandList*`). At that point the backbuffer
-is still bound as the active render target and already holds the game's
-fully rendered frame, so a callback can just record its own draw commands
-(e.g. `ImGui_ImplDX12_RenderDrawData`) straight into the same command list
-and they composite on top, before `Present()` is called. Don't call
-`Close()`/`ExecuteCommandLists()`/`Present()` yourself from inside the
-callback -- Dx8to12 owns the command list's lifecycle; just record commands
-into it.
+is **guaranteed** to already be bound as the active render target (in
+`D3D12_RESOURCE_STATE_RENDER_TARGET`, via `OMSetRenderTargets`) and holding
+the game's fully rendered frame so far -- Dx8to12 forces this even on a
+frame the game itself never drew anything into (e.g. a blank loading-screen
+frame, or the first frame right after a device `Reset()`), so a callback can
+always just record its own draw commands (e.g. `ImGui_ImplDX12_RenderDrawData`)
+straight into the same command list and they composite on top, before
+`Present()` is called. Don't call `Close()`/`ExecuteCommandLists()`/
+`Present()` yourself from inside the callback -- Dx8to12 owns the command
+list's lifecycle; just record commands into it.
+
+**Surviving a device `Reset()`**: a window resize, fullscreen toggle, or
+format change destroys and recreates the back buffer resources (and can
+change their format/dimensions). If your PSO or other render-target-format-
+derived state was built against the old backbuffer, it needs rebuilding.
+Call `Dx8to12_GetSwapChainGeneration()` once per frame (or before you touch
+any cached format/dimension state) and compare it against the value you saw
+last time -- it's a plain counter bumped once per `Reset()`. When it changes,
+re-fetch `Dx8to12_GetBackbufferFormat()`/window size and rebuild whatever
+depended on them.
 
 Register once your mod DLL has initialized (typically from your `DllMain`'s
 `DLL_PROCESS_ATTACH`, after resolving the function pointer via

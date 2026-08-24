@@ -274,11 +274,34 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   adapter_ = std::move(adapter);
   adapter_index_ = adapter_index;
   ASSERT(adapter_);
-  if (HRESULT hr = D3D12CreateDevice(adapter_.get(), D3D_FEATURE_LEVEL_11_0,
-                                     IID_PPV_ARGS(d3d12_device_.GetForInit()));
-      hr != S_OK) {
-    FAIL("Failed to create device: %d", hr);
-    return false;
+  {
+    // DXGI_ERROR_DEVICE_HUNG/DEVICE_RESET (0x887A0006/0x887A0007) here mean
+    // the OS already has the adapter marked as needing to be reopened --
+    // typically a transient leftover from another D3D12 app (e.g. RenderDoc,
+    // or this same process on a previous run) closing right before this
+    // call. There's nothing about *this* call that caused it, but retrying
+    // after a short wait commonly clears it without needing a manual
+    // graphics-driver restart, so do that a few times before giving up.
+    constexpr int kMaxAttempts = 5;
+    HRESULT hr = S_OK;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+      hr = D3D12CreateDevice(adapter_.get(), D3D_FEATURE_LEVEL_11_0,
+                             IID_PPV_ARGS(d3d12_device_.GetForInit()));
+      if (hr == S_OK) break;
+      if ((hr != DXGI_ERROR_DEVICE_HUNG && hr != DXGI_ERROR_DEVICE_RESET) ||
+          attempt == kMaxAttempts) {
+        break;
+      }
+      LOG(AixLog::Severity::error)
+          << "D3D12CreateDevice failed with " << std::hex << hr << std::dec
+          << " (attempt " << attempt << "/" << kMaxAttempts
+          << ") -- retrying shortly.\n";
+      Sleep(400);
+    }
+    if (hr != S_OK) {
+      FAIL("Failed to create device: %d", hr);
+      return false;
+    }
   }
   // TODO: Pass in adapter output.
   // ASSERT_HR(adapter_->EnumOutputs(0, adapter_output_.GetForInit()));
@@ -362,7 +385,9 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
     LOG(INFO) << "Auto depth stencil.\n";
     D3DFORMAT depth_format = presentParams.AutoDepthStencilFormat;
     if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
-    ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32);
+    ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32 ||
+           depth_format == D3DFMT_D24S8 || depth_format == D3DFMT_D24X8 ||
+           depth_format == D3DFMT_D24X4S4);
     depth_stencil_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
         this, TextureKind::Texture2d, presentParams.BackBufferWidth,
         presentParams.BackBufferHeight, 1, 1, D3DUSAGE_DEPTHSTENCIL,
@@ -565,7 +590,9 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     LOG(INFO) << "Reset: creating depth-stencil texture\n";
     D3DFORMAT depth_format = pPresentationParameters->AutoDepthStencilFormat;
     if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
-    ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32);
+    ASSERT(depth_format == D3DFMT_D16 || depth_format == D3DFMT_D32 ||
+           depth_format == D3DFMT_D24S8 || depth_format == D3DFMT_D24X8 ||
+           depth_format == D3DFMT_D24X4S4);
     depth_stencil_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
         this, TextureKind::Texture2d, pPresentationParameters->BackBufferWidth,
         pPresentationParameters->BackBufferHeight, 1, 1, D3DUSAGE_DEPTHSTENCIL,
@@ -599,6 +626,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
   last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  ++swap_chain_generation_;
 
   LOG(INFO) << "Reset: done\n";
   return S_OK;
@@ -1069,8 +1097,20 @@ Device::CreateIndexBuffer(UINT Length, DWORD Usage, D3DFORMAT Format,
 void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
                                D3D12_RESOURCE_STATES state_after) {
   if (texture->current_state() == state_after) return;
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // AixLog's severity filtering happens per-sink at dispatch time, not at
+  // this call site -- an unguarded LOG() here would pay full temporary-
+  // object-construction and stream-formatting cost (std::hex, three
+  // operator<< calls) on every single state-changing transition even when
+  // the TRACE severity is filtered out and nothing ends up written, exactly
+  // the cost TRACE_ENTRY already had to be gated against elsewhere in this
+  // file. TransitionTexture is hot enough (called for close to every
+  // resource state change, so multiple times per draw in typical scenes)
+  // that this was worth gating explicitly rather than assuming the sink
+  // threshold alone would make it free.
   LOG(TRACE) << "Transitioning " << std::hex << texture << "From "
              << texture->current_state() << " to " << state_after << "\n";
+#endif
 
   D3D12_RESOURCE_BARRIER barrier{
       .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -2381,8 +2421,20 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                               ? D3D12_CULL_MODE_BACK
                               : D3D12_CULL_MODE_NONE,
               .FrontCounterClockwise = render_state_.cull_mode == D3DCULL_CW,
-              .DepthBias = 0,         // TODO.
-              .DepthBiasClamp = 0.f,  // TODO.
+              // D3DRS_ZBIAS is a legacy 0-16 integer scale (MSDN: "a larger
+              // value indicates a greater bias" toward the camera -- higher
+              // values win the depth test against coplanar/near-coplanar
+              // geometry, the classic use being a decal drawn flush against
+              // a surface without z-fighting it). There's no single correct
+              // D3D8->D3D12 unit conversion (MSDN never specified one --
+              // real D3D8 drivers already varied per-vendor here), so this
+              // is a reasonable small negative scale (toward the camera)
+              // rather than the previously-hardcoded 0, which silently
+              // dropped the bias entirely and left this class of decal
+              // exposed to z-fighting/occlusion mismatches against the
+              // surface it's meant to sit on top of.
+              .DepthBias = -static_cast<INT>(render_state_.z_bias) * 16,
+              .DepthBiasClamp = 0.f,
               .MultisampleEnable = render_state_.multisample_antialias != 0,
               .AntialiasedLineEnable = render_state_.edge_antialias != 0,
           },
@@ -2571,6 +2623,8 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     cbuffer->world_view_proj = world * view * proj;
     cbuffer->world_view = world * view;
     cbuffer->camera_position = DirectX::SimpleMath::Vector3(0, 0, 0);
+    cbuffer->inv_viewport_size = DirectX::SimpleMath::Vector2(
+        2.f / viewport_.Width, 2.f / viewport_.Height);
     ASSERT_HR(vs_cbuffer_->Unlock());
     dirty_flags_ ^= DIRTY_FLAG_TRANSFORMS;
   }
@@ -2638,6 +2692,31 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   cmd_list_->SetGraphicsRootConstantBufferView(3,
                                                vs_creg_cbuffer_->GetGpuPtr());
 
+  // Keep every currently-bound texture's keep-alive ref fresh for this
+  // frame's back-buffer slot, regardless of whether the GPU-visible
+  // descriptor table binding itself needs to be re-issued below. D3D8
+  // texture bindings are sticky -- a game can (and routinely does) draw many
+  // times, across many frames, off a single SetTexture call, relying on the
+  // binding staying in effect without repeating it. MarkResourceAsUsed used
+  // to only run inside the "rebind the descriptor table" branch, which only
+  // fires on the draw right after SetTexture actually changes something; on
+  // every later draw reusing the same sticky binding, the bound texture was
+  // never re-marked as used for that frame's slot. Once this session's
+  // MarkResourceAsUsed dedup (see slot_generation_) started skipping the
+  // *previously unconditional* AddRef instead of just being redundant with
+  // it, a sticky-bound texture could have its keep-alive ref lapse (and its
+  // SRV descriptor slot get freed and reused by a different texture) while
+  // the GPU was still actively rendering from that same descriptor slot --
+  // observed as another texture's contents flashing in (a font atlas filling
+  // a menu background, the sky flickering). MarkResourceAsUsed is itself
+  // already a cheap same-generation dedup check, so doing this unconditionally
+  // every draw is fine.
+  for (int i = 0; i < kMaxTexStages; ++i) {
+    if (bound_textures_[i]) {
+      MarkResourceAsUsed(bound_textures_[i]);
+    }
+  }
+
   if (dirty_flags_ & DIRTY_FLAG_PS_TEXTURES) {
     // And all the textures.
     for (int i = 0; i < kMaxTexStages; ++i) {
@@ -2646,7 +2725,6 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
             srv_heap_.GetGPUHandleFor(bound_textures_[i]->srv_handle());
         cmd_list_->SetGraphicsRootDescriptorTable(textures_start_bindslot_ + i,
                                                   gpu_handle);
-        MarkResourceAsUsed(bound_textures_[i]);
       }
     }
     dirty_flags_ ^= DIRTY_FLAG_PS_TEXTURES;
@@ -2980,8 +3058,22 @@ void Device::SubmitAndWait(bool should_present) {
 
   // Let mod-API render callbacks draw on top of this frame's backbuffer
   // while it's still bound and the command list is still open -- see
-  // RegisterModRenderCallback.
+  // RegisterModRenderCallback. BeginScene only actually runs lazily, on a
+  // game's first draw/Clear call of the frame (DIRTY_FLAG_OM) -- a frame
+  // presented with zero game draws (e.g. right after Reset(), or a blank
+  // loading-screen frame) would otherwise reach here with no render target
+  // ever bound and the backbuffer still sitting in D3D12_RESOURCE_STATE_
+  // PRESENT, not RENDER_TARGET. A mod callback recording into that raw,
+  // uninitialized command list is a well-known way to crash the GPU driver
+  // (observed: an access violation inside nvwgf2um.dll while recording a
+  // mod's DrawIndexedInstanced). Force BeginScene here so the contract
+  // MODDING.md documents -- backbuffer bound as the active render target --
+  // actually holds on every presented frame, not just ones the game itself
+  // drew into.
   if (should_present) {
+    if (dirty_flags_ & DIRTY_FLAG_OM) {
+      BeginScene();
+    }
     for (ModRenderCallback callback : mod_render_callbacks_) {
       callback(cmd_list_.Get());
     }

@@ -52,6 +52,12 @@ class Device : public IDirect3DDevice8, RefCounted {
   UINT sync_interval() const { return sync_interval_; }
   bool tearing_supported() const { return tearing_supported_; }
   DXGI_FORMAT backbuffer_format() const;
+  // Bumped once per Device::Reset() (window resize, fullscreen toggle,
+  // format change): back buffer resources, format, and dimensions are all
+  // recreated by Reset, so a mod holding onto its own PSO/RTV-format-derived
+  // state should compare this against the value it last saw and rebuild
+  // when it changes.
+  uint64_t swap_chain_generation() const { return swap_chain_generation_; }
   DescriptorPoolHeap &srv_heap() { return srv_heap_; }
   DescriptorPoolHeap *rtv_heap() { return &rtv_heap_; }
   DescriptorPoolHeap *dsv_heap() { return &dsv_heap_; }
@@ -445,6 +451,8 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   // See RegisterModRenderCallback.
   std::vector<ModRenderCallback> mod_render_callbacks_;
+
+  uint64_t swap_chain_generation_ = 1;
 
   int ref_count_;
 

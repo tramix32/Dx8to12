@@ -95,6 +95,17 @@ __declspec(dllexport) int __cdecl Dx8to12_GetNumBackBuffers() {
   return ::Dx8to12::kNumBackBuffers;
 }
 
+// Bumped once per Device::Reset() (window resize, fullscreen toggle, format
+// change) -- back buffer resources, format, and dimensions are all recreated
+// by Reset. Compare this against the value you last saw and rebuild any
+// PSO/RTV-format-derived state (and re-fetch Dx8to12_GetBackbufferFormat)
+// when it changes. Returns 0 if there's no device yet.
+__declspec(dllexport) unsigned long long __cdecl
+Dx8to12_GetSwapChainGeneration() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->swap_chain_generation() : 0;
+}
+
 // callback is invoked once per frame, right before the backbuffer
 // transitions to PRESENT, with the still-open ID3D12GraphicsCommandList*
 // (cast from the void* parameter) -- see Device::RegisterModRenderCallback

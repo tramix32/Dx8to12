@@ -81,6 +81,8 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format) {
       return D3DFMT_D32;
     case DXGI_FORMAT_D16_UNORM:
       return D3DFMT_D16;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return D3DFMT_D24S8;
     case DXGI_FORMAT_A8_UNORM:
       return D3DFMT_A8;
     case DXGI_FORMAT_R16_UINT:
@@ -184,7 +186,17 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
     case D3DFMT_D24S8:
     case D3DFMT_D24X8:
     case D3DFMT_D24X4S4:
-      return DXGI_FORMAT_UNKNOWN;
+      // The single most common D3D8-era depth-stencil format on real
+      // hardware (X8/X4S4 just leave some bits unused; DXGI has no
+      // depth-only 24-bit format to map those to separately, so they share
+      // this too). Previously unmapped entirely -- CheckDeviceFormat would
+      // report it unsupported, so a game probing formats (as GTA VC does)
+      // would fall back to whatever format *was* supported (D3DFMT_D32),
+      // silently landing on 32-bit float depth precision it never actually
+      // asked for and that real period hardware mostly didn't have,
+      // changing depth-test outcomes for anything drawn near-coplanar with
+      // other geometry (e.g. ground decals) versus the original game.
+      return DXGI_FORMAT_D24_UNORM_S8_UINT;
 
     case D3DFMT_R8G8B8:
       return DXGI_FORMAT_UNKNOWN;
@@ -199,6 +211,7 @@ int DXGIFormatSize(DXGI_FORMAT format) {
     case DXGI_FORMAT_R32_UINT:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
       return 4;
     case DXGI_FORMAT_R16_SINT:
     case DXGI_FORMAT_R16_UINT:

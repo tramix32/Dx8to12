@@ -55,6 +55,21 @@ struct VertexCBuffer {
   DirectX::SimpleMath::Matrix world_view;
   DirectX::SimpleMath::Vector3 camera_position;
   float pad;
+  // 2/viewport.Width, 2/viewport.Height -- used by the fixed-function vertex
+  // shader to convert D3DFVF_XYZRHW (pretransformed, screen-space) vertices
+  // into NDC. This used to be baked as a compile-time literal into the
+  // generated HLSL at CreateVertexShader time, which meant it silently went
+  // stale forever for any vertex shader handle created before a later
+  // Reset() changed the viewport size (games typically create their shader
+  // handles once at startup and reuse them for the rest of the run) --
+  // observed as 2D UI (radar, menus) getting positioned/scaled for the
+  // resolution the game started at, not whatever it was later changed to.
+  // Living here instead means it's refreshed from the *current* viewport
+  // every time this cbuffer is (DIRTY_FLAG_TRANSFORMS, at least once a
+  // frame), independent of which vertex shader handle is bound.
+  DirectX::SimpleMath::Vector2 inv_viewport_size;
+  float pad2[2];  // HLSL cbuffer packing: a float2 doesn't share a 16-byte
+                  // register with anything after it either.
   // D3DMATRIX texture_coord_transforms[8];
 };
 struct LightsCBuffer {

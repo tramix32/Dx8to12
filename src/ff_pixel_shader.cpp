@@ -190,18 +190,43 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
   ss << "float4 arg0, arg1, arg2;" << endl;
   ss << "float alpha;" << endl;
 
-  for (int i = 0; i < kMaxTexStages; ++i) {
-    if (s.ts[i].color_op == D3DTOP_DISABLE) {
-      // Done!
-      break;
-    }
+  // Color and alpha are independent per-stage chains in real D3D8: setting a
+  // stage's ColorOp to D3DTOP_DISABLE terminates only the color chain at
+  // that stage, not the alpha chain (and vice versa) -- a common technique
+  // is ColorOp=DISABLE (color stays whatever the previous stage/diffuse
+  // left it) paired with AlphaOp=SELECTARG1/AlphaArg1=TEXTURE at the same
+  // stage, to mask a flat-colored quad's shape using only a texture's alpha
+  // channel (e.g. a soft round particle sprite). Previously this loop broke
+  // out entirely -- skipping that stage's AlphaOp too -- the instant
+  // ColorOp hit DISABLE, which silently dropped the alpha mask and left
+  // result_color.a at diffuse (usually ~1.0), rendering particles as solid
+  // squares instead of their intended shape.
+  bool color_active = true;
+  bool alpha_active = true;
+  for (int i = 0; i < kMaxTexStages && (color_active || alpha_active); ++i) {
     // ASSERT(s.ts[i].texcoord_index < 8);
     ASSERT(!HasFlag(s.ts[i].transform_flags, D3DTTFF_PROJECTED));
-    ApplyOperation(s, "xyz", i, s.ts[i].color_op, s.ts[i].color_arg1,
-                   s.ts[i].color_arg2, ss);
-    if (s.ts[i].alpha_op != D3DTOP_DISABLE) {
-      ApplyOperation(s, "a", i, s.ts[i].alpha_op, s.ts[i].alpha_arg1,
-                     s.ts[i].alpha_arg2, ss);
+    // D3DTOP_DISABLE (1) is the lowest legal D3DTEXTUREOP value -- a stage
+    // that was never actually configured by the game (e.g. an alpha chain
+    // that outlives the color chain, reaching stages the game only ever
+    // set ColorOp for) can read back as a raw 0, which isn't a valid op at
+    // all. Real hardware/drivers evidently treat that the same as DISABLE
+    // rather than erroring, so do the same here instead of FAILing on it.
+    if (color_active) {
+      if (s.ts[i].color_op <= D3DTOP_DISABLE) {
+        color_active = false;
+      } else {
+        ApplyOperation(s, "xyz", i, s.ts[i].color_op, s.ts[i].color_arg1,
+                       s.ts[i].color_arg2, ss);
+      }
+    }
+    if (alpha_active) {
+      if (s.ts[i].alpha_op <= D3DTOP_DISABLE) {
+        alpha_active = false;
+      } else {
+        ApplyOperation(s, "a", i, s.ts[i].alpha_op, s.ts[i].alpha_arg1,
+                       s.ts[i].alpha_arg2, ss);
+      }
     }
   }
   if (s.alpha_func() != D3DCMP_ALWAYS) {

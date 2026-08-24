@@ -45,7 +45,7 @@ FFVertexOutput VSMain(VertexInput IN) {
 #endif
 #else
   OUT.oPos = IN.input_reg0;
-  OUT.oPos.xy = (OUT.oPos.xy + 0.5f) * invView2 - 1.f;
+  OUT.oPos.xy = (OUT.oPos.xy + 0.5f) * inv_viewport_size - 1.f;
   OUT.oPos.y *= -1.f;
   // D3DFVF_XYZRHW vertices are already in screen space -- real D3D8/9
   // hardware does NOT perspective-divide them (RHW is only a per-vertex

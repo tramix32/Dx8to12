@@ -273,10 +273,12 @@ VertexShader CreateFixedFunctionVertexShader(
     s << " : POSITION" << desc.SemanticIndex << ";" << endl;
   }
   s << "};" << endl << endl;
-  // TODO: Put this in cbuffer? Not saving much computation cost. Also needs to
-  // change whenever viewport changes!
-  s << "static const float2 invView2 = {" << 2.f / viewport.Width << ", "
-    << 2.f / viewport.Height << "};" << endl;
+  // inv_viewport_size (2/width, 2/height, for XYZRHW screen->NDC conversion)
+  // used to be baked here as a compile-time literal -- see the comment on
+  // VertexCBuffer::inv_viewport_size (vertex_shader.h) for why that went
+  // stale forever after any later resolution change and was moved into the
+  // Globals cbuffer instead, refreshed from the current viewport every
+  // frame.
   s << "#include \"ff_vertex_shader.hlsl\"\n";
 
   const std::string code = s.str();
