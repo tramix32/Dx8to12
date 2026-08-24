@@ -10,6 +10,8 @@
 // DLL's exports by name via GetProcAddress, same as it would load Windows
 // API functions.
 #include "config.h"
+#include "device.h"
+#include "device_limits.h"
 
 namespace {
 constexpr int kApiVersion = 1;
@@ -59,6 +61,61 @@ __declspec(dllexport) bool __cdecl Dx8to12_SetSettingBool(const char *key,
                                                            bool value) {
   if (!key) return false;
   return ::Dx8to12::SetConfigValueBool(key, value);
+}
+
+// Native D3D12 rendering access for mods (e.g. an ImGui-based trainer/
+// overlay) that want to draw directly through the real device instead of
+// needing a D3D9 (or other) compatibility shim -- see MODDING.md. All of
+// these return null/false before device creation (i.e. before the game has
+// called CreateDevice) or after device destruction.
+
+__declspec(dllexport) void *__cdecl Dx8to12_GetD3D12Device() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->device() : nullptr;
+}
+
+__declspec(dllexport) void *__cdecl Dx8to12_GetD3D12CommandQueue() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->cmd_queue() : nullptr;
+}
+
+__declspec(dllexport) void *__cdecl Dx8to12_GetWindowHandle() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->window() : nullptr;
+}
+
+// Returns a DXGI_FORMAT value (as used by the swap chain's render target
+// views), or 0 (DXGI_FORMAT_UNKNOWN) if there is no device yet.
+__declspec(dllexport) int __cdecl Dx8to12_GetBackbufferFormat() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? static_cast<int>(device->backbuffer_format()) : 0;
+}
+
+__declspec(dllexport) int __cdecl Dx8to12_GetNumBackBuffers() {
+  return ::Dx8to12::kNumBackBuffers;
+}
+
+// callback is invoked once per frame, right before the backbuffer
+// transitions to PRESENT, with the still-open ID3D12GraphicsCommandList*
+// (cast from the void* parameter) -- see Device::RegisterModRenderCallback
+// in device.h for the full contract. Returns false if there's no device yet;
+// register again after your hook observes device creation in that case.
+__declspec(dllexport) bool __cdecl Dx8to12_RegisterRenderCallback(
+    void(__cdecl *callback)(void *command_list)) {
+  if (!callback) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  if (!device) return false;
+  device->RegisterModRenderCallback(callback);
+  return true;
+}
+
+__declspec(dllexport) bool __cdecl Dx8to12_UnregisterRenderCallback(
+    void(__cdecl *callback)(void *command_list)) {
+  if (!callback) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  if (!device) return false;
+  device->UnregisterModRenderCallback(callback);
+  return true;
 }
 
 }  // extern "C"

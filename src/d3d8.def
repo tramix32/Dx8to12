@@ -10,3 +10,12 @@ EXPORTS
     Dx8to12_SetSettingFloat
     Dx8to12_GetSettingBool
     Dx8to12_SetSettingBool
+
+    ; Dx8to12 mod-facing native D3D12 rendering API -- see MODDING.md.
+    Dx8to12_GetD3D12Device
+    Dx8to12_GetD3D12CommandQueue
+    Dx8to12_GetWindowHandle
+    Dx8to12_GetBackbufferFormat
+    Dx8to12_GetNumBackBuffers
+    Dx8to12_RegisterRenderCallback
+    Dx8to12_UnregisterRenderCallback

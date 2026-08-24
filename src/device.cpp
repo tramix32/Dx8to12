@@ -34,6 +34,14 @@
 
 namespace Dx8to12 {
 
+// The single live Device instance, exposed to dx8to12_api.cpp so the C mod
+// API can reach it without every caller needing a Device* of their own.
+// There is only ever one Device (one D3D12 device/swap chain per process),
+// set at the end of Device::Create and cleared in ~Device.
+static Device *g_current_device = nullptr;
+
+Device *GetCurrentDeviceForModApi() { return g_current_device; }
+
 // static_assert(sizeof(void *) == 4, "Does not support 64-bit.");
 
 // DXGI_SWAP_EFFECT_FLIP_DISCARD swap chains only accept a handful of formats,
@@ -291,6 +299,7 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   // ASSERT(options12.EnhancedBarriersSupported);
 
   ASSERT_HR(Init(presentParams));
+  g_current_device = this;
   LOG(INFO) << "Create: done, returning to Direct3D8::CreateDevice()\n";
   return true;
 }
@@ -466,7 +475,26 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
   return S_OK;
 }
 
-Device::~Device() { WaitForFrame(next_fence_ - 1); }
+Device::~Device() {
+  WaitForFrame(next_fence_ - 1);
+  if (g_current_device == this) g_current_device = nullptr;
+}
+
+DXGI_FORMAT Device::backbuffer_format() const {
+  return back_buffers_.at(current_back_buffer_).get()->resource_desc().Format;
+}
+
+void Device::RegisterModRenderCallback(ModRenderCallback callback) {
+  if (std::find(mod_render_callbacks_.begin(), mod_render_callbacks_.end(),
+                callback) != mod_render_callbacks_.end()) {
+    return;
+  }
+  mod_render_callbacks_.push_back(callback);
+}
+
+void Device::UnregisterModRenderCallback(ModRenderCallback callback) {
+  std::erase(mod_render_callbacks_, callback);
+}
 
 HRESULT STDMETHODCALLTYPE
 Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
@@ -2949,6 +2977,15 @@ void Device::SubmitAndWait(bool should_present) {
   }
 
   ASSERT(!(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED));
+
+  // Let mod-API render callbacks draw on top of this frame's backbuffer
+  // while it's still bound and the command list is still open -- see
+  // RegisterModRenderCallback.
+  if (should_present) {
+    for (ModRenderCallback callback : mod_render_callbacks_) {
+      callback(cmd_list_.Get());
+    }
+  }
 
   // Transition back buffer to present.
   if (should_present) {

@@ -127,6 +127,78 @@ its change to persist across game restarts needs to write the INI file
 itself; this API is for live, in-session control (e.g. a mod's own settings
 menu), not for editing the user's config file on their behalf.
 
+## Native D3D12 rendering access for mods
+
+Dx8to12 doesn't emulate D3D8 on top of D3D9 or D3D11 -- it talks directly to
+D3D12. That means a companion mod (an overlay, an ImGui-based trainer, a
+debug HUD) can render natively through the *real* D3D12 device and command
+queue this API exposes, instead of needing some other graphics API
+underneath it. This is deliberately the escape hatch for the class of trainer
+that otherwise depends on a D3D8-to-D3D9 wrapper (e.g. d3d8to9) purely to get
+at a real device object to hook -- with this API there's a real device to
+get directly, no wrapper needed.
+
+```cpp
+#include <windows.h>
+#include <d3d12.h>
+
+using Dx8to12_GetD3D12DeviceFn = void *(__cdecl *)();
+using Dx8to12_GetD3D12CommandQueueFn = void *(__cdecl *)();
+using Dx8to12_GetWindowHandleFn = void *(__cdecl *)();
+using Dx8to12_GetBackbufferFormatFn = int(__cdecl *)();
+using Dx8to12_GetNumBackBuffersFn = int(__cdecl *)();
+using Dx8to12_RenderCallbackFn = void(__cdecl *)(void *command_list);
+using Dx8to12_RegisterRenderCallbackFn = bool(__cdecl *)(Dx8to12_RenderCallbackFn);
+using Dx8to12_UnregisterRenderCallbackFn = bool(__cdecl *)(Dx8to12_RenderCallbackFn);
+
+void __cdecl MyRenderHook(void *command_list_voidptr) {
+  auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(command_list_voidptr);
+  // Record ImGui (or your own) draw commands into cmd_list here. The
+  // backbuffer is already bound as the render target and already contains
+  // the game's fully rendered frame -- anything recorded here draws on top
+  // of it, in the same command list, before Present().
+}
+
+void Example(HMODULE d3d8) {
+  auto register_cb = reinterpret_cast<Dx8to12_RegisterRenderCallbackFn>(
+      GetProcAddress(d3d8, "Dx8to12_RegisterRenderCallback"));
+  if (register_cb) register_cb(MyRenderHook);
+}
+```
+
+### Function reference (rendering)
+
+| Function | Signature | Notes |
+|---|---|---|
+| `Dx8to12_GetD3D12Device` | `void* __cdecl ()` | Returns `ID3D12Device*`, or null before device creation. |
+| `Dx8to12_GetD3D12CommandQueue` | `void* __cdecl ()` | Returns `ID3D12CommandQueue*`, or null before device creation. |
+| `Dx8to12_GetWindowHandle` | `void* __cdecl ()` | Returns the game's `HWND`, or null before device creation. |
+| `Dx8to12_GetBackbufferFormat` | `int __cdecl ()` | Returns a `DXGI_FORMAT` value (0/`DXGI_FORMAT_UNKNOWN` before device creation). |
+| `Dx8to12_GetNumBackBuffers` | `int __cdecl ()` | Number of buffers in the swap chain (currently always 2). |
+| `Dx8to12_RegisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Registers a per-frame render callback; see below. Returns `false` if there's no device yet. |
+| `Dx8to12_UnregisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Removes a previously registered callback. |
+
+**Render callback contract**: once registered, your callback is invoked once
+per presented frame, right before the backbuffer transitions to
+`D3D12_RESOURCE_STATE_PRESENT`, with that frame's still-open
+`ID3D12GraphicsCommandList*` (passed as `void*` to keep the API C-ABI-safe --
+cast it back to `ID3D12GraphicsCommandList*`). At that point the backbuffer
+is still bound as the active render target and already holds the game's
+fully rendered frame, so a callback can just record its own draw commands
+(e.g. `ImGui_ImplDX12_RenderDrawData`) straight into the same command list
+and they composite on top, before `Present()` is called. Don't call
+`Close()`/`ExecuteCommandLists()`/`Present()` yourself from inside the
+callback -- Dx8to12 owns the command list's lifecycle; just record commands
+into it.
+
+Register once your mod DLL has initialized (typically from your `DllMain`'s
+`DLL_PROCESS_ATTACH`, after resolving the function pointer via
+`GetProcAddress`, or from wherever else you first detect the game is ready).
+If `Dx8to12_RegisterRenderCallback` returns `false` because no device exists
+yet, retry after detecting `IDirect3DDevice8` creation (e.g. by hooking
+`Direct3DCreate8`/`CreateDevice`, or simply polling
+`Dx8to12_GetD3D12Device` for a non-null result).
+
 ### Adding a new setting (for anyone extending this project)
 
 Add the field to `Dx8to12::Config` (`src/config.h`), then a case for it

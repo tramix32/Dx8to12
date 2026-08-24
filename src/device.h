@@ -47,8 +47,11 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   ID3D12Device *device() const { return d3d12_device_.get(); }
   ID3D12GraphicsCommandList *cmd_list() const { return cmd_list_.get(); }
+  ID3D12CommandQueue *cmd_queue() const { return cmd_queue_.get(); }
+  HWND window() const { return window_; }
   UINT sync_interval() const { return sync_interval_; }
   bool tearing_supported() const { return tearing_supported_; }
+  DXGI_FORMAT backbuffer_format() const;
   DescriptorPoolHeap &srv_heap() { return srv_heap_; }
   DescriptorPoolHeap *rtv_heap() { return &rtv_heap_; }
   DescriptorPoolHeap *dsv_heap() { return &dsv_heap_; }
@@ -59,6 +62,21 @@ class Device : public IDirect3DDevice8, RefCounted {
   DynamicRingBuffer *dynamic_gpu_ring_buffer() {
     return dynamic_ring_buffer_.get();
   }
+
+  // Mod-API render injection (dx8to12_api.cpp / MODDING.md): a registered
+  // callback is invoked once per frame, right before the backbuffer
+  // transitions to PRESENT, with the still-open command list -- this
+  // frame's real render target (the backbuffer) is still bound from
+  // BeginScene, so a callback can just record its own draw commands
+  // straight into it and they land on top of the already-rendered frame.
+  // Lets a companion mod (e.g. an ImGui-based overlay/trainer) render
+  // natively through the real D3D12 device/command queue/command list this
+  // API also exposes, rather than needing a D3D9 (or other) compatibility
+  // shim underneath -- see the GrinchTrainerVC.asi investigation in
+  // ROADMAP.md for why that alternative is a much larger undertaking.
+  using ModRenderCallback = void(__cdecl *)(void *command_list);
+  void RegisterModRenderCallback(ModRenderCallback callback);
+  void UnregisterModRenderCallback(ModRenderCallback callback);
 
   uint64_t CurrentFrame() const;
   void CopyBuffer(Buffer *dest, int64_t dest_offset, ID3D12Resource *src,
@@ -425,6 +443,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   bool recording_state_block_ = false;
   StateSnapshot state_block_recording_start_;
 
+  // See RegisterModRenderCallback.
+  std::vector<ModRenderCallback> mod_render_callbacks_;
+
   int ref_count_;
 
   ComPtr<IDirect3D8> direct3d8_;  // Have to hold on for GetDirect3D.
@@ -622,5 +643,9 @@ static constexpr D3D12_HEAP_PROPERTIES kSystemMemHeapProps = {
     .MemoryPoolPreference = D3D12_MEMORY_POOL_L0};
 
 ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s);
+
+// The single live Device instance, for dx8to12_api.cpp (see device.cpp).
+// Returns null before device creation / after device destruction.
+Device *GetCurrentDeviceForModApi();
 
 }  // namespace Dx8to12
