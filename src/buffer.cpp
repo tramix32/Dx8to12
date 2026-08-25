@@ -85,12 +85,40 @@ void Buffer::InitAsBuffer(Device* device, size_t size_in_bytes,
       &alloc_desc, &resource_desc_, D3D12_RESOURCE_STATE_COMMON, nullptr,
       allocation_.GetForInit(), IID_NULL, nullptr));
 #else
-  // TODO: Actually put the buffers in GPU mem..
-  D3D12_HEAP_PROPERTIES heap_props = kSystemMemHeapProps;
-  ASSERT_HR(device->device()->CreateCommittedResource(
-      &heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc_,
-      D3D12_RESOURCE_STATE_COMMON, nullptr,
-      IID_PPV_ARGS(resource_.GetForInit())));
+  D3D12_HEAP_PROPERTIES cpu_heap_props = kSystemMemHeapProps;
+  if (usage.Has(Dx8::Usage::WriteOnly)) {
+    // D3DUSAGE_WRITEONLY is the app explicitly promising it will never read
+    // this buffer back, which is exactly the condition write-combined memory
+    // wants: CPU writes stream out without the cache-snoop traffic that
+    // write-back memory forces on every GPU read of the same pages. Left as
+    // write-back otherwise, since WC memory is pathologically slow to read
+    // and a buffer without the flag is allowed to be read back.
+    cpu_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+  }
+
+  // Dynamic buffers keep their contents in system memory: their fast paths
+  // (DynamicBuffer::Lock) stream through DynamicRingBuffer and the GPU reads
+  // straight out of that, so a VRAM copy would just add an upload of data
+  // that's replaced again next frame. Everything else is written rarely and
+  // read every frame, which is what GPU-local memory is for -- see
+  // gpu_resident_.
+  gpu_resident_ = !usage.Has(Dx8::Usage::Dynamic);
+  if (gpu_resident_) {
+    D3D12_HEAP_PROPERTIES default_heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
+    ASSERT_HR(device->device()->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_NONE, &resource_desc_,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(resource_.GetForInit())));
+    ASSERT_HR(device->device()->CreateCommittedResource(
+        &cpu_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc_,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(staging_.GetForInit())));
+  } else {
+    ASSERT_HR(device->device()->CreateCommittedResource(
+        &cpu_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc_,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(resource_.GetForInit())));
+  }
 #endif
 
   // wchar_t name[128];
@@ -135,20 +163,50 @@ HRESULT STDMETHODCALLTYPE Buffer::Lock(UINT OffsetToLock, UINT SizeToLock,
   ASSERT(!HasFlag(Flags, D3DLOCK_DISCARD));
   ASSERT((int)SizeToLock <= size_);
 
-  LOG(kLog) << "Going into static lock.\n";
-
   if (SizeToLock == 0) SizeToLock = size_;
-  D3D12_RANGE range{.Begin = OffsetToLock,
-                    .End = OffsetToLock +
-                           SizeToLock};  // TODO: Don't do if we're not reading.
-  ASSERT_HR(resource()->Map(0, &range, reinterpret_cast<void**>(ppbData)));
-  *ppbData += OffsetToLock;
+
+  // Empty read range: D3D8 locks are writes unless D3DLOCK_READONLY says
+  // otherwise, and declaring a read range the CPU won't actually read from
+  // can force a needless cache invalidate. (The previous code declared the
+  // whole locked range as read, with its own TODO noting as much.)
+  D3D12_RANGE no_read{0, 0};
+  if (gpu_resident_) {
+    if (staging_mapped_ptr_ == nullptr) {
+      ASSERT_HR(staging_->Map(
+          0, &no_read, reinterpret_cast<void**>(&staging_mapped_ptr_)));
+    }
+    locked_offset_ = safe_cast<int>(OffsetToLock);
+    locked_size_ = safe_cast<int>(SizeToLock);
+    *ppbData = staging_mapped_ptr_ + OffsetToLock;
+    return S_OK;
+  }
+
+  if (persistent_mapped_ptr_ == nullptr) {
+    ASSERT_HR(resource()->Map(
+        0, &no_read, reinterpret_cast<void**>(&persistent_mapped_ptr_)));
+  }
+  *ppbData = persistent_mapped_ptr_ + OffsetToLock;
 
   return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Buffer::Unlock() {
-  resource()->Unmap(0, nullptr);
+  // Deliberately keeps the mapping alive -- see persistent_mapped_ptr_. The
+  // old Unmap(0, nullptr) here also declared the *entire* resource as
+  // written on every unlock, which is strictly more invalidation than any
+  // single lock actually dirtied.
+  if (gpu_resident_ && locked_size_ > 0) {
+    // Push just the range this lock handed out up to the GPU-local copy.
+    // Recorded into the current command list, so it lands ahead of any draw
+    // that reads this buffer later in the frame.
+    device_->TransitionBuffer(this, D3D12_RESOURCE_STATE_COPY_DEST);
+    device_->cmd_list()->CopyBufferRegion(
+        resource(), static_cast<UINT64>(locked_offset_), staging_.get(),
+        static_cast<UINT64>(locked_offset_),
+        static_cast<UINT64>(locked_size_));
+    device_->TransitionBuffer(this, D3D12_RESOURCE_STATE_COMMON);
+    locked_size_ = 0;
+  }
   return S_OK;
 }
 
@@ -201,13 +259,16 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
   prev_lock_frame_ = device_->CurrentFrame();
   if (is_discard) {
     ASSERT(offset == 0);
-    if (!speculative_write_cache_.empty()) {
-      // This was either not used, or already persisted by a call to GetGpuPtr.
-      speculative_write_cache_.clear();
-    }
+    // Any previous speculative write was either not used, or already
+    // persisted by a call to GetGpuPtr -- either way it's dead now.
     current_ring_alloc_ = {};
-    // Speculatively cache this write.
-    speculative_write_cache_.resize(size_to_lock);
+    // Speculatively cache this write. Grow-only: never shrink and never
+    // re-zero, since the caller is about to overwrite the whole range.
+    if (static_cast<int>(speculative_write_cache_.size()) < size_to_lock) {
+      speculative_write_cache_.resize(size_to_lock);
+    }
+    has_speculative_write_ = true;
+    speculative_write_size_ = size_to_lock;
     is_speculative_write_persisted_ = false;
     // But save a spot in the CSV heap for it.
     *ppbData = reinterpret_cast<BYTE*>(speculative_write_cache_.data());
@@ -218,11 +279,11 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
     ASSERT(is_nooverwrite);
     ASSERT(prev_lock_frame_ == device_->CurrentFrame());
     // This is a no overwrite.
-    if (!speculative_write_cache_.empty()) {
+    if (has_speculative_write_) {
       // Previous value was a discard. We now know what we're appending data. So
       // allocate the entire buffer size and copy the previous value.
       PersistSpeculativeWrite(size_);
-      speculative_write_cache_.clear();
+      has_speculative_write_ = false;
     }
     char* dest =
         device_->dynamic_ring_buffer()->GetCpuPtrFor(current_ring_alloc_) +
@@ -249,16 +310,16 @@ void DynamicBuffer::PersistSpeculativeWrite(int alloc_size) {
   char* dest =
       device_->dynamic_ring_buffer()->GetCpuPtrFor(current_ring_alloc_);
   memcpy(dest, speculative_write_cache_.data(),
-         speculative_write_cache_.size());
+         static_cast<size_t>(speculative_write_size_));
   prev_lock_frame_ = device_->CurrentFrame();
 
   is_speculative_write_persisted_ = true;
 }
 
 GpuPtr DynamicBuffer::GetGpuPtr() {
-  if (!is_speculative_write_persisted_ && !speculative_write_cache_.empty()) {
+  if (!is_speculative_write_persisted_ && has_speculative_write_) {
     // Persist the speculative write.
-    PersistSpeculativeWrite(speculative_write_cache_.size());
+    PersistSpeculativeWrite(speculative_write_size_);
   } else if (prev_lock_frame_ < device_->CurrentFrame()) {
     LOG(kLog) << "Using backing buffer for " << std::hex << this << ".\n";
     return Buffer::GetGpuPtr();  // Boooo.
@@ -278,11 +339,20 @@ void DynamicBuffer::PersistDynamicChanges() {
   // frame) -- RangeSet::insert only coalesces adjacent/overlapping ranges,
   // so ranges.size() > 1 is expected here, not a bug. The loop below already
   // handles any number of ranges correctly.
+  // Hoist the state transitions out of the loop: Device::CopyBuffer
+  // transitions to COPY_DEST and back to COMMON around each individual copy,
+  // so calling it per range emitted 2N barriers for N ranges when one pair
+  // covers the whole batch.
+  ID3D12Resource* const src =
+      device_->dynamic_ring_buffer()->GetBackingResource();
+  device_->TransitionBuffer(this, D3D12_RESOURCE_STATE_COPY_DEST);
   for (auto [offset, size] : written_ranges_.ranges) {
-    device_->CopyBuffer(this, 0,
-                        device_->dynamic_ring_buffer()->GetBackingResource(),
-                        current_ring_alloc_.offset + offset, size);
+    device_->cmd_list()->CopyBufferRegion(
+        resource(), 0, src,
+        static_cast<UINT64>(current_ring_alloc_.offset + offset),
+        static_cast<UINT64>(size));
   }
+  device_->TransitionBuffer(this, D3D12_RESOURCE_STATE_COMMON);
   written_ranges_.ranges.clear();
   current_ring_alloc_ = {};
 }

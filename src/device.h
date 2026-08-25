@@ -58,6 +58,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   // state should compare this against the value it last saw and rebuild
   // when it changes.
   uint64_t swap_chain_generation() const { return swap_chain_generation_; }
+  // Duration of the most recently presented frame, in milliseconds, measured
+  // between consecutive Present calls. Exposed to mods via
+  // Dx8to12_GetLastFrameMs -- see MODDING.md.
+  double last_frame_ms() const { return last_frame_ms_; }
   DescriptorPoolHeap &srv_heap() { return srv_heap_; }
   DescriptorPoolHeap *rtv_heap() { return &rtv_heap_; }
   DescriptorPoolHeap *dsv_heap() { return &dsv_heap_; }
@@ -454,6 +458,31 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   uint64_t swap_chain_generation_ = 1;
 
+  // Root-argument state that survives across draws within one command list.
+  // Both are invalidated wherever cmd_list_ is Reset (a fresh command list
+  // has no root signature and no root arguments bound) -- see the
+  // root_sig_bound_ block in PrepareDrawCall for why binding the root
+  // signature once per command list rather than once per draw matters.
+  bool root_sig_bound_ = false;
+  std::array<D3D12_GPU_VIRTUAL_ADDRESS, 4> last_root_cbvs_ = {};
+
+  // Result of the last CreatePSO lookup, reused while DIRTY_FLAG_PSO stays
+  // clear. The primitive type is part of the PSO key but is a per-draw
+  // argument rather than device state, so it's tracked separately here
+  // instead of via the dirty flag.
+  // Last vertex buffer view set on the command list, so an unchanged binding
+  // can skip the IASetVertexBuffers call. Invalidated (count reset to 0)
+  // wherever cmd_list_ is Reset, since that drops all IA state.
+  std::array<D3D12_VERTEX_BUFFER_VIEW, kMaxVertexStreams> last_vbuffer_views_ =
+      {};
+  size_t last_vbuffer_view_count_ = 0;
+
+  ComPtr<ID3D12PipelineState> last_pso_;
+  D3DPRIMITIVETYPE last_pso_prim_type_ = D3DPT_FORCE_DWORD;
+  // Last PSO actually bound on the command list (null after a command list
+  // reset, which drops all pipeline state).
+  ID3D12PipelineState *last_set_pso_ = nullptr;
+
   int ref_count_;
 
   ComPtr<IDirect3D8> direct3d8_;  // Have to hold on for GetDirect3D.
@@ -481,6 +510,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   // blocked in WaitForSingleObjectEx (waiting on the GPU fence) vs. actually
   // building the command list -- chasing a report of low GPU+CPU utilization
   // (both under 50%) alongside a large FPS regression vs. the real d3d8.dll.
+  double last_frame_ms_ = 0.0;
   int64_t perf_last_frame_ticks_ = 0;
   int64_t perf_wait_ticks_this_frame_ = 0;
   int64_t perf_wait_ticks_accum_ = 0;
@@ -596,8 +626,16 @@ class Device : public IDirect3DDevice8, RefCounted {
     DIRTY_FLAG_PS_TEXTURES = DIRTY_FLAG_PS_CBUFFER << 1,
     DIRTY_FLAG_PS_SAMPLERS = DIRTY_FLAG_PS_TEXTURES << 1,
     DIRTY_FLAG_LIGHTS = DIRTY_FLAG_PS_SAMPLERS << 1,
+    // Set by every state change that feeds into CreatePSO's cache key
+    // (render state, texture stage state, bound textures/shaders, render
+    // target formats). Building that key is expensive -- it copies and
+    // hashes the whole RenderState plus all 8 TextureStageStates, well over
+    // a kilobyte, and on a cache hit compares the same again -- so doing it
+    // per draw call was pure overhead for the large majority of draws, which
+    // follow another draw with identical state.
+    DIRTY_FLAG_PSO = DIRTY_FLAG_LIGHTS << 1,
 
-    DIRTY_FLAG_ALL = DIRTY_FLAG_LIGHTS | (DIRTY_FLAG_LIGHTS - 1),
+    DIRTY_FLAG_ALL = DIRTY_FLAG_PSO | (DIRTY_FLAG_PSO - 1),
     DIRTY_FLAG_ALL_RESOURCES = DIRTY_FLAG_ALL & ~DIRTY_FLAG_CMD_LIST_CLOSED,
   };
 
@@ -638,7 +676,11 @@ class Device : public IDirect3DDevice8, RefCounted {
     a.fill(1);
     return a;
   }();
-  std::unordered_set<ComPtr<Buffer>> buffers_to_persist_;
+  // Plain vector rather than a set: dedup is handled by a flag on the buffer
+  // itself (Buffer::is_marked_for_persist_), which avoids hashing a pointer
+  // and -- more importantly -- re-AddRef'ing the same buffer on every one of
+  // the many dynamic locks a streaming buffer takes within a single frame.
+  std::vector<ComPtr<Buffer>> buffers_to_persist_;
 
   // TODO: Make macro for this. Or just make dirty_flags_ an int.
   friend DirtyFlags &operator|=(DirtyFlags &, DirtyFlags);

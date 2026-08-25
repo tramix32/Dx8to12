@@ -20,3 +20,4 @@ EXPORTS
     Dx8to12_RegisterRenderCallback
     Dx8to12_UnregisterRenderCallback
     Dx8to12_GetSwapChainGeneration
+    Dx8to12_GetLastFrameMs

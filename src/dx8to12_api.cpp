@@ -95,6 +95,20 @@ __declspec(dllexport) int __cdecl Dx8to12_GetNumBackBuffers() {
   return ::Dx8to12::kNumBackBuffers;
 }
 
+// Duration of the most recently presented frame, in milliseconds, measured
+// between consecutive Present calls -- i.e. exactly the frames the game
+// actually put on screen. Returns 0 before the second presented frame (there
+// is no interval to measure yet) or if there's no device.
+//
+// Provided because third-party overlays that hook Present/ExecuteCommandLists
+// don't reliably interoperate with this shim's hand-rolled D3D12 usage (see
+// ROADMAP.md), so a mod wanting a trustworthy framerate should read it from
+// here rather than from such an overlay. Divide 1000 by this for FPS.
+__declspec(dllexport) double __cdecl Dx8to12_GetLastFrameMs() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->last_frame_ms() : 0.0;
+}
+
 // Bumped once per Device::Reset() (window resize, fullscreen toggle, format
 // change) -- back buffer resources, format, and dimensions are all recreated
 // by Reset. Compare this against the value you last saw and rebuild any

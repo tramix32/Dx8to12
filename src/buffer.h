@@ -54,6 +54,10 @@ class Buffer : public IDirect3DVertexBuffer8,
 
   bool IsIndexBuffer() const { return index_buffer_fmt_ != DXGI_FORMAT_UNKNOWN; }
 
+  // See Device::MarkBufferForPersist / is_marked_for_persist_.
+  bool is_marked_for_persist() const { return is_marked_for_persist_; }
+  void set_marked_for_persist(bool marked) { is_marked_for_persist_ = marked; }
+
 #ifdef DX8TO12_ENABLE_VALIDATION
   const std::wstring& name() const { return name_; }
 #endif
@@ -111,6 +115,37 @@ class Buffer : public IDirect3DVertexBuffer8,
   ComPtr<ID3D12Resource> resource_;
 #endif
   D3D12_RESOURCE_DESC resource_desc_;
+  // Persistent CPU mapping, established lazily on the first Lock and kept
+  // for the buffer's lifetime. Every buffer here lives in CPU-visible memory
+  // (see kSystemMemHeapProps), so there's nothing to gain from unmapping
+  // between locks -- and Map/Unmap are driver calls that a game locking its
+  // buffers every frame would otherwise pay on every single lock.
+  // DynamicRingBuffer already uses this same map-once approach.
+  BYTE* persistent_mapped_ptr_ = nullptr;
+  // Non-dynamic buffers live in GPU-local memory (D3D12_HEAP_TYPE_DEFAULT)
+  // so the GPU reads their geometry out of VRAM instead of pulling it across
+  // PCIe from system memory on every frame that draws them. Since a DEFAULT
+  // heap resource can't be CPU-mapped, each one carries a persistently
+  // mapped CPU-visible staging copy that Lock() hands out and Unlock()
+  // uploads the written range from.
+  //
+  // A dedicated per-buffer staging resource rather than the shared
+  // DynamicRingBuffer: uploads here are driven by the app's Lock/Unlock
+  // pattern, not by frame cadence, so a level load doing hundreds of
+  // buffer fills in a single frame would blow through the ring buffer's
+  // frame-scoped budget (which only reclaims space once the GPU finishes a
+  // frame) and hit its hard OOM failure. It costs one system-memory copy per
+  // buffer, which is what D3DPOOL_MANAGED semantically implies anyway.
+  bool gpu_resident_ = false;
+  ComPtr<ID3D12Resource> staging_;
+  BYTE* staging_mapped_ptr_ = nullptr;
+  // Range handed out by the most recent Lock(), uploaded by Unlock().
+  int locked_offset_ = 0;
+  int locked_size_ = 0;
+  // Set while this buffer is sitting in Device::buffers_to_persist_, so
+  // repeat locks in the same frame don't queue it more than once. See
+  // Device::MarkBufferForPersist.
+  bool is_marked_for_persist_ = false;
   DWORD fvf_ = 0;
   D3DPOOL d3d8_pool_ = D3DPOOL_DEFAULT;
   Dx8::Usage usage_;
@@ -140,8 +175,16 @@ class DynamicBuffer : public Buffer {
   void PersistSpeculativeWrite(int alloc_size);
   void UpdateCbvForRingBuffer(int offset, int size);
 
-  // We store the last dynamic write that the user has done.
+  // We store the last dynamic write that the user has done. The vector is
+  // grow-only and its size() is NOT the logical size of the pending write --
+  // it used to be cleared and resized on every D3DLOCK_DISCARD, which
+  // value-initializes the whole buffer, i.e. a full memset of vertex data the
+  // caller is about to overwrite anyway (that being exactly what DISCARD
+  // means). has_speculative_write_/speculative_write_size_ carry the state
+  // that emptiness/size() used to imply, so the storage can just be reused.
   std::vector<char> speculative_write_cache_;
+  bool has_speculative_write_ = false;
+  int speculative_write_size_ = 0;
   bool is_speculative_write_persisted_ = false;
 
   DynamicRingBuffer::Allocation current_ring_alloc_ = {};

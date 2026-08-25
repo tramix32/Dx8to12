@@ -1,7 +1,14 @@
 #pragma once
 
 namespace Dx8to12 {
-static constexpr int kNumBackBuffers = 2;
+// Three rather than two so the CPU can stay a frame further ahead of the
+// GPU. SubmitAndWait blocks on the fence for the back buffer it's about to
+// reuse immediately after Present, so with only two buffers the CPU could
+// never be more than one frame ahead -- effectively serializing CPU frame N+1
+// against GPU frame N. Every per-slot array (command allocators, fence
+// values, frame resource lists, slot generations) is sized off this constant
+// and scales automatically.
+static constexpr int kNumBackBuffers = 3;
 
 static constexpr int kMaxVertexStreams = 16;
 static constexpr int kMaxTexStages = 8;

@@ -178,6 +178,17 @@ void Example(HMODULE d3d8) {
 | `Dx8to12_RegisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Registers a per-frame render callback; see below. Returns `false` if there's no device yet. |
 | `Dx8to12_UnregisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Removes a previously registered callback. |
 | `Dx8to12_GetSwapChainGeneration` | `unsigned long long __cdecl ()` | Counter bumped once per device `Reset()`; see below. Returns 0 if there's no device yet. |
+| `Dx8to12_GetLastFrameMs` | `double __cdecl ()` | Milliseconds between the last two presented frames; see below. Returns 0 before the second frame or if there's no device. |
+
+**Measuring framerate**: `Dx8to12_GetLastFrameMs()` returns the interval
+between the last two `Present` calls -- the frames the game actually put on
+screen -- so `1000.0 / Dx8to12_GetLastFrameMs()` is the current FPS. Prefer
+this over a third-party FPS overlay: overlays that work by hooking
+`Present`/`ExecuteCommandLists` (RivaTuner/MSI Afterburner, and similar) do
+not reliably interoperate with this shim's hand-rolled D3D12 usage, and have
+been observed both misreporting the framerate and rendering corrupted
+overlay elements on top of the game (see ROADMAP.md). Reading the number
+here and drawing it from your own render callback avoids that entirely.
 
 **Render callback contract**: once registered, your callback is invoked once
 per presented frame, right before the backbuffer transitions to

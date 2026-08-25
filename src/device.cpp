@@ -576,7 +576,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // deciding the window should move or resize.
   LOG(INFO) << "Reset: swap_chain_->ResizeBuffers()\n";
   ASSERT_HR(swap_chain_->ResizeBuffers(
-      2, pPresentationParameters->BackBufferWidth,
+      kNumBackBuffers, pPresentationParameters->BackBufferWidth,
       pPresentationParameters->BackBufferHeight, new_format,
       tearing_supported_
           ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
@@ -626,6 +626,12 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
   last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  // A fresh command list has no root signature, root arguments, or pipeline
+  // state bound.
+  root_sig_bound_ = false;
+  last_set_pso_ = nullptr;
+  last_vbuffer_view_count_ = 0;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   ++swap_chain_generation_;
 
   LOG(INFO) << "Reset: done\n";
@@ -1040,6 +1046,14 @@ HRESULT STDMETHODCALLTYPE Device::CreateAdditionalSwapChain(
                    ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
                    : 0u,
   };
+  // Logged unconditionally (not TRACE_ENTRY, which release builds compile
+  // out): an extra swap chain is a rare, notable event -- each one shows up
+  // as its own framerate reading in overlay tools and holds its own set of
+  // back buffers -- so it's worth being able to tell from a release log
+  // whether one actually got created.
+  LOG(INFO) << "CreateAdditionalSwapChain: creating an additional swap chain "
+               "for window "
+            << target_window << ".\n";
   ComPtr<IDXGISwapChain1> swap_chain1;
   HR_OR_RETURN(dxgi_factory_->CreateSwapChainForHwnd(
       cmd_queue_.get(), target_window, &swap_chain_desc, nullptr, nullptr,
@@ -1170,7 +1184,9 @@ void Device::CopyBufferToTexture(
 }
 
 void Device::MarkBufferForPersist(Buffer *buffer) {
-  buffers_to_persist_.insert(ComWrap(buffer));
+  if (buffer->is_marked_for_persist()) return;
+  buffer->set_marked_for_persist(true);
+  buffers_to_persist_.push_back(ComWrap(buffer));
 }
 
 HRESULT STDMETHODCALLTYPE Device::CopyRects(
@@ -1573,7 +1589,20 @@ HRESULT STDMETHODCALLTYPE Device::ValidateDevice(DWORD *pNumPasses) {
 
 HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
                                                  DWORD Value) {
-  render_state_.GetEnumAtIndex(State) = Value;
+  // Redundant-set early-out. RenderWare (and D3D8-era engines generally)
+  // re-set the same render state value many times per frame rather than
+  // tracking what's already current, so this is a very common case. Skipping
+  // it avoids dirtying cbuffers that would then be re-uploaded for no reason.
+  // Bitwise comparison is correct here even for the float-typed states (this
+  // accessor hands them back reinterpreted as DWORD): identical bits mean an
+  // identical value, and the only false negatives (e.g. -0.0f vs +0.0f) fall
+  // through to the old behavior rather than skipping a real change.
+  DWORD &state_slot = render_state_.GetEnumAtIndex(State);
+  if (state_slot == Value) return S_OK;
+  state_slot = Value;
+  // Every render state is part of the PSO key (PSOState embeds the whole
+  // RenderState), so any real change invalidates the cached lookup.
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   switch (State) {
     case D3DRS_TEXTUREFACTOR:
     case D3DRS_ALPHAREF:
@@ -1611,11 +1640,21 @@ HRESULT STDMETHODCALLTYPE Device::GetTextureStageState(
 HRESULT STDMETHODCALLTYPE Device::SetTextureStageState(
     DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value) {
   if (Stage >= texture_stage_states_.size()) return D3DERR_INVALIDCALL;
+  // Redundant-set early-out -- same reasoning as SetRenderState above. This
+  // one matters extra because a sampler-affecting state redundantly re-set
+  // would dirty DIRTY_FLAG_PS_SAMPLERS, which costs a full 8-stage sampler
+  // rebind on the next draw.
+  DWORD &stage_slot =
+      texture_stage_states_[Stage].GetAtIndex(static_cast<size_t>(Type));
+  if (stage_slot == Value) return S_OK;
+  stage_slot = Value;
+  // Texture stage state drives fixed-function pixel shader generation, which
+  // is part of the PSO key.
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   if ((Type >= D3DTSS_ADDRESSU && Type <= D3DTSS_MAXANISOTROPY) ||
       Type == D3DTSS_ADDRESSW) {
     dirty_flags_ |= DIRTY_FLAG_PS_SAMPLERS;
   }
-  texture_stage_states_[Stage].GetAtIndex(static_cast<size_t>(Type)) = Value;
   return S_OK;
 }
 
@@ -1964,8 +2003,20 @@ HRESULT STDMETHODCALLTYPE Device::SetTexture(DWORD Stage,
     ASSERT(base_texture->GetSurfaceDesc(0).Pool != D3DPOOL_SYSTEMMEM);
   }
   GpuTexture *texture = static_cast<GpuTexture *>(base_texture);
+  // Redundant-set early-out. Re-binding the texture that's already bound to
+  // this stage would otherwise dirty DIRTY_FLAG_PS_TEXTURES and cost a full
+  // 8-stage descriptor-table rebind on the next draw for no change at all.
+  // Note InternalPtr::Get() asserts non-null, and both sides are legitimately
+  // null routinely here (a game unbinding an already-unbound stage), so read
+  // the current binding through the bool conversion rather than Get().
+  GpuTexture *const current_texture =
+      bound_textures_[Stage] ? bound_textures_[Stage].Get() : nullptr;
+  if (current_texture == texture) return S_OK;
   bound_textures_[Stage] = InternalPtr(texture);
   dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
+  // Whether a stage has a texture at all feeds PixelShaderState (and so the
+  // generated shader), which is part of the PSO key.
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   return S_OK;
 }
 
@@ -2051,6 +2102,8 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
     bound_depth_target_.Reset();
   }
   dirty_flags_ |= DIRTY_FLAG_OM;
+  // Render target / depth target formats are part of the PSO key.
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   return S_OK;
 }
 
@@ -2152,6 +2205,7 @@ HRESULT STDMETHODCALLTYPE Device::SetVertexShader(DWORD handle) {
     ASSERT(vertex_shaders_.contains(handle));
   }
   bound_vertex_shader_ = handle;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   return S_OK;
 }
 
@@ -2180,6 +2234,7 @@ HRESULT STDMETHODCALLTYPE Device::SetPixelShader(DWORD Handle) {
   if (Handle != 0 && !pixel_shaders_.contains(Handle))
     return D3DERR_INVALIDCALL;
   bound_pixel_shader_ = Handle;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
   return S_OK;
 }
 
@@ -2503,17 +2558,25 @@ HRESULT STDMETHODCALLTYPE Device::EndScene() { return S_OK; }
 HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
                                         DWORD Flags, D3DCOLOR Color, float Z,
                                         DWORD Stencil) {
+  // Small-buffer optimized: D3D8 Clear rect counts are tiny in practice (a
+  // full-screen clear passes none at all), so the common case shouldn't heap
+  // allocate. Falls back to the vector only for an unexpectedly large Count.
+  std::array<D3D12_RECT, 8> rect_inline;
   std::vector<D3D12_RECT> rect_storage;
   D3D12_RECT *rects = nullptr;
   if (pRects) {
-    rect_storage.resize(Count);
+    D3D12_RECT *rect_dest = rect_inline.data();
+    if (Count > rect_inline.size()) {
+      rect_storage.resize(Count);
+      rect_dest = rect_storage.data();
+    }
     for (DWORD i = 0; i < Count; ++i) {
-      rect_storage[i] = {.left = pRects[i].x1,
+      rect_dest[i] = {.left = pRects[i].x1,
                          .top = pRects[i].y1,
                          .right = pRects[i].x2,
                          .bottom = pRects[i].y2};
     }
-    rects = rect_storage.data();
+    rects = rect_dest;
   }
 
   if (Flags & D3DCLEAR_TARGET) {
@@ -2527,7 +2590,7 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
                       ((Color >> 8) & 0xFF) / 255.f, (Color & 0xFF) / 255.f,
                       ((Color >> 24) & 0xFF) / 255.f};
     cmd_list_->ClearRenderTargetView(render_target->rtv_handle(), color,
-                                     static_cast<UINT>(rect_storage.size()),
+                                     static_cast<UINT>(rects ? Count : 0),
                                      rects);
   }
   if (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) {
@@ -2541,7 +2604,7 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
     if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D12_CLEAR_FLAG_STENCIL;
     cmd_list_->ClearDepthStencilView(
         bound_depth_target_->dsv_handle(), clear_flags, Z,
-        static_cast<UINT8>(Stencil), static_cast<UINT>(rect_storage.size()),
+        static_cast<UINT8>(Stencil), static_cast<UINT>(rects ? Count : 0),
         rects);
   }
   return S_OK;
@@ -2605,13 +2668,51 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     }
   }
 
-  cmd_list_->IASetVertexBuffers(0, max_index + 1, vbuffer_views.data());
+  // Skip the rebind when nothing about the stream bindings changed. The
+  // views do vary per draw whenever the vertex range does (SizeInBytes is
+  // derived from start_vertex/num_vertices), so this only helps runs of
+  // draws sharing the same range -- but those runs are common, and the
+  // comparison is far cheaper than the driver call it avoids.
+  const size_t vbuffer_view_count = max_index + 1;
+  if (vbuffer_view_count != last_vbuffer_view_count_ ||
+      memcmp(last_vbuffer_views_.data(), vbuffer_views.data(),
+             vbuffer_view_count * sizeof(vbuffer_views[0])) != 0) {
+    cmd_list_->IASetVertexBuffers(0, static_cast<UINT>(vbuffer_view_count),
+                                  vbuffer_views.data());
+    memcpy(last_vbuffer_views_.data(), vbuffer_views.data(),
+           vbuffer_view_count * sizeof(vbuffer_views[0]));
+    last_vbuffer_view_count_ = vbuffer_view_count;
+  }
 
-  ComPtr<ID3D12PipelineState> pso = CreatePSO(PrimitiveType);
-  cmd_list_->SetPipelineState(pso.get());
+  // Only rebuild the PSO cache key when something it depends on actually
+  // changed. CreatePSO's key (PSOState + PixelShaderState) copies and hashes
+  // the entire RenderState and all 8 TextureStageStates -- over a kilobyte
+  // -- and then compares the same again on a cache hit, so running it for
+  // every draw call dominated state-change cost in draw-heavy frames even
+  // though consecutive draws almost always share identical state. The
+  // primitive type is part of the key but arrives as a per-draw argument
+  // rather than device state, so it's compared separately.
+  if ((dirty_flags_ & DIRTY_FLAG_PSO) || PrimitiveType != last_pso_prim_type_) {
+    last_pso_ = CreatePSO(PrimitiveType);
+    last_pso_prim_type_ = PrimitiveType;
+    if (dirty_flags_ & DIRTY_FLAG_PSO) dirty_flags_ ^= DIRTY_FLAG_PSO;
+  }
+  if (last_pso_.get() != last_set_pso_) {
+    cmd_list_->SetPipelineState(last_pso_.get());
+    last_set_pso_ = last_pso_.get();
+  }
   // MarkResourceAsUsed(pso);
   using ::DirectX::SimpleMath::Matrix;
-  const Matrix view = MatrixFromD3D(GetTransform(D3DTS_VIEW));
+  // Only the transform and lighting cbuffer updates below consume this, and
+  // both are gated on their own dirty flag -- computing it unconditionally
+  // meant an unordered_map lookup plus a 64-byte copy and conversion on
+  // every single draw call, with the result thrown away for the large
+  // majority of them (a typical frame changes transforms/lights far less
+  // often than it draws).
+  Matrix view;
+  if (dirty_flags_ & (DIRTY_FLAG_TRANSFORMS | DIRTY_FLAG_LIGHTS)) {
+    view = MatrixFromD3D(GetTransform(D3DTS_VIEW));
+  }
 
   // Set the vertex cbuffer.
   if (dirty_flags_ & DIRTY_FLAG_TRANSFORMS) {
@@ -2683,14 +2784,38 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     ASSERT_HR(ps_cbuffer_->Unlock());
     dirty_flags_ ^= DIRTY_FLAG_PS_CBUFFER;
   }
-  cmd_list_->SetGraphicsRootSignature(main_root_sig_.get());
+  // The root signature only actually needs (re)binding once per command
+  // list, not once per draw. Re-binding it is not free, and per the D3D12
+  // spec it also *invalidates every root argument* -- so the old
+  // unconditional call here was, strictly speaking, invalidating the CBVs
+  // and descriptor tables set just below it on the previous draw and relying
+  // on them being re-set again. Bind it once per command list instead, and
+  // invalidate our own root-argument caches whenever we do.
+  if (!root_sig_bound_) {
+    cmd_list_->SetGraphicsRootSignature(main_root_sig_.get());
+    root_sig_bound_ = true;
+    last_root_cbvs_.fill(0);
+    // Descriptor tables are root arguments too, so they need re-issuing for
+    // the same reason.
+    dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
+    dirty_flags_ |= DIRTY_FLAG_PS_SAMPLERS;
+  }
 
-  // Set all the necessary roots.
-  cmd_list_->SetGraphicsRootConstantBufferView(0, vs_cbuffer_->GetGpuPtr());
-  cmd_list_->SetGraphicsRootConstantBufferView(1, ps_cbuffer_->GetGpuPtr());
-  cmd_list_->SetGraphicsRootConstantBufferView(2, lights_cbuffer_->GetGpuPtr());
-  cmd_list_->SetGraphicsRootConstantBufferView(3,
-                                               vs_creg_cbuffer_->GetGpuPtr());
+  // Set all the necessary roots. These addresses only change when the
+  // underlying cbuffer is re-locked with D3DLOCK_DISCARD (which hands back a
+  // fresh ring-buffer allocation) -- which is exactly what the dirty-flag
+  // blocks above do, and only when something actually changed. On every
+  // other draw all four are identical to what's already bound.
+  auto set_root_cbv = [&](UINT slot, GpuPtr gpu_ptr) {
+    const D3D12_GPU_VIRTUAL_ADDRESS address = gpu_ptr;
+    if (last_root_cbvs_[slot] == address) return;
+    last_root_cbvs_[slot] = address;
+    cmd_list_->SetGraphicsRootConstantBufferView(slot, address);
+  };
+  set_root_cbv(0, vs_cbuffer_->GetGpuPtr());
+  set_root_cbv(1, ps_cbuffer_->GetGpuPtr());
+  set_root_cbv(2, lights_cbuffer_->GetGpuPtr());
+  set_root_cbv(3, vs_creg_cbuffer_->GetGpuPtr());
 
   // Keep every currently-bound texture's keep-alive ref fresh for this
   // frame's back-buffer slot, regardless of whether the GPU-visible
@@ -2873,8 +2998,13 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitiveUP(
 
   ASSERT_HR(SetStreamSource(0, nullptr, 0));
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, 0, vertex_count));
-  // Overwrite whatever vertex buffer the prepare set.
+  // Overwrite whatever vertex buffer the prepare set. This bypasses
+  // PrepareDrawCall's vertex-buffer-view cache, so that cache has to be
+  // invalidated -- otherwise a later regular (non-UP) draw whose views
+  // happen to match the cached entry would skip its rebind and wrongly keep
+  // rendering from this call's scratch ring-buffer data.
   cmd_list_->IASetVertexBuffers(0, 1, &vbuffer_view);
+  last_vbuffer_view_count_ = 0;
   cmd_list_->DrawInstanced(vertex_count, 1, 0, 0);
   return S_OK;
 }
@@ -3006,8 +3136,10 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
   ASSERT_HR(SetStreamSource(0, nullptr, 0));
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, static_cast<int>(MinVertexIndex),
                                static_cast<int>(NumVertexIndices)));
-  // Overwrite whatever vertex/index buffer the prepare set.
+  // Overwrite whatever vertex/index buffer the prepare set. See the matching
+  // note in DrawPrimitiveUP for why the view cache must be invalidated here.
   cmd_list_->IASetVertexBuffers(0, 1, &vbuffer_view);
+  last_vbuffer_view_count_ = 0;
   cmd_list_->IASetIndexBuffer(&ib_view);
   cmd_list_->DrawIndexedInstanced(index_count, 1, 0, 0, 0);
   return S_OK;
@@ -3050,6 +3182,14 @@ void Device::SubmitAndWait(bool should_present) {
         perf_frame_sample_count_ = 0;
       }
     }
+    if (perf_last_frame_ticks_ != 0) {
+      LARGE_INTEGER freq;
+      QueryPerformanceFrequency(&freq);
+      last_frame_ms_ = 1000.0 *
+                       static_cast<double>(perf_now.QuadPart -
+                                           perf_last_frame_ticks_) /
+                       static_cast<double>(freq.QuadPart);
+    }
     perf_last_frame_ticks_ = perf_now.QuadPart;
     perf_wait_ticks_this_frame_ = 0;
   }
@@ -3088,6 +3228,7 @@ void Device::SubmitAndWait(bool should_present) {
   // Persist any dynamic buffers.
   for (auto buffer : buffers_to_persist_) {
     buffer->PersistDynamicChanges();
+    buffer->set_marked_for_persist(false);
   }
   buffers_to_persist_.clear();
 
@@ -3125,6 +3266,10 @@ void Device::SubmitAndWait(bool should_present) {
   // the next draw must re-set it regardless of what PrepareDrawCall's own
   // redundant-set check (last_prim_topology_) thinks is currently bound.
   last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  // Likewise for the root signature, root arguments, and pipeline state.
+  root_sig_bound_ = false;
+  last_set_pso_ = nullptr;
+  last_vbuffer_view_count_ = 0;
 }
 
 void Device::WaitForFrame(uint64_t frame_number) {
