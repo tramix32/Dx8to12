@@ -252,7 +252,10 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   ASSERT_HR(
       debug_iface->QueryInterface(IID_PPV_ARGS(debug_interface_.GetForInit())));
   debug_iface->Release();
-  debug_interface_->EnableDebugLayer();
+  // NOTE: EnableDebugLayer() is deliberately NOT called here. It has to run
+  // before any D3D12 device exists (including the cached probe devices
+  // GetProbeDeviceFor creates for CheckDeviceType/CheckDeviceFormat), so it
+  // lives in the Direct3D8 constructor -- see the comment there.
   // debug_interface_->SetEnableSynchronizedCommandQueueValidation(TRUE);
   // GPU-based validation is much heavier than the regular debug layer (shader
   // instrumentation on every draw/copy) -- it's the likely cause of very low

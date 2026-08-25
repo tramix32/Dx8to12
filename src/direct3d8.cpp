@@ -13,6 +13,25 @@ Direct3D8::Direct3D8() {
   UINT Flags = 0;
 #ifdef DX8TO12_ENABLE_VALIDATION
   Flags = DXGI_CREATE_FACTORY_DEBUG;
+  // The debug layer has to be enabled before *any* D3D12 device exists --
+  // turning it on afterwards invalidates the devices already created, which
+  // surfaces as the next D3D12CreateDevice failing with
+  // DXGI_ERROR_DEVICE_RESET. Device::Create used to do this, but by then
+  // GetProbeDeviceFor has usually already created -- and, since it started
+  // caching them, kept alive -- a probe device for CheckDeviceType/
+  // CheckDeviceFormat, which games call before CreateDevice. That made
+  // validation builds fail to start. Here it runs before any adapter is even
+  // enumerated, which is early enough for every path.
+  {
+    ComPtr<ID3D12Debug> debug_interface;
+    if (SUCCEEDED(
+            D3D12GetDebugInterface(IID_PPV_ARGS(debug_interface.GetForInit())))) {
+      debug_interface->EnableDebugLayer();
+    } else {
+      LOG_ERROR() << "Could not get the D3D12 debug interface; continuing "
+                     "without the debug layer.\n";
+    }
+  }
 #endif
   ASSERT_HR(
       CreateDXGIFactory2(Flags, IID_PPV_ARGS(dxgi_factory_.GetForInit())));
