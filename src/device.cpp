@@ -266,6 +266,31 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   }
 
   LOG(INFO) << "Creating device.\n";
+  {
+    // What the app actually asked for vs. the window it handed us. Windowed
+    // is currently ignored entirely -- real D3D8 changed the display mode for
+    // a fullscreen request, so the window ended up exactly covering the
+    // screen; we do neither, which leaves the app sizing its window from
+    // assumptions that no longer hold.
+    RECT client_rect{};
+    RECT window_rect{};
+    GetClientRect(window, &client_rect);
+    GetWindowRect(window, &window_rect);
+    LOG(INFO) << "PresentParams: Windowed=" << presentParams.Windowed
+              << " BackBuffer=" << std::dec << presentParams.BackBufferWidth
+              << "x" << presentParams.BackBufferHeight
+              << " BackBufferCount=" << presentParams.BackBufferCount
+              << " hDeviceWindow=" << presentParams.hDeviceWindow
+              << " | window=" << window << " client="
+              << (client_rect.right - client_rect.left) << "x"
+              << (client_rect.bottom - client_rect.top) << " windowRect=("
+              << window_rect.left << "," << window_rect.top << ")-("
+              << window_rect.right << "," << window_rect.bottom << ")"
+              << " virtualScreen=" << GetSystemMetrics(SM_CXVIRTUALSCREEN)
+              << "x" << GetSystemMetrics(SM_CYVIRTUALSCREEN)
+              << " primary=" << GetSystemMetrics(SM_CXSCREEN) << "x"
+              << GetSystemMetrics(SM_CYSCREEN) << "\n";
+  }
 #ifdef DX8TO12_ENABLE_VALIDATION
   ID3D12Debug *debug_iface = nullptr;
   ASSERT_HR(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_iface)));
@@ -372,9 +397,40 @@ UINT SyncIntervalFromD3DPresentInterval(DWORD present_interval) {
       return 1;
   }
 }
+
+// Makes `window` exactly cover the monitor it's on. Only used for a
+// fullscreen device request -- see kResizeWindowForFullscreen for why this is
+// needed at all.
+void FitWindowToItsMonitor(HWND window) {
+  HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info{.cbSize = sizeof(MONITORINFO)};
+  if (!GetMonitorInfoW(monitor, &monitor_info)) return;
+
+  const RECT &bounds = monitor_info.rcMonitor;
+  const int width = bounds.right - bounds.left;
+  const int height = bounds.bottom - bounds.top;
+
+  RECT current{};
+  if (GetWindowRect(window, &current) && current.left == bounds.left &&
+      current.top == bounds.top && current.right == bounds.right &&
+      current.bottom == bounds.bottom) {
+    return;  // Already exactly right; don't disturb the app's window.
+  }
+
+  LOG(INFO) << "Fullscreen requested: resizing window to its monitor, "
+            << std::dec << width << "x" << height << " at (" << bounds.left
+            << "," << bounds.top << ").\n";
+  // SWP_NOSENDCHANGING keeps Windows from asking the app's WndProc to vet the
+  // new position first; it still gets WM_WINDOWPOSCHANGED/WM_SIZE afterwards.
+  SetWindowPos(window, nullptr, bounds.left, bounds.top, width, height,
+               SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+}
 }  // namespace
 
 HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
+  if (kResizeWindowForFullscreen && !presentParams.Windowed && window_) {
+    FitWindowToItsMonitor(window_);
+  }
   fence_values_ = {};
   next_fence_ = 1;
   sync_interval_ = SyncIntervalFromD3DPresentInterval(

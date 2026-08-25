@@ -274,8 +274,15 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
     current_ring_alloc_ = {};
     // Speculatively cache this write. Grow-only: never shrink and never
     // re-zero, since the caller is about to overwrite the whole range.
-    if (static_cast<int>(speculative_write_cache_.size()) < size_to_lock) {
-      speculative_write_cache_.resize(size_to_lock);
+    if (kSkipDiscardZeroFill) {
+      if (static_cast<int>(speculative_write_cache_.size()) < size_to_lock) {
+        speculative_write_cache_.resize(size_to_lock);
+      }
+    } else {
+      // Zero the whole locked range, as the original clear()+resize() did:
+      // anything the app leaves unwritten then reads as zeroes rather than as
+      // last frame's contents.
+      speculative_write_cache_.assign(size_to_lock, 0);
     }
     has_speculative_write_ = true;
     speculative_write_size_ = size_to_lock;

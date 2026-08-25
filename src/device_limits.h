@@ -53,6 +53,28 @@ static constexpr int kNumPsConstRegs = 8;
 // (0% GPU fence wait), so there may be nothing to gain here anyway.
 static constexpr bool kBuffersInGpuMemory = false;
 
+// Skip zero-filling a dynamic buffer's speculative write cache on
+// D3DLOCK_DISCARD. Saves a memset per discard lock, but leaves whatever the
+// previous frame wrote in any part of the locked range the app doesn't fill
+// in this time -- where it used to read as zeroes. Off while investigating
+// intermittent garbage geometry (a glitch that vanishes under a graphics
+// debugger, which points at reads of undefined memory).
+static constexpr bool kSkipDiscardZeroFill = false;
+
+// Resize the app's window to exactly cover its monitor when it asks for a
+// fullscreen device (D3DPRESENT_PARAMETERS::Windowed == FALSE). Real D3D8
+// switched the display mode for such a request, so the window ended up
+// covering the screen precisely; this shim never does, which leaves the app's
+// own window sizing built on assumptions that no longer hold -- GTA: Vice
+// City ends up with a 2576x1479 client area on a 2560x1440 monitor (its
+// AdjustWindowRect added room for a title bar and borders the window doesn't
+// have), so the picture runs off the right and bottom edges.
+//
+// A switch because touching the app's window makes Windows dispatch
+// WM_SIZE/WM_WINDOWPOSCHANGED into its WndProc, and this codebase has already
+// hit one crash that way (see the ResizeTarget comment in Device::Reset).
+static constexpr bool kResizeWindowForFullscreen = true;
+
 // Keep buffers mapped for their whole lifetime instead of Map/Unmap around
 // every Lock. Saves two driver calls per lock, but leaves graphics debuggers
 // without the per-Unlock dirty range they use to track CPU writes, which
