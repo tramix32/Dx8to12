@@ -186,6 +186,12 @@ HRESULT STDMETHODCALLTYPE Buffer::Lock(UINT OffsetToLock, UINT SizeToLock,
         0, &no_read, reinterpret_cast<void**>(&persistent_mapped_ptr_)));
   }
   *ppbData = persistent_mapped_ptr_ + OffsetToLock;
+  if (!kPersistentBufferMapping) {
+    // Remember what to hand back to Unmap, and drop our cached pointer so
+    // the next Lock maps again.
+    unmap_on_unlock_ = true;
+    persistent_mapped_ptr_ = nullptr;
+  }
 
   return S_OK;
 }
@@ -195,6 +201,10 @@ HRESULT STDMETHODCALLTYPE Buffer::Unlock() {
   // old Unmap(0, nullptr) here also declared the *entire* resource as
   // written on every unlock, which is strictly more invalidation than any
   // single lock actually dirtied.
+  if (unmap_on_unlock_) {
+    unmap_on_unlock_ = false;
+    resource()->Unmap(0, nullptr);
+  }
   if (gpu_resident_ && locked_size_ > 0 && device_->IsCommandListOpen()) {
     // Push just the range this lock handed out up to the GPU-local copy.
     // Recorded into the current command list, so it lands ahead of any draw

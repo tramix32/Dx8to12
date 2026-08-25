@@ -631,7 +631,16 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   root_sig_bound_ = false;
   last_set_pso_ = nullptr;
   last_vbuffer_view_count_ = 0;
-  dirty_flags_ |= DIRTY_FLAG_PSO;
+  // Everything the renderer thinks is bound was dropped along with the old
+  // command list -- including the descriptor heaps, which only BeginScene
+  // ever binds. Without this, the first draw after a device reset could skip
+  // BeginScene (DIRTY_FLAG_OM having been left clear) and then call
+  // SetGraphicsRootDescriptorTable against heaps that were never bound,
+  // which the D3D12 debug layer flags as "the descriptor heap containing
+  // handle ... is different from currently set descriptor heap". The
+  // matching command list reset in SubmitAndWait already did this; this one
+  // was missing it.
+  dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
   ++swap_chain_generation_;
 
   LOG(INFO) << "Reset: done\n";
@@ -2674,7 +2683,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // draws sharing the same range -- but those runs are common, and the
   // comparison is far cheaper than the driver call it avoids.
   const size_t vbuffer_view_count = max_index + 1;
-  if (vbuffer_view_count != last_vbuffer_view_count_ ||
+  if (!kCacheDrawStateBindings || vbuffer_view_count != last_vbuffer_view_count_ ||
       memcmp(last_vbuffer_views_.data(), vbuffer_views.data(),
              vbuffer_view_count * sizeof(vbuffer_views[0])) != 0) {
     cmd_list_->IASetVertexBuffers(0, static_cast<UINT>(vbuffer_view_count),
@@ -2692,12 +2701,13 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // though consecutive draws almost always share identical state. The
   // primitive type is part of the key but arrives as a per-draw argument
   // rather than device state, so it's compared separately.
-  if ((dirty_flags_ & DIRTY_FLAG_PSO) || PrimitiveType != last_pso_prim_type_) {
+  if (!kCacheDrawStateBindings || (dirty_flags_ & DIRTY_FLAG_PSO) ||
+      PrimitiveType != last_pso_prim_type_) {
     last_pso_ = CreatePSO(PrimitiveType);
     last_pso_prim_type_ = PrimitiveType;
     if (dirty_flags_ & DIRTY_FLAG_PSO) dirty_flags_ ^= DIRTY_FLAG_PSO;
   }
-  if (last_pso_.get() != last_set_pso_) {
+  if (!kCacheDrawStateBindings || last_pso_.get() != last_set_pso_) {
     cmd_list_->SetPipelineState(last_pso_.get());
     last_set_pso_ = last_pso_.get();
   }
@@ -2791,7 +2801,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // and descriptor tables set just below it on the previous draw and relying
   // on them being re-set again. Bind it once per command list instead, and
   // invalidate our own root-argument caches whenever we do.
-  if (!root_sig_bound_) {
+  if (!kCacheDrawStateBindings || !root_sig_bound_) {
     cmd_list_->SetGraphicsRootSignature(main_root_sig_.get());
     root_sig_bound_ = true;
     last_root_cbvs_.fill(0);
@@ -2808,7 +2818,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // other draw all four are identical to what's already bound.
   auto set_root_cbv = [&](UINT slot, GpuPtr gpu_ptr) {
     const D3D12_GPU_VIRTUAL_ADDRESS address = gpu_ptr;
-    if (last_root_cbvs_[slot] == address) return;
+    if (kCacheDrawStateBindings && last_root_cbvs_[slot] == address) return;
     last_root_cbvs_[slot] = address;
     cmd_list_->SetGraphicsRootConstantBufferView(slot, address);
   };

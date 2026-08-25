@@ -40,12 +40,33 @@ static constexpr int kNumPsConstRegs = 8;
 
 // Put non-dynamic vertex/index buffers in GPU-local memory (VRAM) with a
 // CPU-visible staging copy, rather than keeping them in CPU-visible system
-// memory that the GPU reads across PCIe. Costs a second committed resource
-// per buffer (each with its own heap, 64KB-granular), which measurably
-// increases both resource count and memory footprint -- suspected of
-// breaking RenderDoc captures ("insufficient resources"), so it's a switch
-// until that's settled.
+// memory that the GPU reads across PCIe.
+//
+// Off by default pending a retest on a freshly-booted machine. It doubles
+// the committed resource count (each buffer gets its own 64KB-granular heap
+// for both the VRAM copy and its staging copy), and the first GPU device
+// removal of the session appeared shortly after it was first enabled --
+// after which *every* subsequent capture failed, including builds from
+// before any of this work, so the driver stayed wedged and the correlation
+// could never be confirmed or ruled out. Worth revisiting: the win is
+// GPU-side bandwidth, and measurements so far put this shim firmly CPU-bound
+// (0% GPU fence wait), so there may be nothing to gain here anyway.
 static constexpr bool kBuffersInGpuMemory = false;
+
+// Keep buffers mapped for their whole lifetime instead of Map/Unmap around
+// every Lock. Saves two driver calls per lock, but leaves graphics debuggers
+// without the per-Unlock dirty range they use to track CPU writes, which
+// makes them shadow and diff whole buffers instead -- suspected of breaking
+// RenderDoc captures, so it's a switch until that's settled.
+static constexpr bool kPersistentBufferMapping = true;
+
+// Reuse the previous draw's PSO lookup, root signature binding and vertex
+// buffer views when nothing they depend on changed. These are the only
+// optimisations that skip *recording* commands, so they're the ones that
+// could leave a command list depending on state it never set -- which is
+// what a GPU device removal during capture replay looks like. Switchable
+// while bisecting that.
+static constexpr bool kCacheDrawStateBindings = true;
 
 // Will implicitly disable Pso cache.
 static constexpr bool kDisablePixelShaderCache = false;

@@ -122,6 +122,8 @@ class Buffer : public IDirect3DVertexBuffer8,
   // buffers every frame would otherwise pay on every single lock.
   // DynamicRingBuffer already uses this same map-once approach.
   BYTE* persistent_mapped_ptr_ = nullptr;
+  // Set between Lock and Unlock when kPersistentBufferMapping is off.
+  bool unmap_on_unlock_ = false;
   // Non-dynamic buffers live in GPU-local memory (D3D12_HEAP_TYPE_DEFAULT)
   // so the GPU reads their geometry out of VRAM instead of pulling it across
   // PCIe from system memory on every frame that draws them. Since a DEFAULT
