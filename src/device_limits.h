@@ -1,14 +1,14 @@
 #pragma once
 
 namespace Dx8to12 {
-// Three rather than two so the CPU can stay a frame further ahead of the
-// GPU. SubmitAndWait blocks on the fence for the back buffer it's about to
-// reuse immediately after Present, so with only two buffers the CPU could
-// never be more than one frame ahead -- effectively serializing CPU frame N+1
-// against GPU frame N. Every per-slot array (command allocators, fence
-// values, frame resource lists, slot generations) is sized off this constant
-// and scales automatically.
-static constexpr int kNumBackBuffers = 3;
+// Back to two. Three would let the CPU run a frame further ahead of the GPU,
+// but measurements put this shim firmly CPU-bound (0% of frame spent waiting
+// on the GPU fence), so there was nothing to win -- and with
+// DXGI_SWAP_EFFECT_FLIP_DISCARD a back buffer's contents are undefined after
+// Present, so any screen the game only partially redraws (menus lean on this)
+// shows whatever was in that buffer N frames ago. Going from 2 to 3 made that
+// stale content older and the resulting flicker visible.
+static constexpr int kNumBackBuffers = 2;
 
 static constexpr int kMaxVertexStreams = 16;
 static constexpr int kMaxTexStages = 8;

@@ -51,6 +51,26 @@ Device *GetCurrentDeviceForModApi() { return g_current_device; }
 // outright (DXGI_ERROR_INVALID_CALL), aborting device creation. Swap in the
 // alpha variant for the swap chain itself; games never read/write backbuffer
 // alpha through the X8 format anyway.
+// D3D8's swap effect says whether the app may rely on the back buffer still
+// holding the previous frame after Present. D3DSWAPEFFECT_DISCARD explicitly
+// does not; FLIP and COPY (and COPY_VSYNC) do. Hardcoding FLIP_DISCARD for
+// all of them means an app that legitimately renders only the part of the
+// screen that changed -- which menus commonly do -- gets whatever happened to
+// be left in that buffer instead of its previous frame, showing up as
+// flickering remnants of older frames.
+static DXGI_SWAP_EFFECT ToDxgiSwapEffect(D3DSWAPEFFECT d3d8_swap_effect) {
+  switch (d3d8_swap_effect) {
+    case D3DSWAPEFFECT_FLIP:
+    case D3DSWAPEFFECT_COPY:
+    case D3DSWAPEFFECT_COPY_VSYNC:
+      // Preserves back buffer contents across Present, unlike FLIP_DISCARD.
+      return DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    case D3DSWAPEFFECT_DISCARD:
+    default:
+      return DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  }
+}
+
 static DXGI_FORMAT ToFlipModelSwapChainFormat(DXGI_FORMAT format) {
   if (format == DXGI_FORMAT_B8G8R8X8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM;
   return format;
@@ -442,12 +462,23 @@ HRESULT Device::Init(const D3DPRESENT_PARAMETERS &presentParams) {
       .SampleDesc = {.Count = 1, .Quality = 0},
       .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
       .BufferCount = kNumBackBuffers,
-      .Scaling = DXGI_SCALING_NONE,
-      .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+      // Stretch, not DXGI_SCALING_NONE: the back buffer is sized to whatever
+      // resolution the game asked for, which routinely differs from the size
+      // of the window it's presenting into. NONE means "don't scale" -- DXGI
+      // puts the buffer in the window's top-left corner at 1:1 and leaves the
+      // rest blank, which is what made a game running at, say, 1920x1080 on a
+      // 2560x1440 window render into just part of the screen. Real D3D8
+      // changed the display mode for fullscreen instead, so the picture
+      // always filled the screen; STRETCH is the flip-model equivalent.
+      .Scaling = DXGI_SCALING_STRETCH,
+      .SwapEffect = ToDxgiSwapEffect(presentParams.SwapEffect),
       .Flags = tearing_supported_
                    ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
                    : 0u,
   };
+  LOG(INFO) << "Swap chain: app requested D3DSWAPEFFECT " << std::dec
+            << presentParams.SwapEffect << " -> DXGI swap effect "
+            << swap_chain_desc.SwapEffect << ".\n";
   // Don't crash if creating the swap chain fails. This might happen during
   // device reset.
   ComPtr<IDXGISwapChain1> swap_chain1;
@@ -1052,8 +1083,16 @@ HRESULT STDMETHODCALLTYPE Device::CreateAdditionalSwapChain(
       .SampleDesc = {.Count = 1, .Quality = 0},
       .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
       .BufferCount = kNumBackBuffers,
-      .Scaling = DXGI_SCALING_NONE,
-      .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+      // Stretch, not DXGI_SCALING_NONE: the back buffer is sized to whatever
+      // resolution the game asked for, which routinely differs from the size
+      // of the window it's presenting into. NONE means "don't scale" -- DXGI
+      // puts the buffer in the window's top-left corner at 1:1 and leaves the
+      // rest blank, which is what made a game running at, say, 1920x1080 on a
+      // 2560x1440 window render into just part of the screen. Real D3D8
+      // changed the display mode for fullscreen instead, so the picture
+      // always filled the screen; STRETCH is the flip-model equivalent.
+      .Scaling = DXGI_SCALING_STRETCH,
+      .SwapEffect = ToDxgiSwapEffect(pPresentationParameters->SwapEffect),
       .Flags = tearing_supported_
                    ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
                    : 0u,
