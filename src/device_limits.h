@@ -38,6 +38,15 @@ static constexpr int kNumPsConstRegs = 8;
 
 // Helpful debug controls.
 
+// Put non-dynamic vertex/index buffers in GPU-local memory (VRAM) with a
+// CPU-visible staging copy, rather than keeping them in CPU-visible system
+// memory that the GPU reads across PCIe. Costs a second committed resource
+// per buffer (each with its own heap, 64KB-granular), which measurably
+// increases both resource count and memory footprint -- suspected of
+// breaking RenderDoc captures ("insufficient resources"), so it's a switch
+// until that's settled.
+static constexpr bool kBuffersInGpuMemory = false;
+
 // Will implicitly disable Pso cache.
 static constexpr bool kDisablePixelShaderCache = false;
 static constexpr bool kDisablePsoCache = false;

@@ -47,6 +47,11 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   ID3D12Device *device() const { return d3d12_device_.get(); }
   ID3D12GraphicsCommandList *cmd_list() const { return cmd_list_.get(); }
+  // False between the Close() and Reset() of a frame's command list, during
+  // which nothing may be recorded into it.
+  bool IsCommandListOpen() const {
+    return !(dirty_flags_ & DIRTY_FLAG_CMD_LIST_CLOSED);
+  }
   ID3D12CommandQueue *cmd_queue() const { return cmd_queue_.get(); }
   HWND window() const { return window_; }
   UINT sync_interval() const { return sync_interval_; }

@@ -102,7 +102,7 @@ void Buffer::InitAsBuffer(Device* device, size_t size_in_bytes,
   // that's replaced again next frame. Everything else is written rarely and
   // read every frame, which is what GPU-local memory is for -- see
   // gpu_resident_.
-  gpu_resident_ = !usage.Has(Dx8::Usage::Dynamic);
+  gpu_resident_ = kBuffersInGpuMemory && !usage.Has(Dx8::Usage::Dynamic);
   if (gpu_resident_) {
     D3D12_HEAP_PROPERTIES default_heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     ASSERT_HR(device->device()->CreateCommittedResource(
@@ -195,7 +195,7 @@ HRESULT STDMETHODCALLTYPE Buffer::Unlock() {
   // old Unmap(0, nullptr) here also declared the *entire* resource as
   // written on every unlock, which is strictly more invalidation than any
   // single lock actually dirtied.
-  if (gpu_resident_ && locked_size_ > 0) {
+  if (gpu_resident_ && locked_size_ > 0 && device_->IsCommandListOpen()) {
     // Push just the range this lock handed out up to the GPU-local copy.
     // Recorded into the current command list, so it lands ahead of any draw
     // that reads this buffer later in the frame.
