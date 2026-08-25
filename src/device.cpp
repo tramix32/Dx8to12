@@ -6,6 +6,7 @@
 #include <dxgi1_5.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <sstream>
 #include <utility>
 
@@ -2762,10 +2763,23 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
         Buffer *buffer = static_cast<Buffer *>(d3d_buffer.Get());
         TransitionBuffer(buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         int stride = vertex_shader->decl.buffer_strides[i];
-        vbuffer_views[i] = {.BufferLocation = buffer->GetGpuPtr(),
-                            .SizeInBytes = static_cast<UINT>(
-                                stride * (start_vertex + num_vertices)),
-                            .StrideInBytes = static_cast<UINT>(stride)};
+        // Size the view to the whole buffer, not to the draw's declared
+        // vertex range. DrawIndexedPrimitive's MinIndex/NumVertices are only
+        // *hints* in D3D8 -- real hardware ignores them, so games fill them
+        // in loosely and their indices are free to reference vertices well
+        // outside that range. GTA: Vice City's 2D text batching does exactly
+        // that: it reports MinIndex=0/NumVertices=384 while drawing from
+        // startIndex=9516, whose indices reach vertex ~6300. Deriving
+        // SizeInBytes from those hints made the view stop after 384 vertices,
+        // so the GPU read past its end and rendered garbage geometry -- seen
+        // as a text quad blowing up to cover the screen with the whole font
+        // atlas. The view has to span every vertex an index could name, which
+        // is the entire buffer.
+        vbuffer_views[i] = {
+            .BufferLocation = buffer->GetGpuPtr(),
+            .SizeInBytes =
+                safe_cast<UINT>(buffer->resource_desc().Width),
+            .StrideInBytes = static_cast<UINT>(stride)};
         if (i > max_index) max_index = i;
         MarkResourceAsUsed(bound_vertex_streams_[i]);
       } else {
@@ -3094,6 +3108,67 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitiveUP(
   }
 
   // Allocate some ring buffer memory.
+  // DIAGNOSTIC for the "whole font atlas stretched across the screen" glitch
+  // (see ROADMAP.md): 2D UI is drawn through this path as small
+  // D3DFVF_XYZRHW quads whose vertices are already in screen coordinates, so
+  // a text glyph should cover a few dozen pixels. When the glitch happens the
+  // same draw covers the entire screen, which means its vertex data is wrong
+  // before we ever touch it -- or wrong because we handed it the wrong
+  // memory. Log the actual incoming coordinates when a small UP draw claims
+  // most of the screen; that distinguishes the two without needing a graphics
+  // debugger (the glitch never survives a capture).
+  if (vertex_count <= 6 && VertexStreamZeroStride >= 2 * sizeof(float)) {
+    float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
+    for (int i = 0; i < vertex_count; ++i) {
+      const float *pos = reinterpret_cast<const float *>(
+          static_cast<const uint8_t *>(pVertexStreamZeroData) +
+          static_cast<size_t>(i) * VertexStreamZeroStride);
+      min_x = std::min(min_x, pos[0]);
+      max_x = std::max(max_x, pos[0]);
+      min_y = std::min(min_y, pos[1]);
+      max_y = std::max(max_y, pos[1]);
+    }
+    const float covered_w = max_x - min_x;
+    const float covered_h = max_y - min_y;
+    if (covered_w > 0.8f * viewport_.Width &&
+        covered_h > 0.8f * viewport_.Height) {
+      static int oversized_up_draws = 0;
+      if (oversized_up_draws < 16) {
+        ++oversized_up_draws;
+        LOG(AixLog::Severity::error)
+            << "OVERSIZED-UI-DRAW: prim=" << PrimitiveType << " verts="
+            << vertex_count << " stride=" << VertexStreamZeroStride
+            << " bounds=(" << min_x << "," << min_y << ")-(" << max_x << ","
+            << max_y << ") viewport=" << viewport_.Width << "x"
+            << viewport_.Height << " tex0="
+            << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+            << "\n";
+      }
+    }
+
+    // Full per-draw dump while the F9 toggle is on, so a correct glyph quad
+    // and a corrupted one can be compared side by side. This logs the vertex
+    // data exactly as the game handed it over, before it's copied anywhere:
+    // if the coordinates are already wrong here the corruption is upstream of
+    // this shim, and if they're sane here but the draw still covers the
+    // screen, it's ours.
+    if (ui_dump_enabled_) {
+      std::ostringstream dump;
+      dump << "UIDUMP prim=" << PrimitiveType << " verts=" << vertex_count
+           << " stride=" << VertexStreamZeroStride << " tex0="
+           << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+           << " vs=" << bound_vertex_shader_ << " pos=[";
+      for (int i = 0; i < vertex_count; ++i) {
+        const float *pos = reinterpret_cast<const float *>(
+            static_cast<const uint8_t *>(pVertexStreamZeroData) +
+            static_cast<size_t>(i) * VertexStreamZeroStride);
+        dump << "(" << pos[0] << "," << pos[1] << ") ";
+      }
+      dump << "]\n";
+      LOG(AixLog::Severity::error) << dump.str();
+    }
+  }
+
   size_t num_bytes = vertex_count * VertexStreamZeroStride;
   DynamicRingBuffer::Allocation alloc =
       dynamic_ring_buffer()->Allocate(num_bytes);
@@ -3145,15 +3220,54 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
       break;
   }
 
+  // F9 dump on the path the 2D UI actually uses -- neither DrawPrimitiveUP
+  // nor DrawIndexedPrimitiveUP logged anything for the menu, so it draws from
+  // a real vertex buffer through here. Records which texture each small quad
+  // gets: the glitch under investigation shows the font atlas where another
+  // texture belongs (see ROADMAP.md), so comparing a clean dump against a
+  // glitched one should show the same draw with a different texture bound.
+  // No primCount filter: RenderWare batches many 2D sprites (whole strings of
+  // text) into a single draw, so filtering for small quads excluded exactly
+  // the draws worth seeing. A line cap keeps the log manageable instead.
+  static int ui_dump_lines = 0;
+  if (ui_dump_enabled_ && ui_dump_lines < 40000) {
+    ++ui_dump_lines;
+    GpuTexture *tex0 =
+        bound_textures_[0] ? bound_textures_[0].Get() : nullptr;
+    std::ostringstream dump;
+    dump << "UIDUMP(indexed-vb) prim=" << PrimitiveType
+         << " prims=" << primCount << " minIndex=" << minIndex
+         << " numVerts=" << NumVertices << " startIndex=" << startIndex
+         << " tex0=" << tex0;
+    if (tex0) {
+      const D3D12_RESOURCE_DESC &desc = tex0->resource_desc();
+      dump << " tex0size=" << std::dec << desc.Width << "x" << desc.Height
+           << " fmt=" << static_cast<int>(desc.Format);
+    }
+    dump << " vs=" << bound_vertex_shader_ << " ps=" << bound_pixel_shader_
+         << " baseVertex=" << bound_base_vertex_;
+    if (bound_vertex_streams_[0]) {
+      Buffer *vb = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
+      dump << " vbBytes=" << vb->resource_desc().Width
+           << " vbDyn=" << vb->IsDynamic();
+    }
+    if (bound_index_buffer_) {
+      dump << " ibBytes=" << bound_index_buffer_->resource_desc().Width;
+    }
+    dump << " colorop=" << texture_stage_states_[0].color_op
+         << " alphaop=" << texture_stage_states_[0].alpha_op << "\n";
+    LOG(AixLog::Severity::error) << dump.str();
+  }
+
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, minIndex + bound_base_vertex_,
                                NumVertices));
 
   TransitionBuffer(bound_index_buffer_.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER);
+  // Whole buffer, for the same reason the vertex buffer view above uses it.
   D3D12_INDEX_BUFFER_VIEW ib_view{
       .BufferLocation = bound_index_buffer_->GetGpuPtr(),
-      .SizeInBytes = static_cast<UINT>(
-          DXGIFormatSize(bound_index_buffer_->index_buffer_fmt()) *
-          (startIndex + index_count)),
+      .SizeInBytes =
+          safe_cast<UINT>(bound_index_buffer_->resource_desc().Width),
       .Format = bound_index_buffer_->index_buffer_fmt()};
   MarkResourceAsUsed(bound_index_buffer_);
   cmd_list_->IASetIndexBuffer(&ib_view);
@@ -3217,6 +3331,57 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
   // is indexed from element 0 (indices in pIndexData are absolute, not
   // relative to MinVertexIndex), so we have to bring along everything up to
   // the top of that range.
+  // Same diagnostic as DrawPrimitiveUP, on the path RenderWare's 2D drawing
+  // actually takes (RwIm2DRenderIndexedPrimitive lands here, not on the
+  // non-indexed one). Reports the vertex data exactly as the game supplied
+  // it, before it's copied anywhere. See ROADMAP.md for the glitch this is
+  // chasing.
+  if (VertexStreamZeroStride >= 2 * sizeof(float) && NumVertexIndices <= 64) {
+    float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
+    for (UINT i = 0; i < NumVertexIndices; ++i) {
+      const float *pos = reinterpret_cast<const float *>(
+          static_cast<const uint8_t *>(pVertexStreamZeroData) +
+          static_cast<size_t>(MinVertexIndex + i) * VertexStreamZeroStride);
+      min_x = std::min(min_x, pos[0]);
+      max_x = std::max(max_x, pos[0]);
+      min_y = std::min(min_y, pos[1]);
+      max_y = std::max(max_y, pos[1]);
+    }
+    const bool covers_screen = (max_x - min_x) > 0.8f * viewport_.Width &&
+                               (max_y - min_y) > 0.8f * viewport_.Height;
+    if (covers_screen) {
+      static int oversized_indexed_up_draws = 0;
+      if (oversized_indexed_up_draws < 16) {
+        ++oversized_indexed_up_draws;
+        LOG(AixLog::Severity::error)
+            << "OVERSIZED-UI-DRAW(indexed): prim=" << PrimitiveType
+            << " verts=" << NumVertexIndices << " prims=" << PrimitiveCount
+            << " stride=" << VertexStreamZeroStride << " bounds=(" << min_x
+            << "," << min_y << ")-(" << max_x << "," << max_y
+            << ") viewport=" << viewport_.Width << "x" << viewport_.Height
+            << " tex0="
+            << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+            << "\n";
+      }
+    }
+    if (ui_dump_enabled_) {
+      std::ostringstream dump;
+      dump << "UIDUMP(indexed) prim=" << PrimitiveType
+           << " verts=" << NumVertexIndices << " prims=" << PrimitiveCount
+           << " stride=" << VertexStreamZeroStride << " tex0="
+           << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+           << " pos=[";
+      for (UINT i = 0; i < NumVertexIndices && i < 8; ++i) {
+        const float *pos = reinterpret_cast<const float *>(
+            static_cast<const uint8_t *>(pVertexStreamZeroData) +
+            static_cast<size_t>(MinVertexIndex + i) * VertexStreamZeroStride);
+        dump << "(" << pos[0] << "," << pos[1] << ") ";
+      }
+      dump << "]\n";
+      LOG(AixLog::Severity::error) << dump.str();
+    }
+  }
+
   const size_t num_vertices_to_upload = MinVertexIndex + NumVertexIndices;
   const size_t vertex_bytes = num_vertices_to_upload * VertexStreamZeroStride;
   DynamicRingBuffer::Allocation vertex_alloc =
@@ -3253,12 +3418,39 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
   return S_OK;
 }
 
+void Device::PollUiDumpHotkey() {
+  // Edge-triggered so holding the key doesn't toggle every frame. Uses
+  // GetAsyncKeyState rather than the app's input: this has to work while the
+  // game has focus and is running its own message loop.
+  const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+  if (down && !ui_dump_key_was_down_) {
+    ui_dump_enabled_ = !ui_dump_enabled_;
+    // Cap the run so a forgotten toggle can't fill the disk. 1000 frames is
+    // only about 2.8 seconds on a 360Hz display, which is the shortest window
+    // that's realistically long enough to react and catch the glitch.
+    ui_dump_frames_left_ = ui_dump_enabled_ ? 1000 : 0;
+    LOG(AixLog::Severity::error)
+        << "=== UI DUMP " << (ui_dump_enabled_ ? "STARTED" : "STOPPED")
+        << " (F9) ===\n";
+  }
+  ui_dump_key_was_down_ = down;
+
+  if (ui_dump_enabled_) {
+    if (--ui_dump_frames_left_ <= 0) {
+      ui_dump_enabled_ = false;
+      LOG(AixLog::Severity::error)
+          << "=== UI DUMP STOPPED (frame budget reached) ===\n";
+    }
+  }
+}
+
 HRESULT STDMETHODCALLTYPE Device::Present(CONST RECT *pSourceRect,
                                           CONST RECT *pDestRect,
                                           HWND hDestWindowOverride,
                                           CONST RGNDATA *pDirtyRegion) {
   TRACE_ENTRY(hDestWindowOverride);
   ASSERT(hDestWindowOverride == nullptr || hDestWindowOverride == window_);
+  PollUiDumpHotkey();
   SubmitAndWait(true);
   return S_OK;
 }

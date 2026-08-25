@@ -247,6 +247,23 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
 
   const bool is_discard = HasFlag(Flags, D3DLOCK_DISCARD);
   const bool is_nooverwrite = HasFlag(Flags, D3DLOCK_NOOVERWRITE);
+
+  // Lock traffic for the F9 dump. The draw-side dump showed the game reaching
+  // BaseVertexIndex in the thousands within a 256KB dynamic buffer, so which
+  // path each lock takes -- and where its data actually lands -- is what
+  // decides whether those vertices exist by the time the GPU reads them.
+  if (device_->ui_dump_enabled()) {
+    LOG(AixLog::Severity::error)
+        << "LOCKDUMP buf=" << this << " size=" << size_
+        << " offset=" << OffsetToLock << " lockSize=" << size_to_lock
+        << " discard=" << is_discard << " nooverwrite=" << is_nooverwrite
+        << " prevLockFrame=" << prev_lock_frame_
+        << " curFrame=" << device_->CurrentFrame()
+        << " hasSpec=" << has_speculative_write_
+        << " specPersisted=" << is_speculative_write_persisted_
+        << " ringOff=" << current_ring_alloc_.offset
+        << " ringSize=" << current_ring_alloc_.size << "\n";
+  }
   // const bool is_entire_buffer = size_to_lock == size_;
 
   if (is_nooverwrite && prev_lock_frame_ < device_->CurrentFrame()) {
@@ -364,8 +381,19 @@ void DynamicBuffer::PersistDynamicChanges() {
       device_->dynamic_ring_buffer()->GetBackingResource();
   device_->TransitionBuffer(this, D3D12_RESOURCE_STATE_COPY_DEST);
   for (auto [offset, size] : written_ranges_.ranges) {
+    // Destination offset is the range's own offset, not 0. written_ranges_
+    // holds offsets within this buffer, and the ring allocation mirrors that
+    // layout, so a range written at offset N belongs at offset N here too.
+    // Copying every range to 0 piled them all on top of each other at the
+    // start of the buffer: with a single range starting at 0 (the common
+    // case) that happened to be right, but a game appending several
+    // D3DLOCK_NOOVERWRITE batches into one buffer -- which is exactly how
+    // GTA: Vice City batches 2D text, reaching BaseVertexIndex in the
+    // thousands -- got every batch after the first written to the wrong
+    // place, and read garbage back on any later frame that drew from this
+    // buffer without re-locking it.
     device_->cmd_list()->CopyBufferRegion(
-        resource(), 0, src,
+        resource(), static_cast<UINT64>(offset), src,
         static_cast<UINT64>(current_ring_alloc_.offset + offset),
         static_cast<UINT64>(size));
   }

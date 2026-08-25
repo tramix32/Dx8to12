@@ -94,6 +94,8 @@ class Device : public IDirect3DDevice8, RefCounted {
   void UnregisterModRenderCallback(ModRenderCallback callback);
 
   uint64_t CurrentFrame() const;
+  // True while the F9 UI dump is running -- see PollUiDumpHotkey.
+  bool ui_dump_enabled() const { return ui_dump_enabled_; }
   void CopyBuffer(Buffer *dest, int64_t dest_offset, ID3D12Resource *src,
                   int64_t src_offset, int64_t num_bytes);
   void CopyBufferToTexture(GpuTexture *dest, uint32_t dest_subresource,
@@ -468,6 +470,14 @@ class Device : public IDirect3DDevice8, RefCounted {
   // has no root signature and no root arguments bound) -- see the
   // root_sig_bound_ block in PrepareDrawCall for why binding the root
   // signature once per command list rather than once per draw matters.
+  // F9 toggles a detailed dump of 2D UI draws to log.txt -- see
+  // PollUiDumpHotkey. Lets a glitch that never survives a graphics-debugger
+  // capture be recorded at the moment it's actually on screen.
+  void PollUiDumpHotkey();
+  bool ui_dump_enabled_ = false;
+  bool ui_dump_key_was_down_ = false;
+  int ui_dump_frames_left_ = 0;
+
   bool root_sig_bound_ = false;
   std::array<D3D12_GPU_VIRTUAL_ADDRESS, 4> last_root_cbvs_ = {};
 

@@ -103,8 +103,17 @@ void DynamicRingBuffer::HasCompletedFrame(uint64_t frame) {
   if (!frame_heads_.empty()) {
     head_ = frame_heads_.front().second;
   } else {
-    head_ = 0;
-    tail_ = 0;
+    // Nothing is in flight, so every byte is reusable -- but the write
+    // pointer must stay where it is. Resetting tail_ to 0 here rewound it
+    // into memory the *current, still-being-recorded* frame had already
+    // handed out: the next allocation then landed on top of vertex data a
+    // draw call already recorded, and the GPU read whatever the CPU had
+    // since overwritten. That is a race, so it only showed up at speed --
+    // it disappeared under a graphics debugger and even under this file's
+    // own logging, both of which slow the frame down enough to hide it.
+    // head_ = tail_ marks the ring as empty without moving the write
+    // pointer.
+    head_ = tail_;
   }
 }
 
