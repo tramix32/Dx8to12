@@ -111,7 +111,15 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
 
     diffuse_lighting += saturate(dot(view_normal, dir_to_light)) * attenuation *
                         light.diffuse.xyz;
-    ambient_lighting += light.ambient.xyz;
+    // Per-light ambient is part of the same Attn * (...) formula as diffuse
+    // and specular (D3D8's lighting math, "Iamb*Camb + Idif*Cdif*(N.L) +
+    // Ispec*Cspec*(N.H)^Power", all inside the same Attn multiply) -- a
+    // point/spot light's ambient contribution should fall off with distance
+    // and cone falloff exactly like its diffuse/specular do. This was adding
+    // it at full, unattenuated strength regardless of range or spotlight
+    // cone, which is wrong for any light with a nonzero Ambient field (most
+    // games leave it zero, but not all).
+    ambient_lighting += attenuation * light.ambient.xyz;
 
 #if 0
     // TODO: LOCALVIEWER
@@ -130,9 +138,15 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
   else
     specular_lighting *= specular_color;
 
-  diffuse_lighting = saturate(diffuse_lighting * diffuse_color.rgb);
-  ambient_lighting = saturate(ambient_lighting * ambient_color.rgb);
-
+  // D3D8's lighting equation sums every term (ambient*Camb + diffuse*Cdif +
+  // specular*Cspec + emissive) and clamps *once*, at the very end -- not
+  // per-term. Saturating diffuse_lighting/ambient_lighting here individually,
+  // before combining them, silently threw away legitimate headroom in any
+  // scene bright enough for one term to exceed 1.0 on its own (multiple
+  // overlapping lights, a strong single light) -- exactly the kind of thing
+  // that would read as a flatter, lower-contrast image without an obvious
+  // single wrong pixel to point at.
+  //
   // Emissive adds flat, unlit light of its own -- unlike ambient/diffuse it
   // is not modulated by any material color, it *is* the color. Previously
   // material_emissive was uploaded to the GPU (PixelCBuffer) but nothing
@@ -140,7 +154,8 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
   // e.g. self-lit signs/headlights/instrument panels that rely on emissive
   // to stay visible in the dark rendered exactly as dark as their
   // surroundings.
-  diffuse_lighting = saturate(diffuse_lighting + ambient_lighting +
+  diffuse_lighting = saturate(diffuse_lighting * diffuse_color.rgb +
+                              ambient_lighting * ambient_color.rgb +
                               emissive_color.rgb);
 
   return float4(diffuse_lighting, diffuse_color.a);
