@@ -3439,33 +3439,17 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     LinearSrvHeap &scratch = tex_scratch_heaps_[current_back_buffer_];
     ASSERT(scratch.next_offset + kMaxTexStages <= scratch.capacity);
     const int base_offset = scratch.next_offset;
-    // A WPA trace (CPU Usage Sampled, captured by the user against exactly
-    // this code) showed ~98% of PrepareDrawCall's time landing inside
-    // nvwgf2um.dll under CopyDescriptorsSimple -- calling it kMaxTexStages
-    // times per rebind event meant kMaxTexStages separate trips into the
-    // driver, and on this hardware/driver each individual trip turned out
-    // to be far from free. ID3D12Device::CopyDescriptors (the general,
-    // multi-range form) does the exact same copy in one driver call: one
-    // destination range (the whole contiguous scratch block) and up to
-    // kMaxTexStages single-descriptor source ranges, since the sources
-    // (each texture's own persistent SRV slot) aren't contiguous with each
-    // other the way the destination is.
-    const D3D12_CPU_DESCRIPTOR_HANDLE dest_range_start{
-        .ptr = scratch.cpu_start.ptr +
-               static_cast<SIZE_T>(base_offset) * scratch.increment};
-    const UINT dest_range_size = kMaxTexStages;
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, kMaxTexStages> src_range_starts;
-    std::array<UINT, kMaxTexStages> src_range_sizes;
     for (int i = 0; i < kMaxTexStages; ++i) {
       GpuTexture *tex =
           bound_textures_[i] ? bound_textures_[i].Get() : nullptr;
-      src_range_starts[i] = tex ? tex->srv_handle() : null_srv_cpu_handle_;
-      src_range_sizes[i] = 1;
+      const D3D12_CPU_DESCRIPTOR_HANDLE src =
+          tex ? tex->srv_handle() : null_srv_cpu_handle_;
+      const D3D12_CPU_DESCRIPTOR_HANDLE dest{
+          .ptr = scratch.cpu_start.ptr +
+                 static_cast<SIZE_T>(base_offset + i) * scratch.increment};
+      d3d12_device_->CopyDescriptorsSimple(
+          1, dest, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    d3d12_device_->CopyDescriptors(
-        1, &dest_range_start, &dest_range_size, kMaxTexStages,
-        src_range_starts.data(), src_range_sizes.data(),
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const D3D12_GPU_DESCRIPTOR_HANDLE table_start{
         .ptr = scratch.gpu_start.ptr +
                static_cast<UINT64>(base_offset) * scratch.increment};
