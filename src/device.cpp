@@ -726,11 +726,6 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   dirty_texture_stage_mask_ = 0xFF;
   dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
-  // Reset() implies every back-buffer slot's prior work is long GPU-idle by
-  // this point (it's already tearing down and recreating the back buffers
-  // and depth-stencil target), so every scratch heap's bump offset can
-  // safely go back to 0, not just current_back_buffer_'s.
-  for (auto &scratch : tex_scratch_heaps_) scratch.next_offset = 0;
   // Everything the renderer thinks is bound was dropped along with the old
   // command list -- including the descriptor heaps, which only BeginScene
   // ever binds. Without this, the first draw after a device reset could skip
@@ -888,39 +883,26 @@ void Device::InitRootSignatures() {
       },
   };
   textures_start_bindslot_ = root_params.size();
-  // One descriptor table covering all kMaxTexStages SRV registers (t0..t7)
-  // contiguously, instead of kMaxTexStages separate single-descriptor
-  // tables. PrepareDrawCall now copies the current per-stage SRVs (real
-  // texture, or null_srv_cpu_handle_ for an unbound stage) into a
-  // contiguous scratch-heap block and binds the whole table with one
-  // SetGraphicsRootDescriptorTable call whenever any stage changes, instead
-  // of up to kMaxTexStages separate calls -- textures change on essentially
-  // every draw in a typical scene, so this was the dominant cost of the
-  // old per-stage-table layout (plan/oportowanie.md section 5).
-  D3D12_DESCRIPTOR_RANGE srv_range{
-      .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-      .NumDescriptors = kMaxTexStages,
-      .BaseShaderRegister = 0,
-      .OffsetInDescriptorsFromTableStart = 0};
-  root_params.push_back(D3D12_ROOT_PARAMETER{
-      .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-      .DescriptorTable = {.NumDescriptorRanges = 1,
-                          .pDescriptorRanges = &srv_range},
-      .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
-  });
-  samplers_start_bindslot_ = root_params.size();
-  // Samplers deliberately keep one root parameter per stage: sampler_cache_
-  // already dedupes identical SamplerDesc states, so this side is already
-  // small and low-churn (nowhere near the per-draw texture change rate),
-  // and unlike SRV heaps, D3D12 hardware caps shader-visible *sampler*
-  // heaps much lower (2048 entries on common tiers) -- collapsing this side
-  // the same way would trade an already-cheap path for a hard capacity
-  // ceiling, without a confirmed need.
+  // Add all kMaxTexStages textures.
+  std::array<D3D12_DESCRIPTOR_RANGE, kMaxTexStages> srv_ranges;
   std::array<D3D12_DESCRIPTOR_RANGE, kMaxTexStages> sampler_ranges;
   for (unsigned int i = 0; i < kMaxTexStages; ++i) {
+    srv_ranges[i] = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                     .NumDescriptors = 1,
+                     .BaseShaderRegister = i,
+                     .OffsetInDescriptorsFromTableStart = 0};
     sampler_ranges[i] = {.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
                          .NumDescriptors = 1,
                          .BaseShaderRegister = i};
+    root_params.push_back(D3D12_ROOT_PARAMETER{
+        .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        .DescriptorTable = {.NumDescriptorRanges = 1,
+                            .pDescriptorRanges = &srv_ranges[i]},
+        .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
+    });
+  }
+  // And all samplers.
+  for (unsigned int i = 0; i < kMaxTexStages; ++i) {
     root_params.push_back(D3D12_ROOT_PARAMETER{
         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
         .DescriptorTable = {.NumDescriptorRanges = 1,
@@ -950,45 +932,6 @@ void Device::InitRootSignatures() {
   ASSERT_HR(d3d12_device_->CreateRootSignature(
       0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
       IID_PPV_ARGS(main_root_sig_.GetForInit())));
-
-  // Called once from Init(), never from Reset() -- srv_heap_ (which this
-  // permanent slot is allocated from) and these scratch heaps both need to
-  // survive a Reset() the same way bound textures already do, so there is
-  // no matching teardown/recreate needed here.
-  LOG(INFO) << "InitRootSignatures: null SRV + texture scratch heaps\n";
-  null_srv_cpu_handle_ = srv_heap_.Allocate();
-  {
-    D3D12_SHADER_RESOURCE_VIEW_DESC null_desc{
-        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
-        .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-        .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-        .Texture2D = {.MipLevels = 1}};
-    d3d12_device_->CreateShaderResourceView(nullptr, &null_desc,
-                                            null_srv_cpu_handle_);
-  }
-  // Sized generously against FRAME-DRAWCOUNT's observed ~400-900 draws/frame
-  // in a busy scene, on the assumption every single one dirties texture
-  // state (worst case -- most don't, thanks to dirty_texture_stage_mask_
-  // only firing this on an actual change): 4096 rebind events/frame *
-  // kMaxTexStages is comfortably under the ~1,000,000-descriptor
-  // shader-visible CBV_SRV_UAV heap limit Tier 1 hardware guarantees, with
-  // headroom to spare -- unlike the sampler-heap collapse this deliberately
-  // avoided above, there is no tight hardware ceiling to size against here.
-  constexpr int kTexScratchRebindsPerFrame = 4096;
-  for (auto &scratch : tex_scratch_heaps_) {
-    scratch.capacity = kTexScratchRebindsPerFrame * kMaxTexStages;
-    D3D12_DESCRIPTOR_HEAP_DESC desc{
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        .NumDescriptors = static_cast<UINT>(scratch.capacity),
-        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-    ASSERT_HR(d3d12_device_->CreateDescriptorHeap(
-        &desc, IID_PPV_ARGS(scratch.heap.GetForInit())));
-    scratch.cpu_start = scratch.heap->GetCPUDescriptorHandleForHeapStart();
-    scratch.gpu_start = scratch.heap->GetGPUDescriptorHandleForHeapStart();
-    scratch.increment = d3d12_device_->GetDescriptorHandleIncrementSize(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    scratch.next_offset = 0;
-  }
 
   // Create the cbuffers.
   LOG(INFO) << "InitRootSignatures: creating cbuffers\n";
@@ -3426,36 +3369,22 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   }
 
   if (dirty_flags_ & DIRTY_FLAG_PS_TEXTURES) {
-    // Copy all kMaxTexStages current SRVs (real texture, or
-    // null_srv_cpu_handle_ for an unbound stage) into a fresh contiguous
-    // block of this back-buffer slot's scratch heap, then bind the whole
-    // block with one call -- dirty_texture_stage_mask_ still gates *whether*
-    // this runs at all (unchanged from before), but once it does, every
-    // stage gets rewritten into the new block regardless of which
-    // individual stage(s) actually changed: the table has to be a single
-    // contiguous range to bind it in one call, so a stage that didn't
-    // change still needs its descriptor present in the new block, not just
-    // left stale in the previous one.
-    LinearSrvHeap &scratch = tex_scratch_heaps_[current_back_buffer_];
-    ASSERT(scratch.next_offset + kMaxTexStages <= scratch.capacity);
-    const int base_offset = scratch.next_offset;
+    // And all the textures -- but only the stages dirty_texture_stage_mask_
+    // actually marked touched. See its comment (device.h) for why this is a
+    // mask set at mutation time rather than inferred by comparing cached
+    // texture identities against the current binding.
+    const uint32_t mask =
+        kCacheDrawStateBindings ? dirty_texture_stage_mask_ : 0xFFu;
     for (int i = 0; i < kMaxTexStages; ++i) {
+      if (!(mask & (1u << i))) continue;
       GpuTexture *tex =
           bound_textures_[i] ? bound_textures_[i].Get() : nullptr;
-      const D3D12_CPU_DESCRIPTOR_HANDLE src =
-          tex ? tex->srv_handle() : null_srv_cpu_handle_;
-      const D3D12_CPU_DESCRIPTOR_HANDLE dest{
-          .ptr = scratch.cpu_start.ptr +
-                 static_cast<SIZE_T>(base_offset + i) * scratch.increment};
-      d3d12_device_->CopyDescriptorsSimple(
-          1, dest, src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      if (tex) {
+        const auto gpu_handle = srv_heap_.GetGPUHandleFor(tex->srv_handle());
+        cmd_list_->SetGraphicsRootDescriptorTable(textures_start_bindslot_ + i,
+                                                  gpu_handle);
+      }
     }
-    const D3D12_GPU_DESCRIPTOR_HANDLE table_start{
-        .ptr = scratch.gpu_start.ptr +
-               static_cast<UINT64>(base_offset) * scratch.increment};
-    cmd_list_->SetGraphicsRootDescriptorTable(textures_start_bindslot_,
-                                              table_start);
-    scratch.next_offset += kMaxTexStages;
     dirty_texture_stage_mask_ = 0;
     dirty_flags_ ^= DIRTY_FLAG_PS_TEXTURES;
   }
@@ -3478,7 +3407,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
       }
       ASSERT(iter->second.ptr != 0);
       cmd_list_->SetGraphicsRootDescriptorTable(
-          samplers_start_bindslot_ + i, iter->second);
+          textures_start_bindslot_ + kMaxTexStages + i, iter->second);
     }
     dirty_sampler_stage_mask_ = 0;
     dirty_flags_ ^= DIRTY_FLAG_PS_SAMPLERS;
@@ -4391,11 +4320,6 @@ void Device::SubmitAndWait(bool should_present) {
   dirty_texture_stage_mask_ = 0xFF;
   dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
-  // Same reasoning as cmd_allocators_[current_back_buffer_]->Reset() just
-  // above: WaitForFrame has just confirmed this slot's prior frame is
-  // GPU-complete, so nothing can still be reading scratch descriptors this
-  // slot handed out then -- safe to bump the offset back to 0.
-  tex_scratch_heaps_[current_back_buffer_].next_offset = 0;
 }
 
 void Device::WaitForFrame(uint64_t frame_number) {
