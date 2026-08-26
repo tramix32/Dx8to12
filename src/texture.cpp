@@ -53,16 +53,39 @@ BaseTexture *BaseTexture::Create(Device *device, TextureKind kind,
     resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   if (d3d8_usage & D3DUSAGE_DEPTHSTENCIL)
     resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  BaseTexture *result;
   if (pool == D3DPOOL_SYSTEMMEM) {
-    return new CpuTexture(device, kind, d3d8_usage, resource_desc);
+    result = new CpuTexture(device, kind, d3d8_usage, resource_desc);
   } else {
     if (HasFlag(d3d8_usage, D3DUSAGE_DYNAMIC)) {
       FAIL("Dynamic textures are untested.");
       // return new DynamicTexture(device, kind, d3d8_usage, resource_desc);
-    } else {
-      return new GpuTexture(device, kind, d3d8_usage, pool, resource_desc);
+    }
+    result = new GpuTexture(device, kind, d3d8_usage, pool, resource_desc);
+  }
+  // DIAGNOSTIC: a ground/sidewalk draw is silently missing from some frames
+  // (no crash, no state error -- the draw call itself never happens), moving
+  // to a different spot each session. If a specific texture is failing or
+  // being delayed at creation, this is the first place that would show it --
+  // every texture this session, with the exact dims D3D12 actually got, so
+  // a bad block-compression size (BC1/2/3 require dimensions to be multiples
+  // of 4) or an unexpectedly tiny/degenerate size stands out.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  {
+    static int create_tex_lines = 0;
+    if (create_tex_lines < 20000) {
+      ++create_tex_lines;
+      LOG(AixLog::Severity::error)
+          << "CREATETEX ptr=" << result << " kind=" << static_cast<int>(kind)
+          << " w=" << width << " h=" << height << " mips=" << mip_levels
+          << " actualMips=" << resource_desc.MipLevels
+          << " usage=0x" << std::hex << d3d8_usage << std::dec
+          << " fmt=" << static_cast<int>(format) << " pool=" << pool
+          << "\n";
     }
   }
+#endif
+  return result;
 }
 
 BaseTexture::BaseTexture(Device *device, TextureKind kind, Dx8::Usage usage,

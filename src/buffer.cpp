@@ -314,9 +314,13 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Lock(UINT OffsetToLock,
     ASSERT(prev_lock_frame_ == device_->CurrentFrame());
     // This is a no overwrite.
     if (has_speculative_write_) {
-      // Previous value was a discard. We now know what we're appending data. So
-      // allocate the entire buffer size and copy the previous value.
-      PersistSpeculativeWrite(size_);
+      // Previous value was a discard. We now know we're appending data, so it
+      // has to live in the ring where the append can reach it. If a draw
+      // already forced it out via GetGpuPtr the allocation is there and is
+      // full-size, so reuse it rather than allocating a second copy: appending
+      // into a region a recorded draw already references is exactly what
+      // D3DLOCK_NOOVERWRITE promises is safe.
+      if (!is_speculative_write_persisted_) PersistSpeculativeWrite();
       has_speculative_write_ = false;
     }
     char* dest =
@@ -338,13 +342,105 @@ HRESULT STDMETHODCALLTYPE DynamicBuffer::Unlock() noexcept {
   return S_OK;
 }
 
-void DynamicBuffer::PersistSpeculativeWrite(int alloc_size) {
-  // if (use_cbv_) alloc_size = AlignUp(alloc_size, 256);
-  current_ring_alloc_ = device_->dynamic_ring_buffer()->Allocate(alloc_size);
+bool DynamicBuffer::IsRangeWrittenThisFrame(int offset, int size) {
+  // Not streaming through the ring this frame: the draw reads the buffer's own
+  // persistent resource, which still holds earlier frames' contents. Whether
+  // *that* is safe is a separate question (the CPU writes it with no
+  // synchronisation against a GPU that may still be reading it), but it is not
+  // uninitialised memory, so it is not what this check is looking for.
+  if (prev_lock_frame_ < device_->CurrentFrame()) return true;
+  if (current_ring_alloc_.size == 0) return true;
+  // ranges are kept sorted and coalesced by RangeSet, so the only candidate is
+  // the last range starting at or before `offset`. Binary search keeps this
+  // cheap enough to run on every draw rather than only under the F9 dump --
+  // which matters, because the dump's own cost is what has been hiding the
+  // bug.
+  const auto& ranges = written_ranges_.ranges;
+  auto iter = std::upper_bound(
+      ranges.begin(), ranges.end(), offset,
+      [](int value, const RangeSet::Range& r) { return value < r.offset; });
+  if (iter == ranges.begin()) return false;
+  --iter;
+  return offset >= iter->offset &&
+         offset + size <= iter->offset + iter->size;
+}
+
+std::string DynamicBuffer::DebugState() {
+  std::ostringstream s;
+  const bool on_ring = prev_lock_frame_ == device_->CurrentFrame() &&
+                       current_ring_alloc_.size > 0;
+  s << (on_ring ? "ring" : "persistent") << " ringOff="
+    << current_ring_alloc_.offset << " ringSize=" << current_ring_alloc_.size
+    << " prevLockFrame=" << prev_lock_frame_
+    << " curFrame=" << device_->CurrentFrame()
+    << " hasSpec=" << has_speculative_write_
+    << " specSize=" << speculative_write_size_
+    << " ranges=" << written_ranges_.ranges.size();
+  // The range covering the vertices the draw is about to read, which is what
+  // says whether this frame put them there or they are last frame's leftovers.
+  for (size_t i = 0; i < written_ranges_.ranges.size() && i < 3; ++i) {
+    s << " r" << i << "=[" << written_ranges_.ranges[i].offset << "+"
+      << written_ranges_.ranges[i].size << "]";
+  }
+  return s.str();
+}
+
+const char* DynamicBuffer::DebugCpuPtr(int offset, int size) {
+  // A D3DLOCK_DISCARD write that no draw has forced out yet still lives in the
+  // CPU-side cache; the ring copy only happens on the next GetGpuPtr. Since
+  // this runs *before* PrepareDrawCall, that is the normal state for the first
+  // draw after a discard -- and reading anywhere else there means reading the
+  // previous frame's leftovers instead of the vertices the GPU will use, which
+  // is exactly how this check manufactured a fake full-screen quad.
+  if (has_speculative_write_ && !is_speculative_write_persisted_) {
+    if (offset < 0 || size < 0 || offset + size > speculative_write_size_) {
+      return nullptr;
+    }
+    return speculative_write_cache_.data() + offset;
+  }
+  // Streaming through the ring this frame: that is the memory the draw reads.
+  if (prev_lock_frame_ == device_->CurrentFrame() &&
+      current_ring_alloc_.size > 0 && offset >= 0 && size >= 0 &&
+      offset + size <= current_ring_alloc_.size) {
+    return device_->dynamic_ring_buffer()->GetCpuPtrFor(current_ring_alloc_) +
+           offset;
+  }
+  // Otherwise the draw reads the buffer's own persistent resource, and so
+  // should we. Returning nullptr here left the vertex scan blind on every
+  // draw that took the D3DLOCK_NOOVERWRITE-without-discard path, which is
+  // most of them -- and a scan that silently examines nothing looks exactly
+  // like a scan that found nothing wrong.
+  return Buffer::DebugCpuPtr(offset, size);
+}
+
+void DynamicBuffer::PersistSpeculativeWrite() {
+  // Always reserve the *whole* buffer, never just the bytes the D3DLOCK_DISCARD
+  // happened to lock. Draws bind a vertex buffer view spanning the full buffer
+  // size (they have to -- D3D8's BaseVertexIndex is an index into the entire
+  // buffer, and GTA: Vice City's 2D text batching reaches BaseVertexIndex in
+  // the thousands), so a shorter allocation leaves that view pointing past its
+  // own region and straight into whatever else the ring is holding. GTA
+  // discards only 0x2a00 bytes of a 0x40000 buffer and then D3DLOCK_NOOVERWRITE
+  // appends out to offset 0x3f070, so nearly the entire view sat over other
+  // allocations' memory -- correct textures, garbage positions, and different
+  // garbage every frame depending on where the ring pointer had got to. That is
+  // the whole-font-atlas-stretched-over-the-menu glitch, and it is why slowing
+  // the CPU down (a graphics debugger, or just this file's own logging) shuffled
+  // the ring enough to hide it.
+  current_ring_alloc_ = device_->dynamic_ring_buffer()->Allocate(size_);
   char* dest =
       device_->dynamic_ring_buffer()->GetCpuPtrFor(current_ring_alloc_);
   memcpy(dest, speculative_write_cache_.data(),
          static_cast<size_t>(speculative_write_size_));
+  // Everything the discard did not cover has to be *defined*, not merely
+  // reserved. D3DLOCK_DISCARD says the untouched remainder is undefined, so
+  // zeroes are a legal thing to put there -- and unlike stale ring bytes they
+  // collapse into degenerate triangles instead of screen-filling noise if the
+  // app ever draws from a region it did not rewrite this frame.
+  if (size_ > speculative_write_size_) {
+    memset(dest + speculative_write_size_, 0,
+           static_cast<size_t>(size_ - speculative_write_size_));
+  }
   prev_lock_frame_ = device_->CurrentFrame();
 
   is_speculative_write_persisted_ = true;
@@ -353,9 +449,20 @@ void DynamicBuffer::PersistSpeculativeWrite(int alloc_size) {
 GpuPtr DynamicBuffer::GetGpuPtr() {
   if (!is_speculative_write_persisted_ && has_speculative_write_) {
     // Persist the speculative write.
-    PersistSpeculativeWrite(speculative_write_size_);
+    PersistSpeculativeWrite();
   } else if (prev_lock_frame_ < device_->CurrentFrame()) {
-    LOG(kLog) << "Using backing buffer for " << std::hex << this << ".\n";
+    // std::dec after the pointer: AixLog's Log singleton hijacks std::clog's
+    // streambuf (aixlog.hpp), so every LOG(...) call -- even one filtered
+    // out entirely by severity, since that filtering happens at sink-dispatch
+    // time, after the << chain has already run (see CLAUDE.md's TRACE_ENTRY
+    // note) -- writes through the *same* shared stream object. std::hex left
+    // unreset here silently flips every *other* LOG() call in the process,
+    // on any thread, into hex formatting until something else happens to
+    // reset it -- this trace-level line doesn't even need to be seen for the
+    // damage to happen. Confirmed as the actual cause of "frame=cd"-style
+    // garbage in an unrelated decimal-only diagnostic elsewhere in this file.
+    LOG(kLog) << "Using backing buffer for " << std::hex << this << std::dec
+             << ".\n";
     return Buffer::GetGpuPtr();  // Boooo.
   }
 
@@ -363,7 +470,10 @@ GpuPtr DynamicBuffer::GetGpuPtr() {
 }
 
 void DynamicBuffer::PersistDynamicChanges() {
-  LOG(kLog) << "Persisting changes for " << std::hex << this << "\n";
+  // See the std::dec comment on the "Using backing buffer" LOG above --
+  // same shared-stream hazard, same fix.
+  LOG(kLog) << "Persisting changes for " << std::hex << this << std::dec
+           << "\n";
   // Make sure any speculative writes are committed.
   GetGpuPtr();
   ASSERT(current_ring_alloc_.frame == device_->CurrentFrame());

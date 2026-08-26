@@ -30,7 +30,8 @@ cbuffer Lights : register(b2) {
   int specular_material_source;
   int specular_enable;
   int lighting_enabled;
-  int2 pad1;
+  int emissive_material_source;
+  int pad1;
   float4 global_ambient;
 };
 
@@ -51,6 +52,14 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
       specular_material_source == D3DMCS_MATERIAL
           ? material_specular
           : (specular_material_source == D3DMCS_COLOR1 ? vertex_color1
+                                                       : vertex_color2);
+  // material_emissive comes from PixelGlobals (common.hlsl, register b1,
+  // ALL-visibility) -- the same cbuffer diffuse/ambient/specular's *_MATERIAL
+  // case reads from.
+  float4 emissive_color =
+      emissive_material_source == D3DMCS_MATERIAL
+          ? material_emissive
+          : (emissive_material_source == D3DMCS_COLOR1 ? vertex_color1
                                                        : vertex_color2);
   float3 diffuse_lighting = 0;
   float3 ambient_lighting = global_ambient.xyz;
@@ -124,7 +133,15 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
   diffuse_lighting = saturate(diffuse_lighting * diffuse_color.rgb);
   ambient_lighting = saturate(ambient_lighting * ambient_color.rgb);
 
-  diffuse_lighting = saturate(diffuse_lighting + ambient_lighting);
+  // Emissive adds flat, unlit light of its own -- unlike ambient/diffuse it
+  // is not modulated by any material color, it *is* the color. Previously
+  // material_emissive was uploaded to the GPU (PixelCBuffer) but nothing
+  // ever read it, so D3DMATERIAL8::Emissive had no visible effect at all --
+  // e.g. self-lit signs/headlights/instrument panels that rely on emissive
+  // to stay visible in the dark rendered exactly as dark as their
+  // surroundings.
+  diffuse_lighting = saturate(diffuse_lighting + ambient_lighting +
+                              emissive_color.rgb);
 
   return float4(diffuse_lighting, diffuse_color.a);
 }

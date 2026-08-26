@@ -3,6 +3,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "util.h"
@@ -23,6 +24,15 @@ class DescriptorPoolHeap {
   void Free(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void FreeAll();
 
+  // Descriptor slots are not reusable the moment their owner is destroyed:
+  // command lists already submitted still name them, and the GPU resolves a
+  // descriptor when it *executes* the draw, not when the draw was recorded.
+  // Free() therefore only parks a slot, stamped with the frame in flight;
+  // ReleaseCompleted() hands it back to the free list once the GPU has
+  // finished every frame that could still reference it.
+  void SetCurrentFrame(uint64_t frame) { current_frame_ = frame; }
+  void ReleaseCompleted(uint64_t completed_frame);
+
   D3D12_GPU_DESCRIPTOR_HANDLE GetGPUHandleFor(
       D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle) const;
 
@@ -31,6 +41,9 @@ class DescriptorPoolHeap {
  private:
   ComPtr<ID3D12DescriptorHeap> heap_;
   std::vector<intptr_t> free_list_;
+  // Slots whose owner is gone but which the GPU may still be reading.
+  std::vector<std::pair<uint64_t, intptr_t>> pending_free_;
+  uint64_t current_frame_ = 0;
 
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_ = {};
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_ = {};

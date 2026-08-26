@@ -74,8 +74,44 @@ DynamicRingBuffer::Allocation DynamicRingBuffer::Allocate(size_t num_bytes,
     FAIL("OOM: Could not allocate %zu bytes.", num_bytes);
   }
   ASSERT(alloc.offset + alloc.size <= (int)max_size_);
+#ifdef DX8TO12_ENABLE_VALIDATION
+  CheckForOverlap(alloc);
+  live_allocs_.push_back(alloc);
+#endif
   return alloc;
 }
+
+#ifdef DX8TO12_ENABLE_VALIDATION
+void DynamicRingBuffer::CheckForOverlap(const Allocation& alloc) {
+  const int new_lo = alloc.offset;
+  const int new_hi = alloc.offset + alloc.size;
+  // A real collision (two live allocations landing on the same bytes) can
+  // only happen between allocations close together in the ring, so it will
+  // always show up against a RECENT live allocation -- scanning the last
+  // 256 is enough to catch it without an O(total live count) walk every
+  // single allocation, which could slow the frame down enough to be the
+  // very thing that hides the race (see the HasCompletedFrame comment).
+  int checked = 0;
+  for (auto it = live_allocs_.rbegin();
+       it != live_allocs_.rend() && checked < 256; ++it, ++checked) {
+    const Allocation& live = *it;
+    const int live_lo = live.offset;
+    const int live_hi = live.offset + live.size;
+    if (new_lo < live_hi && live_lo < new_hi) {
+      static int overlap_lines = 0;
+      if (overlap_lines < 500) {
+        ++overlap_lines;
+        LOG(AixLog::Severity::error)
+            << "RINGBUF-COLLISION new{frame=" << alloc.frame
+            << " off=" << alloc.offset << " size=" << alloc.size
+            << "} overlaps live{frame=" << live.frame
+            << " off=" << live.offset << " size=" << live.size
+            << "} head=" << head_ << " tail=" << tail_ << "\n";
+      }
+    }
+  }
+}
+#endif
 
 char *DynamicRingBuffer::GetCpuPtrFor(Allocation alloc) {
   ASSERT(alloc.frame == current_frame_);
@@ -115,6 +151,15 @@ void DynamicRingBuffer::HasCompletedFrame(uint64_t frame) {
     // pointer.
     head_ = tail_;
   }
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // Prune allocations from frames that are now known GPU-complete -- same
+  // lifecycle as frame_heads_ above, just tracking individual allocations
+  // instead of per-frame boundaries so CheckForOverlap has something to
+  // compare against.
+  while (!live_allocs_.empty() && live_allocs_.front().frame <= frame) {
+    live_allocs_.pop_front();
+  }
+#endif
 }
 
 }  // namespace Dx8to12

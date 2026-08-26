@@ -4,6 +4,7 @@ private/
 dumps/
 build/
 build-x86/
+build-x86-release/
 
 # Game-specific binary analysis artifacts (not for the public repo).
 d3d8_calls_*.txt
@@ -58,3 +59,5 @@ readings.txt
 *.exe
 *.out
 *.app
+
+plan/

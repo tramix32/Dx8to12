@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "d3d8.h"
@@ -40,6 +41,35 @@ class Buffer : public IDirect3DVertexBuffer8,
   // buffers.
   virtual void PersistDynamicChanges();
   virtual GpuPtr GetGpuPtr();
+
+  // Diagnostic: is [offset, offset+size) memory this frame actually filled
+  // in, or is the GPU about to read whatever happened to be lying there? Only
+  // dynamic buffers can answer meaningfully -- a static buffer's contents are
+  // always valid, so the base returns true.
+  virtual bool IsRangeWrittenThisFrame(int /*offset*/, int /*size*/) {
+    return true;
+  }
+  // Diagnostic: CPU-readable pointer at `offset` into whatever memory the GPU
+  // will read for this draw, or nullptr if there isn't one. For an ordinary
+  // buffer that is its own mapped upload-heap allocation -- which is also the
+  // memory a *dynamic* buffer's draws read on every frame where the game
+  // appended with D3DLOCK_NOOVERWRITE without discarding first, so this base
+  // implementation covers roughly half of all locks and must not be skipped.
+  // Takes the size too: a diagnostic that reads past the end of whichever
+  // buffer it landed on is worse than no diagnostic, and the readable extent
+  // differs per path (discard cache, ring allocation, persistent resource).
+  virtual const char* DebugCpuPtr(int offset, int size) {
+    if (persistent_mapped_ptr_ == nullptr) return nullptr;
+    if (offset < 0 || size < 0 || offset + size > size_) return nullptr;
+    return reinterpret_cast<const char*>(persistent_mapped_ptr_) + offset;
+  }
+
+  // Diagnostic: which memory a draw off this buffer reads right now, and how
+  // it got there. A text batch reading vertex 0 is perfectly correct if the
+  // game just discarded and refilled the buffer, and catastrophic if it is
+  // instead seeing the previous frame's contents -- and the two are
+  // indistinguishable without knowing which path the buffer is on.
+  virtual std::string DebugState() { return "static"; }
 
   ID3D12Resource* resource();
   D3D12_RESOURCE_DESC resource_desc() const { return resource_desc_; }
@@ -173,8 +203,12 @@ class DynamicBuffer : public Buffer {
 
   void PersistDynamicChanges() override;
 
+  bool IsRangeWrittenThisFrame(int offset, int size) override;
+  const char* DebugCpuPtr(int offset, int size) override;
+  std::string DebugState() override;
+
  private:
-  void PersistSpeculativeWrite(int alloc_size);
+  void PersistSpeculativeWrite();
   void UpdateCbvForRingBuffer(int offset, int size);
 
   // We store the last dynamic write that the user has done. The vector is

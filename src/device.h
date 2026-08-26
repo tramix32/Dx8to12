@@ -497,6 +497,46 @@ class Device : public IDirect3DDevice8, RefCounted {
   // Last PSO actually bound on the command list (null after a command list
   // reset, which drops all pipeline state).
   ID3D12PipelineState *last_set_pso_ = nullptr;
+  // D3DRS_STENCILREF, like the viewport/scissor, is a dynamic per-draw value
+  // in D3D12 (OMSetStencilRef) rather than something baked into the PSO --
+  // see pso_key.rs.stencil_ref being zeroed in CreatePSO's key. -1 is not a
+  // legal 8-bit stencil ref, so it forces the first draw after any command
+  // list reset to actually issue the call instead of skipping it as
+  // redundant against a stale value from a previous, already-closed list.
+  int last_stencil_ref_ = -1;
+  // Per-stage "does this root descriptor table need rebinding" bits,
+  // mirroring DIRTY_FLAG_PS_TEXTURES/PS_SAMPLERS but at per-stage
+  // granularity -- those flags only say *some* stage's binding changed
+  // (SetTexture/SetTextureStageState don't know which slot a game will
+  // touch next), so without this every draw after any single SetTexture call
+  // rebound all kMaxTexStages (8) root descriptor tables -- one
+  // SetGraphicsRootDescriptorTable call each -- even for the 7 stages whose
+  // binding didn't change.
+  //
+  // Deliberately NOT implemented as "does bound_textures_[i] differ from
+  // whatever we bound last time" (comparing cached GpuTexture* or descriptor
+  // handles): both are heap-allocated identities that get freed and reused
+  // by an unrelated later object (GpuTexture via RefCounted's `delete this`,
+  // descriptor slots via DescriptorPoolHeap's free list -- the exact hazard
+  // the pending_free_ generation-based reclaim in pool_heap.cpp exists to
+  // manage on the *pool's* side, but does nothing to protect a cache held
+  // here). A texture destroyed and replaced by a new, unrelated one that
+  // happens to land at the same address/slot would compare equal to a stale
+  // cached value and wrongly skip the rebind, leaving the GPU sampling
+  // whatever the root table already pointed at. Tracking dirtiness as a bit
+  // set at the moment of mutation (SetTexture/SetTextureStageState) instead
+  // of inferred later by comparing identities sidesteps that class of bug
+  // entirely -- there is no stale value to alias against.
+  uint32_t dirty_texture_stage_mask_ = 0xFF;
+  uint32_t dirty_sampler_stage_mask_ = 0xFF;
+  // DIAGNOSTIC: the contiguous has-texture bitmask (matching CreatePSO's own
+  // stage_has_texture computation) at the moment last_pso_ was actually
+  // built. Compared every draw against the *current* live mask to catch a
+  // cached PSO/pixel-shader being reused for a draw whose texture-stage
+  // shape has since changed without DIRTY_FLAG_PSO having been raised for
+  // it -- the failure mode that would explain a draw silently getting an
+  // untextured pixel shader when a texture is actually bound.
+  uint32_t last_pso_texture_mask_ = 0;
 
   int ref_count_;
 
@@ -520,6 +560,16 @@ class Device : public IDirect3DDevice8, RefCounted {
   int current_back_buffer_ = 0;
   std::array<uint64_t, kNumBackBuffers> fence_values_ = {};
   uint64_t next_fence_ = 1;
+
+  // DIAGNOSTIC: counts every Draw*Primitive* entry (indexed/non-indexed,
+  // UP/non-UP), incremented before any early-return, so it reflects calls
+  // the game actually made regardless of whether the shim went on to submit
+  // anything. Reset and logged in SubmitAndWait so it can be compared
+  // against a RenderDoc capture's own draw count for the same frame -- if
+  // they match, a draw call missing from a capture was never issued by the
+  // game in the first place (not dropped by the shim); if the shim's count
+  // is higher, something in a Draw* early-return path is eating a real call.
+  uint64_t draw_calls_this_frame_ = 0;
 
   // TEMP DIAGNOSTIC: measuring how much of each frame's CPU time is spent
   // blocked in WaitForSingleObjectEx (waiting on the GPU fence) vs. actually
@@ -550,13 +600,43 @@ class Device : public IDirect3DDevice8, RefCounted {
   // fresh GetRenderTarget() call to still be valid/consistent with other
   // outstanding references. Returning a brand-new independently-refcounted
   // wrapper on every call breaks that assumption and can free the surface
-  // out from under a reference the game still expects to be live. Keyed by
-  // the backing texture pointer so a Reset() (which reallocates back
-  // buffers/depth-stencil) naturally invalidates the cache.
+  // out from under a reference the game still expects to be live.
+  //
+  // Keyed by bound_render_target_generation_ (bumped every SetRenderTarget
+  // call that actually reassigns bound_render_target_), not by the backing
+  // texture's raw pointer. A custom render target set via SetRenderTarget
+  // is *not* kept alive the way a texture actively bound for drawing is --
+  // MarkResourceAsUsed only runs at draw time (BeginScene/PrepareDrawCall),
+  // so a target that's set, queried once via GetRenderTarget, then swapped
+  // away before ever being drawn to can have its C++ wrapper destroyed
+  // (RefCounted::Release -> delete this) the moment the app also drops its
+  // own reference. A later, unrelated GpuTexture allocated at that same
+  // freed heap address would then compare equal to the stale cached
+  // pointer, handing back a wrapper around an already-destroyed resource --
+  // the same identity-reuse (ABA) hazard already found and fixed tonight
+  // for the texture-descriptor rebind cache (see dirty_texture_stage_mask_).
+  // A generation counter bumped at the point of mutation, rather than
+  // compared by identity after the fact, has no stale value to alias
+  // against. GetDepthStencilSurface/GetBackBuffer don't need the same
+  // treatment: they key off depth_stencil_tex_/back_buffers_[0], both of
+  // which are held alive by this Device for the whole session (only
+  // replaced, never destroyed-and-maybe-reused, at a Reset() boundary that
+  // already invalidates their caches unconditionally).
   ComPtr<BaseSurface> cached_render_target_surface_;
-  void *cached_render_target_surface_key_ = nullptr;
+  uint64_t cached_render_target_surface_key_ = 0;
+  uint64_t bound_render_target_generation_ = 1;
   ComPtr<BaseSurface> cached_depth_stencil_surface_;
   void *cached_depth_stencil_surface_key_ = nullptr;
+  // Same COM-identity requirement as the two caches above -- GetBackBuffer
+  // previously allocated a brand new BackbufferSurface wrapper on every
+  // call, so two calls at the same device state hand the app two distinct
+  // interface pointers to what's supposed to be the *same* object; anything
+  // that compares them for identity, or holds one past the other's Release
+  // expecting shared state, breaks. Keyed on back_buffers_[0].get() the same
+  // way GetRenderTarget's fallback case is, so a Reset() (which re-acquires
+  // the back buffers, changing the pointer) correctly invalidates this.
+  ComPtr<BaseSurface> cached_backbuffer_surface_;
+  void *cached_backbuffer_surface_key_ = nullptr;
 
   // Shader resources/handles.
   // TODO: Don't count shader references, instead make PSO own shaders and count
@@ -629,7 +709,19 @@ class Device : public IDirect3DDevice8, RefCounted {
   // Internal rendering resources.
 
   std::unordered_map<PSOState, ComPtr<ID3D12PipelineState>> pso_cache_;
-  std::unordered_map<PixelShaderState, ComPtr<ID3DBlob>> ps_cache_;
+  // Carries a NextShaderId() (vertex_shader.h) alongside the blob so
+  // PSOState.ps can key off a stable id here too, the same as it does for
+  // programmable pixel shaders (PixelShader::unique_id) -- see NextShaderId's
+  // comment for why a raw ID3DBlob* isn't safe to use as that key. This
+  // specific cache never evicts, so its own blobs' addresses never actually
+  // get reused -- but pso_key.ps has to be one consistent kind of value
+  // regardless of which of the two pixel-shader paths (this cache, or a
+  // programmable PixelShader) produced it.
+  struct CachedPixelShader {
+    ComPtr<ID3DBlob> blob;
+    uint64_t id = NextShaderId();
+  };
+  std::unordered_map<PixelShaderState, CachedPixelShader> ps_cache_;
   std::unordered_map<SamplerDesc, D3D12_GPU_DESCRIPTOR_HANDLE> sampler_cache_;
 
   enum DirtyFlags : uint32_t {

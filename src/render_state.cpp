@@ -193,7 +193,15 @@ PixelShaderState::PixelShaderState(
                               .texcoord_index = stage.texcoord_index,
                               .transform_flags = stage.transform_flags,
                               .color_arg0 = stage.color_arg0,
-                              .alpha_arg0 = stage.alpha_arg0};
+                              .alpha_arg0 = stage.alpha_arg0,
+                              // D3DTSS_RESULTARG: which register this
+                              // stage's output goes to now actually affects
+                              // the generated shader (ff_pixel_shader.cpp),
+                              // so it has to be part of the PSO key like
+                              // every other field in this list -- previously
+                              // omitted here (despite being tracked in
+                              // TextureStageState) since nothing consumed it.
+                              .result_arg = stage.result_arg};
     if (stage.alpha_arg1 == D3DTA_TEXTURE && !stage_has_texture[i]) {
       // Default argument is DIFFUSE if no texture is set.
       ts[i].alpha_arg1 = D3DTA_DIFFUSE;
@@ -276,15 +284,10 @@ size_t std::hash<Dx8to12::PSOState>::operator()(
   using ::Dx8to12::MurmurHashTo32;
   using ::Dx8to12::RenderState;
 
-  // `&pso_state.vs`/`&pso_state.ps`, not `pso_state.vs`/`pso_state.ps` --
-  // these are meant to hash the *pointer value* (an opaque per-shader
-  // identity), not the bytes at the address the pointer points to. Passing
-  // the pointer itself made MurmurHashTo32 read sizeof(pointer) bytes from
-  // inside the pointed-to ID3DBlob (effectively its vtable pointer, which is
-  // identical across every ID3DBlob instance), so every PSOState's vs/ps
-  // terms collapsed to nearly the same hash contribution regardless of which
-  // shader was actually bound -- silently degrading pso_cache_ into mostly
-  // linear buckets keyed on `rs` alone.
+  // vs/ps are NextShaderId() values (see PSOState's comment, render_state.h)
+  // -- opaque per-shader identity numbers, not pointers. Hashing
+  // &pso_state.vs/&pso_state.ps here just reads the 8 bytes of each uint64_t
+  // field directly, same as any other fixed-size field below.
   uint32_t hash_elements[] = {
       std::hash<RenderState>()(pso_state.rs),
       MurmurHashTo32(&pso_state.vs, sizeof(pso_state.vs)),

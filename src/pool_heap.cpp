@@ -29,7 +29,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE DescriptorPoolHeap::Allocate() {
   ASSERT(heap_);
   ASSERT(!free_list_.empty());
   if (free_list_.empty()) return {};
-  int back = free_list_.back();
+  // Was `int back` -- a descriptor handle truncated to 32 bits. Harmless in
+  // this x86-only build, where SIZE_T is 32 bits anyway, but silently wrong
+  // the moment anything is built for x64.
+  intptr_t back = free_list_.back();
   free_list_.pop_back();
   return {.ptr = static_cast<size_t>(back)};
 }
@@ -37,10 +40,33 @@ D3D12_CPU_DESCRIPTOR_HANDLE DescriptorPoolHeap::Allocate() {
 void DescriptorPoolHeap::Free(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   const ptrdiff_t diff = static_cast<ptrdiff_t>(handle.ptr - cpu_start_.ptr);
   ASSERT(diff >= 0 && diff < num_descriptors_ * increment_);
-  free_list_.push_back(handle.ptr);
+  // Park it rather than returning it to the free list. Allocate() pops from
+  // the back, so a slot freed here used to be handed straight to the very next
+  // texture created, which then wrote its own view over a descriptor that
+  // command lists still in flight were pointing at -- the GPU would reach
+  // those draws and sample whatever texture had since claimed the slot. That
+  // is a use-after-free of a descriptor, and it is what put the font atlas
+  // over the menu background when GTA: Vice City swapped the radio-station
+  // artwork: the outgoing station's texture was destroyed and the next
+  // texture created took its slot while the previous frame was still being
+  // rendered.
+  pending_free_.push_back({current_frame_, handle.ptr});
+}
+
+void DescriptorPoolHeap::ReleaseCompleted(uint64_t completed_frame) {
+  size_t keep = 0;
+  for (size_t i = 0; i < pending_free_.size(); ++i) {
+    if (pending_free_[i].first <= completed_frame) {
+      free_list_.push_back(pending_free_[i].second);
+    } else {
+      pending_free_[keep++] = pending_free_[i];
+    }
+  }
+  pending_free_.resize(keep);
 }
 
 void DescriptorPoolHeap::FreeAll() {
+  pending_free_.clear();
   free_list_.clear();
   for (int i = num_descriptors_ - 1; i >= 0; --i) {
     free_list_.push_back(cpu_start_.ptr + i * increment_);

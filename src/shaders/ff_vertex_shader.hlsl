@@ -25,8 +25,18 @@ FFVertexOutput VSMain(VertexInput IN) {
   OUT.oViewPos = view_pos;
   OUT.oViewNormal = view_normal;
   OUT.oViewReflect = normalize(reflect(view_pos, view_normal));
-  vertex_diffuse = ComputeLighting(view_pos, view_normal, vertex_diffuse,
-                                   vertex_specular, specular_lighting);
+  // This call used to be unconditional, so geometry with a normal stream
+  // got lit even with D3DRS_LIGHTING == FALSE -- the no-normal branch below
+  // already respected the flag (it has its own lighting_enabled check), but
+  // this, the far more common branch (any mesh with normals -- most world
+  // geometry, including roads), did not. A model authored to be unlit (flat
+  // baked vertex colors, D3DRS_LIGHTING off) got re-lit by whatever the
+  // scene's lights/ambient happened to be instead of showing its own colors.
+  if (lighting_enabled) {
+    vertex_diffuse = ComputeLighting(view_pos, view_normal, vertex_diffuse,
+                                     vertex_specular, specular_lighting);
+  }
+  OUT.oFog = ComputeFogFactor(length(view_pos));
 #else
   // No normal stream, so per-light diffuse/specular can't be computed (their
   // formulas need a surface orientation) -- but ambient lighting doesn't
@@ -36,14 +46,25 @@ FFVertexOutput VSMain(VertexInput IN) {
   // Without this, meshes with baked-black/dark vertex colors and no normals
   // (common for unlit-looking static geometry) rendered solid black instead
   // of getting lit by the scene's ambient term.
+  float3 view_pos = mul(world_view, float4(IN.input_reg0, 1.f)).xyz;
   if (lighting_enabled) {
-    float3 view_pos = mul(world_view, float4(IN.input_reg0, 1.f)).xyz;
     float4 unused_specular;
     vertex_diffuse = ComputeLighting(view_pos, float3(0, 0, 0), vertex_diffuse,
                                      vertex_specular, unused_specular);
   }
+  OUT.oFog = ComputeFogFactor(length(view_pos));
 #endif
 #else
+  // Pretransformed (XYZRHW) vertices are already in screen space, with no
+  // notion of eye-space distance to fog by -- and real D3D8 does not fog
+  // these unless the app supplies a per-vertex fog value via D3DFVF_XYZRHW's
+  // packed fog/specular field, which this shim doesn't forward. 1 = the
+  // vertex's own color, unaffected -- otherwise this stayed at the
+  // zero-initialized OUT's default of 0 (fully replaced by fog_color), and
+  // any 2D UI drawn while fog was still enabled from a prior 3D scene (fog
+  // render states are sticky, not reset between draws) would render solid
+  // fog-colored quads instead of menu content.
+  OUT.oFog = 1.f;
   OUT.oPos = IN.input_reg0;
   OUT.oPos.xy = (OUT.oPos.xy + 0.5f) * inv_viewport_size - 1.f;
   OUT.oPos.y *= -1.f;

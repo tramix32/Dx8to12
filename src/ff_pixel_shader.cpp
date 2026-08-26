@@ -16,8 +16,19 @@ constexpr char kPixelHeader[] = R"(
 
 static void GenerateArgValue(int stage_index, const TextureStageState &ts,
                              DWORD color_arg, std::stringstream &ss) {
-  ASSERT((color_arg & D3DTA_ALPHAREPLICATE) == 0);
   ASSERT(!HasFlag(ts.transform_flags, D3DTTFF_PROJECTED));
+  // D3DTA_ALPHAREPLICATE: use this argument's alpha channel, broadcast to
+  // all four components, instead of its color. A real (if apparently rare --
+  // never observed triggering the ASSERT this used to be, across every
+  // session so far) D3D8 technique for feeding an alpha value (commonly a
+  // texture's alpha channel) into a *color* operation, e.g. tinting by
+  // opacity. `1.f - X.aaaa` and `(1.f - X).aaaa` are the same value --
+  // subtraction and a single-component-replicating swizzle both apply
+  // per-component/independently of the others -- so it doesn't matter
+  // whether this wraps the argument before or after D3DTA_COMPLEMENT's
+  // "1.f - " prefix; applying it at the very end, after everything else
+  // below, keeps this one line the only thing that changes for this flag.
+  const bool alpha_replicate = HasFlag(color_arg, D3DTA_ALPHAREPLICATE);
   ss << "(";
   if (HasFlag(color_arg, D3DTA_COMPLEMENT)) ss << "1.f - ";
   switch (color_arg & D3DTA_SELECTMASK) {
@@ -66,10 +77,17 @@ static void GenerateArgValue(int stage_index, const TextureStageState &ts,
     case D3DTA_SPECULAR:
       ss << "specular_color";
       break;
+    case D3DTA_TEMP:
+      // See D3DTSS_RESULTARG (PSMain's temp_color declaration, and the
+      // write-target selection in ApplyOperation below) -- this reads
+      // whatever an earlier stage most recently redirected there.
+      ss << "temp_color";
+      break;
     default:
       FAIL("Unsupported texture stage arg 0x%X", color_arg);
   }
   ss << ")";
+  if (alpha_replicate) ss << ".aaaa";
 }
 
 static void ApplyOperation(const PixelShaderState &s, const char *components,
@@ -112,7 +130,15 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
     default:
       break;
   }
-  ss << "result_color." << components << " = (";
+  // D3DTSS_RESULTARG redirect (see temp_color's declaration in
+  // CreatePixelShaderFromState). Only the *write* target changes -- every
+  // GenerateArgValue call above and D3DTOP_BLENDCURRENTALPHA's read just
+  // above both reference "current" (result_color) unconditionally, which is
+  // correct: they mean the running main-chain accumulator regardless of
+  // where *this* stage's own output is about to go.
+  const char *write_target =
+      s.ts[stage].result_arg == D3DTA_TEMP ? "temp_color" : "result_color";
+  ss << write_target << "." << components << " = (";
   switch (op) {
     case D3DTOP_SELECTARG1:
       ss << "arg1";
@@ -187,6 +213,15 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
   ss << "float4 specular_color = IN.oD1;" << endl;
 
   ss << "float4 result_color = diffuse_color;" << endl;
+  // D3DTSS_RESULTARG: a stage can redirect its output to this side register
+  // (D3DTA_TEMP) instead of the implicit "current" (result_color) chain that
+  // feeds the next stage -- e.g. computing an auxiliary value mid-chain
+  // without disturbing the main accumulator, then referencing it explicitly
+  // via D3DTA_TEMP from a later stage. Zero-initialized: D3D8 doesn't define
+  // what D3DTA_TEMP reads as before any stage has written it, and a game
+  // that reads it in that state already has undefined behavior on real
+  // hardware too -- zero is as reasonable a value as any to give it here.
+  ss << "float4 temp_color = 0;" << endl;
   ss << "float4 arg0, arg1, arg2;" << endl;
   ss << "float alpha;" << endl;
 
@@ -229,6 +264,15 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
       }
     }
   }
+  // Fog blend. Real D3D8 fog blends into color *after* the texture-stage
+  // chain and does not touch alpha, hence rgb-only and placed here, ahead of
+  // the alpha test below (which reads result_color.a, untouched by this).
+  // IN.oFog is 1 (this pixel's own color, unaffected) unless the vertex
+  // shader computed an actual fog factor -- see ComputeFogFactor in
+  // common.hlsl and its callers in ff_vertex_shader.hlsl.
+  ss << "result_color.rgb = lerp(fog_color.rgb, result_color.rgb, "
+       "IN.oFog);"
+     << endl;
   if (s.alpha_func() != D3DCMP_ALWAYS) {
     ss << "if (!(result_color.a ";
     switch (s.alpha_func()) {

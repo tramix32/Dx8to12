@@ -52,5 +52,19 @@ class DynamicRingBuffer {
   uint64_t current_frame_ = 0;
 
   const uint32_t min_align_ = 256;
+
+  // DIAGNOSTIC: head_/tail_ arithmetic is supposed to make two live
+  // allocations' byte ranges overlap impossible, but this exact class of bug
+  // has bitten this file before (see the HasCompletedFrame comment) and,
+  // per that comment, is a timing-sensitive race that hides under a
+  // debugger or heavy logging -- exactly the conditions every earlier
+  // RenderDoc-driven audit of this bug ran under. Rather than trust the
+  // arithmetic, verify it directly: track every allocation not yet known to
+  // be GPU-complete and flag any new one whose byte range overlaps a still
+  // "live" one, which the arithmetic should make structurally impossible.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  std::deque<Allocation> live_allocs_;
+  void CheckForOverlap(const Allocation& alloc);
+#endif
 };
 }  // namespace Dx8to12

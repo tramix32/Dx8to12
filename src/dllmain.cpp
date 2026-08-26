@@ -143,6 +143,38 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                                   LogCrashAndContinueSearch);
       LOG(AixLog::Severity::info)
           << "DLL_PROCESS_ATTACH on thread " << GetCurrentThreadId() << "\n";
+      // Build stamp. A log is only evidence about the code that produced it,
+      // and "was the DLL under test actually the one the game loaded?" has
+      // already cost a full debugging round-trip once. Compare this against
+      // the build you just made before drawing any conclusion from a log.
+      {
+        // Report the DLL file's own last-write time, not __DATE__/__TIME__.
+        // Those expand when *this translation unit* is compiled, so an
+        // incremental build that only recompiles other files leaves the stamp
+        // frozen at an older time -- which already once made a correctly
+        // deployed DLL look like a stale one. The file timestamp cannot drift
+        // from the binary that is actually loaded.
+        wchar_t path[MAX_PATH] = {};
+        WIN32_FILE_ATTRIBUTE_DATA attr = {};
+        SYSTEMTIME st = {};
+        if (GetModuleFileNameW(hModule, path, MAX_PATH) &&
+            GetFileAttributesExW(path, GetFileExInfoStandard, &attr) &&
+            FileTimeToSystemTime(&attr.ftLastWriteTime, &st)) {
+          char stamp[64];
+          snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                   st.wSecond);
+          LOG(AixLog::Severity::info)
+              << "Dx8to12 binary written " << stamp << " (compiled " __DATE__
+                 " " __TIME__
+#ifdef DX8TO12_ENABLE_VALIDATION
+                 ", dev: validation+trace)"
+#else
+                 ", release: no validation)"
+#endif
+                 "\n";
+        }
+      }
       Dx8to12::LoadConfig(hModule);
       break;
     case DLL_THREAD_ATTACH:

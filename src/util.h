@@ -89,12 +89,24 @@ class ComPtr {
   // Copies an existing ComPtr. Calls AddRef on the internal pointer.
   ComPtr(const ComPtr &copy) : ptr_(copy.ptr_) { AddRef(); }
   ComPtr &operator=(const ComPtr &assign) {
+    // Self-assignment guard -- see InternalPtr::operator= (same file) for
+    // the full reasoning. Without it, `x = x` (or an alias resolving to the
+    // same slot) calls Reset() on this object's *only* reference to itself
+    // before re-reading assign.ptr_, which has by then already been zeroed
+    // by that same Reset() -- silently releasing (and potentially deleting)
+    // the object and leaving ptr_ null, rather than a no-op. ComPtr wraps
+    // essentially every raw D3D12/COM object in this codebase, so this
+    // guard is cheap insurance against exactly the class of "a resource
+    // slot ends up holding something unrelated" symptom this session has
+    // spent a lot of time chasing elsewhere.
+    if (this == &assign) return *this;
     Reset();
     ptr_ = assign.ptr_;
     AddRef();
     return *this;
   }
   ComPtr &operator=(ComPtr &&assign) {
+    if (this == &assign) return *this;
     Reset();
     ptr_ = assign.ptr_;
     assign.ptr_ = nullptr;
@@ -177,12 +189,30 @@ class InternalPtr {
   ~InternalPtr() { Reset(); }
 
   InternalPtr &operator=(const InternalPtr &other) {
+    // Self-assignment (`x = x`, or through an alias -- e.g. two parameters
+    // of a generic helper resolving to the same slot in a container of
+    // InternalPtr) previously corrupted the refcount instead of being a
+    // no-op: Reset() below drops this object's ref *first*, which for a
+    // self-assignment means dropping the *only* remaining reference to
+    // `other` too, since it's the same wrapper -- deleting the pointee out
+    // from under both sides -- and then re-reads other.ptr_ *after* Reset()
+    // already zeroed it, so ptr_ ends up null regardless of whether the
+    // delete fired. A real-D3D8 "this texture's descriptor slot is now
+    // holding a completely different, unrelated texture's data" symptom is
+    // exactly what silently deleting-and-nulling a live binding out from
+    // under itself would produce, so this check is cheap insurance even
+    // without having pinned down a concrete call site that hits it.
+    if (this == &other) return *this;
     Reset();
     ptr_ = other.ptr_;
     AddRef();
     return *this;
   }
   InternalPtr &operator=(InternalPtr &&other) {
+    // Self-move (`x = std::move(x)`) has the same hazard as self-copy above
+    // -- Reset() would drop the reference out from under `other` before the
+    // subsequent reads, since they're the same object.
+    if (this == &other) return *this;
     Reset();
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;

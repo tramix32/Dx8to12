@@ -26,7 +26,40 @@ cbuffer PixelGlobals : register(b1) {
   float material_power;
   float alpha_ref;
   float4 texture_factor;
+  // Fog. See the comment on PixelCBuffer::fog_enable (vertex_shader.h) for
+  // why these are runtime cbuffer values rather than shader-permutation
+  // constants.
+  int fog_enable;
+  int fog_mode;  // D3DFOGMODE: NONE=0, EXP=1, EXP2=2, LINEAR=3.
+  float fog_start;
+  float fog_end;
+  float fog_density;
+  float4 fog_color;
 };
+
+#define D3DFOG_NONE 0
+#define D3DFOG_EXP 1
+#define D3DFOG_EXP2 2
+#define D3DFOG_LINEAR 3
+
+// Vertex fog factor from eye-space distance: 1 = object's own color, 0 =
+// fully replaced by fog_color. Matches the D3D8/9 fixed-function fog
+// equations (Direct3D docs, "Fog Formulas").
+float ComputeFogFactor(float eye_dist) {
+  if (!fog_enable) return 1.f;
+  if (fog_mode == D3DFOG_EXP) return saturate(exp(-fog_density * eye_dist));
+  if (fog_mode == D3DFOG_EXP2) {
+    float d = fog_density * eye_dist;
+    return saturate(exp(-d * d));
+  }
+  if (fog_mode == D3DFOG_LINEAR) {
+    return saturate((fog_end - eye_dist) / max(fog_end - fog_start, 1e-5f));
+  }
+  // D3DFOG_NONE with fog_enable set: D3D8 allows FOGENABLE with both
+  // FOGTABLEMODE and FOGVERTEXMODE at NONE, which real hardware treats as no
+  // fog rather than a degenerate case.
+  return 1.f;
+}
 
 struct FFVertexOutput {
   float4 oPos : SV_POSITION;

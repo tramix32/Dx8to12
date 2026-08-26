@@ -639,7 +639,8 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // runs. Repeated Reset() calls then permanently burn one dsv_heap_/
   // rtv_heap_ slot each, eventually exhausting the 32-slot pool.
   cached_render_target_surface_.Reset();
-  cached_render_target_surface_key_ = nullptr;
+  cached_render_target_surface_key_ = 0;
+  ++bound_render_target_generation_;
   cached_depth_stencil_surface_.Reset();
   cached_depth_stencil_surface_key_ = nullptr;
   bound_render_target_.Reset();
@@ -721,6 +722,9 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // state bound.
   root_sig_bound_ = false;
   last_set_pso_ = nullptr;
+  last_stencil_ref_ = -1;
+  dirty_texture_stage_mask_ = 0xFF;
+  dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
   // Everything the renderer thinks is bound was dropped along with the old
   // command list -- including the descriptor heaps, which only BeginScene
@@ -1015,8 +1019,15 @@ Device::GetBackBuffer(UINT BackBuffer, D3DBACKBUFFER_TYPE Type,
   ASSERT(Type == D3DBACKBUFFER_TYPE_MONO);
   ASSERT(BackBuffer == 0);
   ASSERT(ppBackBuffer);
-  *ppBackBuffer =
-      new BackbufferSurface(this, BackBuffer, back_buffers_[0].get());
+  // COM identity: see the comment on cached_backbuffer_surface_ (device.h).
+  void *key = back_buffers_[0].get();
+  if (!cached_backbuffer_surface_ || cached_backbuffer_surface_key_ != key) {
+    cached_backbuffer_surface_ = ComOwn<BaseSurface>(
+        new BackbufferSurface(this, BackBuffer, back_buffers_[0].get()));
+    cached_backbuffer_surface_key_ = key;
+  }
+  cached_backbuffer_surface_->AddRef();
+  *ppBackBuffer = cached_backbuffer_surface_.get();
   return S_OK;
 }
 
@@ -1230,8 +1241,14 @@ void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
   // resource state change, so multiple times per draw in typical scenes)
   // that this was worth gating explicitly rather than assuming the sink
   // threshold alone would make it free.
+  // std::dec at the end: see the matching comment in buffer.cpp (search
+  // "Using backing buffer") -- AixLog's shared std::clog streambuf means an
+  // unreset std::hex here leaks into every other LOG() call process-wide,
+  // even though this specific line is TRACE-level and normally filtered out
+  // before ever reaching a sink.
   LOG(TRACE) << "Transitioning " << std::hex << texture << "From "
-             << texture->current_state() << " to " << state_after << "\n";
+             << texture->current_state() << " to " << state_after << std::dec
+             << "\n";
 #endif
 
   D3D12_RESOURCE_BARRIER barrier{
@@ -1707,13 +1724,78 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
   // through to the old behavior rather than skipping a real change.
   DWORD &state_slot = render_state_.GetEnumAtIndex(State);
   if (state_slot == Value) return S_OK;
+  // DIAGNOSTIC: a mesh chunk was confirmed via RenderDoc's PixelHistory to
+  // be legitimately backface-culled (not a missing/dropped draw call) while
+  // sitting inside a run of otherwise-identical CullMode=Back draws, right
+  // before a later run of the same batch switches to CullMode=NoCull -- so
+  // the game clearly does vary D3DRS_CULLMODE within this sequence. This
+  // logs every real change so the next repro can show whether that specific
+  // draw actually got the cull mode the game had just set, or a stale one.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (State == D3DRS_CULLMODE) {
+    static uint64_t cullmode_seq = 0;
+    ++cullmode_seq;
+    LOG(AixLog::Severity::error)
+        << "SETCULLMODE seq=" << cullmode_seq << " frame=" << CurrentFrame()
+        << " was=" << state_slot << " now=" << Value << "\n";
+  }
+#endif
   state_slot = Value;
-  // Every render state is part of the PSO key (PSOState embeds the whole
-  // RenderState), so any real change invalidates the cached lookup.
-  dirty_flags_ |= DIRTY_FLAG_PSO;
+  // Every render state is part of the PSO key by default (PSOState embeds
+  // the whole RenderState) -- *except* the fields CreatePSO's own key-
+  // normalization block (its "Zero out/normalize..." comment) explicitly
+  // resets to a fixed value before hashing/looking up the cache, because
+  // they don't influence the built D3D12_GRAPHICS_PIPELINE_STATE_DESC or
+  // which shader gets selected -- they're consumed at draw time from a
+  // cbuffer by whichever PSO is *already* bound (see the PS_CBUFFER/LIGHTS
+  // cases in the switch below). Setting DIRTY_FLAG_PSO for those anyway
+  // forced a full CreatePSO hash+compare (over a kilobyte of RenderState+
+  // PixelShaderState, per CreatePSO's own comment) on the next draw for a
+  // PSO that was always going to come back byte-identical -- exactly the
+  // kind of state a foliage/decal-heavy scene changes constantly
+  // (D3DRS_ALPHAREF per-material, fog toggles, TEXTUREFACTOR). This list
+  // must stay a subset of CreatePSO's normalization block, not grow beyond
+  // it -- excluding something PSO-relevant here would mean a stale PSO gets
+  // reused instead of rebuilt, which is a correctness bug (wrong pipeline
+  // state silently applied), not just a missed optimization. When in
+  // doubt, leave a state out of this list; the default below still marks
+  // PSO dirty.
+  switch (State) {
+    case D3DRS_TEXTUREFACTOR:
+    case D3DRS_AMBIENT:
+    case D3DRS_DIFFUSEMATERIALSOURCE:
+    case D3DRS_SPECULARMATERIALSOURCE:
+    case D3DRS_AMBIENTMATERIALSOURCE:
+    case D3DRS_EMISSIVEMATERIALSOURCE:
+    case D3DRS_ALPHAREF:
+    case D3DRS_DITHERENABLE:
+    case D3DRS_FOGENABLE:
+    case D3DRS_FOGCOLOR:
+    case D3DRS_FOGTABLEMODE:
+    case D3DRS_FOGSTART:
+    case D3DRS_FOGEND:
+    case D3DRS_FOGDENSITY:
+    case D3DRS_RANGEFOGENABLE:
+    case D3DRS_FOGVERTEXMODE:
+    case D3DRS_COLORVERTEX:
+    case D3DRS_STENCILREF:
+    case D3DRS_LOCALVIEWER:
+    case D3DRS_NORMALIZENORMALS:
+      break;
+    default:
+      dirty_flags_ |= DIRTY_FLAG_PSO;
+      break;
+  }
   switch (State) {
     case D3DRS_TEXTUREFACTOR:
     case D3DRS_ALPHAREF:
+    case D3DRS_FOGENABLE:
+    case D3DRS_FOGCOLOR:
+    case D3DRS_FOGTABLEMODE:
+    case D3DRS_FOGVERTEXMODE:
+    case D3DRS_FOGSTART:
+    case D3DRS_FOGEND:
+    case D3DRS_FOGDENSITY:
       dirty_flags_ |= DIRTY_FLAG_PS_CBUFFER;
       break;
     case D3DRS_LIGHTING:
@@ -1721,6 +1803,7 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
     case D3DRS_DIFFUSEMATERIALSOURCE:
     case D3DRS_AMBIENTMATERIALSOURCE:
     case D3DRS_SPECULARMATERIALSOURCE:
+    case D3DRS_EMISSIVEMATERIALSOURCE:
     case D3DRS_AMBIENT:
     case D3DRS_SPECULARENABLE:
     case D3DRS_NORMALIZENORMALS:
@@ -1756,12 +1839,38 @@ HRESULT STDMETHODCALLTYPE Device::SetTextureStageState(
       texture_stage_states_[Stage].GetAtIndex(static_cast<size_t>(Type));
   if (stage_slot == Value) return S_OK;
   stage_slot = Value;
-  // Texture stage state drives fixed-function pixel shader generation, which
-  // is part of the PSO key.
-  dirty_flags_ |= DIRTY_FLAG_PSO;
+  // Only the fields PixelShaderState::PixelShaderState (render_state.cpp)
+  // actually copies into ts[i] feed fixed-function pixel shader generation --
+  // color/alpha op+args+arg0, the texcoord index/transform flags, and the
+  // result-register redirect. The addressing/filtering/anisotropy/border-
+  // color/LOD-bias states below drive
+  // the *sampler* only (see the D3DTSS_ADDRESSU..MAXANISOTROPY branch), never
+  // shader selection, so marking DIRTY_FLAG_PSO for those forced a PSO
+  // cache hash+lookup (over a kilobyte of RenderState+PixelShaderState, per
+  // CreatePSO's call-site comment) on every SetTextureStageState regardless
+  // of which field changed -- most commonly hit through filtering/anisotropy
+  // toggles that never once change what shader a draw needs.
+  switch (Type) {
+    case D3DTSS_COLOROP:
+    case D3DTSS_COLORARG0:
+    case D3DTSS_COLORARG1:
+    case D3DTSS_COLORARG2:
+    case D3DTSS_ALPHAOP:
+    case D3DTSS_ALPHAARG0:
+    case D3DTSS_ALPHAARG1:
+    case D3DTSS_ALPHAARG2:
+    case D3DTSS_TEXCOORDINDEX:
+    case D3DTSS_TEXTURETRANSFORMFLAGS:
+    case D3DTSS_RESULTARG:
+      dirty_flags_ |= DIRTY_FLAG_PSO;
+      break;
+    default:
+      break;
+  }
   if ((Type >= D3DTSS_ADDRESSU && Type <= D3DTSS_MAXANISOTROPY) ||
       Type == D3DTSS_ADDRESSW) {
     dirty_flags_ |= DIRTY_FLAG_PS_SAMPLERS;
+    dirty_sampler_stage_mask_ |= (1u << Stage);
   }
   return S_OK;
 }
@@ -2008,6 +2117,25 @@ void Device::ApplyState(const StateBlock &block) {
   // Force everything above to actually get re-bound/re-uploaded before the
   // next draw call, since we just changed it out from under the renderer.
   dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
+  // DIRTY_FLAG_ALL_RESOURCES alone is not enough for textures/samplers: the
+  // actual root-descriptor-table rebind loop (PrepareDrawCall) gates on the
+  // separate dirty_texture_stage_mask_/dirty_sampler_stage_mask_ bitmasks
+  // (added later than this function, to fix a different bug -- see their
+  // comment in device.h), which SetTexture/SetTextureStageState keep in
+  // sync but this function never touched. bound_textures_/
+  // texture_stage_states_ just got reassigned directly above, completely
+  // bypassing both of those setters, so without this the two masks stay
+  // however a *previous*, unrelated draw last left them -- typically all
+  // zero, right after any prior draw's own rebind cleared them. The dirty
+  // *flag* would then be set, but the rebind loop's own per-stage mask check
+  // would skip every single stage, so bound_textures_ ends up logically
+  // correct while the GPU-visible descriptor tables silently keep pointing
+  // at whatever was bound before this call -- confirmed via RenderDoc as the
+  // cause of a UI panel rendering with the player's clothing/skin texture
+  // instead of its own (that panel's real texture binding was restored via
+  // a state block, exactly this path).
+  dirty_texture_stage_mask_ = 0xFF;
+  dirty_sampler_stage_mask_ = 0xFF;
 }
 
 HRESULT STDMETHODCALLTYPE Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type,
@@ -2112,26 +2240,76 @@ HRESULT STDMETHODCALLTYPE Device::SetTexture(DWORD Stage,
   }
   GpuTexture *texture = static_cast<GpuTexture *>(base_texture);
   // Redundant-set early-out. Re-binding the texture that's already bound to
-  // this stage would otherwise dirty DIRTY_FLAG_PS_TEXTURES and cost a full
-  // 8-stage descriptor-table rebind on the next draw for no change at all.
-  // Note InternalPtr::Get() asserts non-null, and both sides are legitimately
-  // null routinely here (a game unbinding an already-unbound stage), so read
-  // the current binding through the bool conversion rather than Get().
+  // this stage would otherwise dirty DIRTY_FLAG_PS_TEXTURES for no change at
+  // all. Note InternalPtr::Get() asserts non-null, and both sides are
+  // legitimately null routinely here (a game unbinding an already-unbound
+  // stage), so read the current binding through the bool conversion rather
+  // than Get().
   GpuTexture *const current_texture =
       bound_textures_[Stage] ? bound_textures_[Stage].Get() : nullptr;
   if (current_texture == texture) return S_OK;
+  // DIAGNOSTIC: full call history for stage 0. A RenderDoc capture only ever
+  // shows the *final* committed D3D12 state -- confirmed a UI panel (static
+  // buffer, XYZRHW) is genuinely bound to the player's clothing/skin atlas
+  // at draw time, but not *why*: whether the game itself never issued a real
+  // SetTexture for this panel (relying on sticky binding but not getting
+  // what it expected), or something dropped a call that did happen. That
+  // needs the actual call sequence, which only live logging can give. Kept
+  // generous (this is stage 0 specifically, not all 8, and past sessions'
+  // similarly-capped CREATETEX diagnostic survived full sessions fine).
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (Stage == 0) {
+    static uint64_t settex0_seq = 0;
+    // Every cap tried here so far has turned out too small: 3000 only
+    // reached frame 2432 (a repro needed frame 15579); the next cap, raised
+    // to 200000, still only reached frame 3970 -- 13 seconds into a session
+    // whose actual repro wasn't captured until roughly a minute in. There's
+    // no way to size a cap in advance since a repro's length isn't known
+    // until the session that needs it is already over, so this is
+    // deliberately uncapped -- every stage-0 SetTexture for the whole
+    // session, whatever that costs in log size.
+    ++settex0_seq;
+    LOG(AixLog::Severity::error)
+        << "SETTEX0 seq=" << settex0_seq << " frame=" << CurrentFrame()
+        << " was=" << current_texture << " now=" << texture;
+    if (texture) {
+      const D3D12_RESOURCE_DESC &d = texture->resource_desc();
+      LOG(AixLog::Severity::error)
+          << " w=" << d.Width << " h=" << d.Height
+          << " fmt=" << static_cast<int>(d.Format);
+    }
+    LOG(AixLog::Severity::error) << "\n";
+  }
+#endif
   bound_textures_[Stage] = InternalPtr(texture);
   dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
-  // Whether a stage has a texture at all feeds PixelShaderState (and so the
-  // generated shader), which is part of the PSO key.
-  dirty_flags_ |= DIRTY_FLAG_PSO;
+  dirty_texture_stage_mask_ |= (1u << Stage);
+  // Whether a stage *has* a texture at all feeds PixelShaderState (via
+  // stage_has_texture -- see its constructor in render_state.cpp), which is
+  // part of the PSO key. Swapping which specific texture is bound does not:
+  // the generated pixel shader only branches on presence/absence per stage,
+  // never on which texture object or format is there. Gating DIRTY_FLAG_PSO
+  // on that presence/absence actually flipping -- rather than setting it on
+  // every SetTexture unconditionally -- matters because it also drives
+  // CreatePSO's full RenderState+PixelShaderState hash/lookup (over a
+  // kilobyte, per the comment at its call site), and a scene with many
+  // objects swapping between different *already-bound-somewhere* textures
+  // every draw (traffic, pedestrians) was paying that on every single one
+  // for a PSO that, in the overwhelmingly common case, was already cached
+  // and unchanged.
+  if (!current_texture != !texture) dirty_flags_ |= DIRTY_FLAG_PSO;
   return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Device::GetTexture(DWORD Stage,
                                              IDirect3DBaseTexture8 **ppTexture) {
   if (Stage >= bound_textures_.size()) return D3DERR_INVALIDCALL;
-  GpuTexture *texture = bound_textures_[Stage].Get();
+  // InternalPtr::Get() asserts non-null; an unbound stage (no texture ever
+  // SetTexture'd there, or explicitly cleared) is a routine, legitimate
+  // state, not a caller error, so check via the bool conversion first --
+  // same reasoning as the identical fix already applied in SetTexture.
+  GpuTexture *texture =
+      bound_textures_[Stage] ? bound_textures_[Stage].Get() : nullptr;
   *ppTexture = static_cast<IDirect3DTexture8 *>(texture);
   if (texture) texture->AddRef();
   return S_OK;
@@ -2172,6 +2350,11 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
         return D3DERR_INVALIDCALL;
     }
     bound_render_target_ = InternalPtr(texture);
+    // See bound_render_target_generation_ (device.h) -- this is what
+    // GetRenderTarget's cache keys off instead of the texture pointer
+    // itself, to avoid an ABA hazard from a freed-and-reused GpuTexture
+    // address.
+    ++bound_render_target_generation_;
 
     // Reset viewport to the size of this one.
     D3DVIEWPORT8 viewport{.Width = safe_cast<DWORD>(resource_desc.Width),
@@ -2217,8 +2400,7 @@ HRESULT STDMETHODCALLTYPE Device::SetRenderTarget(
 
 HRESULT STDMETHODCALLTYPE
 Device::GetRenderTarget(IDirect3DSurface8 **ppRenderTarget) {
-  void *key = bound_render_target_ ? static_cast<void *>(bound_render_target_.Get())
-                                   : static_cast<void *>(back_buffers_[0].get());
+  const uint64_t key = bound_render_target_generation_;
   if (!cached_render_target_surface_ || cached_render_target_surface_key_ != key) {
     if (bound_render_target_) {
       cached_render_target_surface_ = ComOwn<BaseSurface>(
@@ -2418,7 +2600,11 @@ HRESULT STDMETHODCALLTYPE Device::SetStreamSource(
 HRESULT STDMETHODCALLTYPE Device::GetStreamSource(
     UINT StreamNumber, IDirect3DVertexBuffer8 **ppStreamData, UINT *pStride) {
   if (StreamNumber >= kMaxVertexStreams) return D3DERR_INVALIDCALL;
-  Buffer *buffer = bound_vertex_streams_[StreamNumber].Get();
+  // InternalPtr::Get() asserts non-null; an unbound stream is routine, not
+  // a caller error -- same fix as GetTexture/SetTexture (this file).
+  Buffer *buffer = bound_vertex_streams_[StreamNumber]
+                       ? bound_vertex_streams_[StreamNumber].Get()
+                       : nullptr;
   *ppStreamData = buffer;
   if (buffer) buffer->AddRef();
   *pStride = bound_vertex_stream_strides_[StreamNumber];
@@ -2427,6 +2613,24 @@ HRESULT STDMETHODCALLTYPE Device::GetStreamSource(
 
 HRESULT STDMETHODCALLTYPE Device::SetIndices(IDirect3DIndexBuffer8 *pIndexData,
                                              UINT BaseVertexIndex) {
+  // DIAGNOSTIC: bound_index_buffer_ has exactly one writer -- this function
+  // -- and nothing else in this class ever clears it (verified by grepping
+  // every use site). So DRAW-NO-INDEXBUFFER firing can only mean the app
+  // itself called SetIndices(NULL, ...) and then issued a draw before
+  // re-setting a real buffer, or never called SetIndices at all before that
+  // draw. Logging every transition to NULL here (paired with the frame
+  // number DRAW-NO-INDEXBUFFER already logs) settles which one it is on the
+  // first repro, instead of needing a follow-up build to find out.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (bound_index_buffer_ && pIndexData == nullptr) {
+    static int null_indices_lines = 0;
+    if (null_indices_lines < 100) {
+      ++null_indices_lines;
+      LOG(AixLog::Severity::error)
+          << "SETINDICES-NULL frame=" << CurrentFrame() << "\n";
+    }
+  }
+#endif
   bound_index_buffer_ = InternalPtr(static_cast<Buffer *>(pIndexData));
   bound_base_vertex_ = BaseVertexIndex;
   return S_OK;
@@ -2434,12 +2638,57 @@ HRESULT STDMETHODCALLTYPE Device::SetIndices(IDirect3DIndexBuffer8 *pIndexData,
 
 HRESULT STDMETHODCALLTYPE Device::GetIndices(
     IDirect3DIndexBuffer8 **ppIndexData, UINT *pBaseVertexIndex) {
-  Buffer *buffer = bound_index_buffer_.Get();
+  // InternalPtr::Get() asserts non-null. No index buffer bound is routine
+  // (confirmed this session: the game really does call SetIndices(NULL, ...)
+  // sometimes, via the SETINDICES-NULL diagnostic), not a caller error --
+  // same fix as GetTexture/SetTexture (this file).
+  Buffer *buffer = bound_index_buffer_ ? bound_index_buffer_.Get() : nullptr;
   *ppIndexData = buffer;
   if (buffer) buffer->AddRef();
   *pBaseVertexIndex = bound_base_vertex_;
   return S_OK;
 }
+
+namespace {
+// Real D3D8 has no separate alpha-blend state at all -- D3DRS_SRCBLEND/
+// DESTBLEND/BLENDOP apply uniformly to every channel, alpha included
+// (D3DRS_SEPARATEALPHABLENDENABLE and the SRCBLENDALPHA/DESTBLENDALPHA/
+// BLENDOPALPHA states are a D3D9 addition this API doesn't have). The PSO
+// below used to hardcode SrcBlendAlpha/DestBlendAlpha/BlendOpAlpha to
+// ONE/ZERO/ADD (an unconditional passthrough) regardless of what the app
+// set -- correct for on-screen backbuffer draws (nothing reads the
+// presented alpha), but wrong for anything rendering to an off-screen
+// target whose alpha channel is later sampled (menu blur/reflection
+// effects, per the RTV-format comment a few lines below -- this project
+// already assumes those exist). D3D12 requires the alpha slot's blend
+// factor to make sense as a scalar (it rejects D3D12_BLEND_SRC_COLOR/
+// DEST_COLOR/their INV_ variants there outright), so the four COLOR-family
+// D3DBLEND values can't just be copied across like the others are for
+// .SrcBlend/.DestBlend below -- each degenerates to its ALPHA counterpart
+// instead, since "use the source color as a per-channel factor" applied to
+// the alpha channel's own equation is exactly "use the source alpha".
+D3D12_BLEND D3D8BlendToAlphaBlend(D3DBLEND blend) {
+  switch (blend) {
+    case D3DBLEND_SRCCOLOR:
+      return D3D12_BLEND_SRC_ALPHA;
+    case D3DBLEND_INVSRCCOLOR:
+      return D3D12_BLEND_INV_SRC_ALPHA;
+    case D3DBLEND_DESTCOLOR:
+      return D3D12_BLEND_DEST_ALPHA;
+    case D3DBLEND_INVDESTCOLOR:
+      return D3D12_BLEND_INV_DEST_ALPHA;
+    default:
+      // Every other D3DBLEND value (ZERO, ONE, SRCALPHA, INVSRCALPHA,
+      // DESTALPHA, INVDESTALPHA, SRCALPHASAT) is numerically identical to
+      // its D3D12_BLEND counterpart -- the same fact .SrcBlend/.DestBlend
+      // below already rely on -- and is already legal in the alpha slot as-
+      // is (SRCALPHASAT is a scalar min(As,1-Ad) factor, not a per-channel
+      // one, so it's valid for alpha too; only the four *_COLOR variants
+      // above are D3D12-illegal there).
+      return static_cast<D3D12_BLEND>(blend);
+  }
+}
+}  // namespace
 
 ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   std::array<bool, kMaxTexStages> stage_has_texture = {};
@@ -2447,26 +2696,54 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
     stage_has_texture[i] = bound_textures_[i];
     if (!stage_has_texture[i]) break;
   }
+  // DIAGNOSTIC: stage 0 wants to sample a texture (ColorArg1/AlphaArg1 ==
+  // D3DTA_TEXTURE) but none is bound -- ff_pixel_shader.cpp's
+  // PixelShaderState constructor treats this exactly like ColorOp ==
+  // DISABLE, silently producing a shader with no texture reference at all.
+  // That is indistinguishable, from the compiled shader alone, from a
+  // legitimate untextured/flat-color draw -- which is why RenderDoc alone
+  // couldn't tell them apart. If this fires for the flat quad the game
+  // shows, the game itself is missing a SetTexture call it should have
+  // made, not this renderer dropping one.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (!stage_has_texture[0] &&
+      (texture_stage_states_[0].color_arg1 == D3DTA_TEXTURE ||
+       texture_stage_states_[0].alpha_arg1 == D3DTA_TEXTURE)) {
+    static int wants_tex0_lines = 0;
+    if (wants_tex0_lines < 50) {
+      ++wants_tex0_lines;
+      LOG(AixLog::Severity::error)
+          << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
+          << " colorop=" << texture_stage_states_[0].color_op
+          << " colorarg1=" << texture_stage_states_[0].color_arg1 << "\n";
+    }
+  }
+#endif
   ASSERT(bound_vertex_shader_ != 0);
   VertexShader *vertex_shader = vertex_shaders_.at(bound_vertex_shader_).Get();
   // If no pixel shader is bound, generate a fixed-function shader.
   ComPtr<ID3DBlob> pixel_shader;
+  uint64_t pixel_shader_id;
   if (bound_pixel_shader_ == 0) {
     // Try to find the fixed-function pixel shader in our cache.
     PixelShaderState key(render_state_, stage_has_texture.data(),
                          texture_stage_states_.data());
     auto iter = ps_cache_.find(key);
     if (iter != ps_cache_.end()) {
-      pixel_shader = iter->second;
+      pixel_shader = iter->second.blob;
+      pixel_shader_id = iter->second.id;
     } else {
-      pixel_shader = CreatePixelShaderFromState(key);
+      CachedPixelShader entry{.blob = CreatePixelShaderFromState(key)};
+      pixel_shader = entry.blob;
+      pixel_shader_id = entry.id;
       if (!kDisablePixelShaderCache)
-        ps_cache_.emplace_hint(iter, key, pixel_shader);
+        ps_cache_.emplace_hint(iter, key, std::move(entry));
     }
   } else {
     auto iter = pixel_shaders_.find(bound_pixel_shader_);
     ASSERT(iter != pixel_shaders_.end());
     pixel_shader = iter->second->blob;
+    pixel_shader_id = iter->second->unique_id;
   }
 
   // Matches the render target BeginScene actually binds via
@@ -2485,8 +2762,8 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   // Now that we know our pixel shader, try to look into the PSO cache.
   PSOState pso_key{
       .rs = render_state_,
-      .vs = vertex_shader->blob.get(),
-      .ps = pixel_shader.get(),
+      .vs = vertex_shader->unique_id,
+      .ps = pixel_shader_id,
       .prim_type = d3d8_prim_type,
       .dsv_format = bound_depth_target_
                         ? bound_depth_target_->resource_desc().Format
@@ -2523,6 +2800,13 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   pso_key.rs.range_fog_enable = 0;
   pso_key.rs.fog_vertex_mode = D3DFOG_NONE;
   pso_key.rs.color_vertex = 0;
+  // D3DRS_STENCILREF is dynamic (OMSetStencilRef, set per-draw below,
+  // outside the PSO) -- unlike the other stencil states just above it in
+  // DepthStencilState, D3D12 doesn't bake the reference value into the PSO
+  // at all, so leaving it in the key would fragment the cache with one
+  // identical PSO per distinct ref value ever used (stencil ref is commonly
+  // varied per-object for masking techniques).
+  pso_key.rs.stencil_ref = 0;
   pso_key.rs.local_viewer = FALSE;
   pso_key.rs.normalized_normals = FALSE;
 
@@ -2569,9 +2853,14 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                .SrcBlend = static_cast<D3D12_BLEND>(render_state_.src_blend),
                .DestBlend = static_cast<D3D12_BLEND>(render_state_.dest_blend),
                .BlendOp = static_cast<D3D12_BLEND_OP>(render_state_.blend_op),
-               .SrcBlendAlpha = D3D12_BLEND_ONE,
-               .DestBlendAlpha = D3D12_BLEND_ZERO,
-               .BlendOpAlpha = D3D12_BLEND_OP_ADD,
+               // See D3D8BlendToAlphaBlend's comment above: real D3D8 blends
+               // alpha with the same factors/op as color, not a fixed
+               // passthrough.
+               .SrcBlendAlpha = D3D8BlendToAlphaBlend(render_state_.src_blend),
+               .DestBlendAlpha =
+                   D3D8BlendToAlphaBlend(render_state_.dest_blend),
+               .BlendOpAlpha =
+                   static_cast<D3D12_BLEND_OP>(render_state_.blend_op),
                .LogicOp = D3D12_LOGIC_OP_NOOP,
                .RenderTargetWriteMask =
                    safe_cast<uint8_t>(render_state_.color_write_enable),
@@ -2608,6 +2897,69 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                   render_state_.zwrite_enable != 0),
               .DepthFunc =
                   static_cast<D3D12_COMPARISON_FUNC>(render_state_.z_func),
+              // Render states were tracked (SetRenderState/GetRenderState
+              // round-tripped correctly) but never actually reached a PSO --
+              // stencil testing was silently a no-op regardless of what the
+              // app requested, e.g. any stencil-masked multipass effect
+              // (mirrors, shadow volumes, portal/decal masking) drew as if
+              // D3DRS_STENCILENABLE were always FALSE.
+              //
+              // Also gated on the bound depth target's format actually
+              // *having* a stencil plane. D3DFMT_D32/D3DFMT_D16 both map to
+              // stencil-less DXGI formats (D32_FLOAT/D16_UNORM -- see
+              // DXGIFromD3DFormat, dx_utils.cpp), and D3D12 flatly rejects
+              // StencilEnable=true against a DSV format with no stencil
+              // component. GTA: Vice City always ends up on D24S8-family
+              // (which does carry stencil bits here, X8/X4S4's "unused
+              // bits" notwithstanding -- see the D3DFMT_D24* case in
+              // DXGIFromD3DFormat), so this hasn't been observed to fire in
+              // practice, but D3DRS_STENCILENABLE is app-controlled and
+              // independent of which depth format got created -- nothing
+              // stops a game from setting it while a stencil-less depth
+              // buffer happens to be bound, and the debug layer would flag
+              // it immediately (dev build) while a release build's driver
+              // behavior for the same PSO is undefined rather than merely
+              // "test always passes".
+              .StencilEnable =
+                  render_state_.stencil_enable != 0 &&
+                  bound_depth_target_ &&
+                  bound_depth_target_->resource_desc().Format ==
+                      DXGI_FORMAT_D24_UNORM_S8_UINT,
+              .StencilReadMask =
+                  static_cast<UINT8>(render_state_.stencil_mask),
+              .StencilWriteMask =
+                  static_cast<UINT8>(render_state_.stencil_write_mask),
+              // D3D8 has one stencil op set applying to both polygon
+              // winding orders -- two-sided stencil (independent front/back
+              // ops) is a D3D9 addition (D3DRS_TWOSIDEDSTENCILMODE /
+              // CCW_STENCIL*) this codebase doesn't track, so front and back
+              // share the same D3D8 state here, matching D3D8 semantics
+              // exactly rather than leaving BackFace at D3D12's permissive
+              // KEEP/ALWAYS default (which would silently pass the stencil
+              // test on back-facing geometry regardless of what the app
+              // configured).
+              .FrontFace =
+                  {
+                      .StencilFailOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_fail),
+                      .StencilDepthFailOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_zfail),
+                      .StencilPassOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_pass),
+                      .StencilFunc = static_cast<D3D12_COMPARISON_FUNC>(
+                          render_state_.stencil_func),
+                  },
+              .BackFace =
+                  {
+                      .StencilFailOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_fail),
+                      .StencilDepthFailOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_zfail),
+                      .StencilPassOp = static_cast<D3D12_STENCIL_OP>(
+                          render_state_.stencil_pass),
+                      .StencilFunc = static_cast<D3D12_COMPARISON_FUNC>(
+                          render_state_.stencil_func),
+                  },
           },
       .InputLayout = {.pInputElementDescs =
                           vertex_shader->decl.input_elements.data(),
@@ -2813,15 +3165,47 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // though consecutive draws almost always share identical state. The
   // primitive type is part of the key but arrives as a per-draw argument
   // rather than device state, so it's compared separately.
+  // DIAGNOSTIC: cheap contiguous has-texture mask, mirroring the `break`-on-
+  // first-gap loop in CreatePSO. Kept outside the rebuild branch so it can
+  // be compared against a cache *hit* too, not just recomputed when a PSO
+  // is actually (re)built.
+  uint32_t current_texture_mask = 0;
+  for (int i = 0; i < kMaxTexStages; ++i) {
+    if (!bound_textures_[i]) break;
+    current_texture_mask |= (1u << i);
+  }
   if (!kCacheDrawStateBindings || (dirty_flags_ & DIRTY_FLAG_PSO) ||
       PrimitiveType != last_pso_prim_type_) {
     last_pso_ = CreatePSO(PrimitiveType);
     last_pso_prim_type_ = PrimitiveType;
+    last_pso_texture_mask_ = current_texture_mask;
     if (dirty_flags_ & DIRTY_FLAG_PSO) dirty_flags_ ^= DIRTY_FLAG_PSO;
   }
+#ifdef DX8TO12_ENABLE_VALIDATION
+  else if (last_pso_texture_mask_ != current_texture_mask) {
+    static int stale_pso_lines = 0;
+    if (stale_pso_lines < 50) {
+      ++stale_pso_lines;
+      LOG(AixLog::Severity::error)
+          << "STALE-PSO-TEXMASK bakedMask=0x" << std::hex
+          << last_pso_texture_mask_ << " liveMask=0x" << current_texture_mask
+          << std::dec << " prim=" << PrimitiveType << "\n";
+    }
+  }
+#endif
   if (!kCacheDrawStateBindings || last_pso_.get() != last_set_pso_) {
     cmd_list_->SetPipelineState(last_pso_.get());
     last_set_pso_ = last_pso_.get();
+  }
+  // D3DRS_STENCILREF -- see the comment on pso_key.rs.stencil_ref above for
+  // why this is set here instead of living in the PSO.
+  {
+    const int stencil_ref =
+        static_cast<int>(render_state_.stencil_ref & 0xFF);
+    if (!kCacheDrawStateBindings || stencil_ref != last_stencil_ref_) {
+      cmd_list_->OMSetStencilRef(static_cast<UINT>(stencil_ref));
+      last_stencil_ref_ = stencil_ref;
+    }
   }
   // MarkResourceAsUsed(pso);
   using ::DirectX::SimpleMath::Matrix;
@@ -2884,6 +3268,9 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     cbuffer->specular_material_source =
         render_state_.color_vertex ? render_state_.specular_material_source
                                    : D3DMCS_MATERIAL;
+    cbuffer->emissive_material_source =
+        render_state_.color_vertex ? render_state_.emissive_material_source
+                                   : D3DMCS_MATERIAL;
     cbuffer->specular_enable = render_state_.specular_enable;
     cbuffer->lighting_enabled = render_state_.lighting;
     cbuffer->global_ambient = Dx8::Color(render_state_.ambient).ToValue();
@@ -2898,11 +3285,24 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     cbuffer->material_diffuse = material_.Diffuse;
     cbuffer->material_ambient = material_.Ambient;
     cbuffer->material_specular = material_.Specular;
+    cbuffer->material_emissive = material_.Emissive;
     cbuffer->material_power = material_.Power;
 
     cbuffer->alpha_ref = (render_state_.alpha_ref & 0xFF) / 255.f;
     cbuffer->texture_factor =
         Dx8::Color(render_state_.texture_factor).ToValue();
+    // Fog. See the fog_enable comment on PixelCBuffer (vertex_shader.h) for
+    // why this is a runtime cbuffer value instead of a PSO/shader variant --
+    // pso_key.rs.fog_* is deliberately zeroed in CreatePSO's key so these
+    // values never fragment the PSO cache.
+    cbuffer->fog_enable = render_state_.fog_enable;
+    cbuffer->fog_mode = render_state_.fog_table_mode != D3DFOG_NONE
+                            ? render_state_.fog_table_mode
+                            : render_state_.fog_vertex_mode;
+    cbuffer->fog_start = render_state_.fog_start;
+    cbuffer->fog_end = render_state_.fog_end;
+    cbuffer->fog_density = render_state_.fog_density;
+    cbuffer->fog_color = Dx8::Color(render_state_.fog_color).ToValue();
     ASSERT_HR(ps_cbuffer_->Unlock());
     dirty_flags_ ^= DIRTY_FLAG_PS_CBUFFER;
   }
@@ -2918,9 +3318,12 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     root_sig_bound_ = true;
     last_root_cbvs_.fill(0);
     // Descriptor tables are root arguments too, so they need re-issuing for
-    // the same reason.
+    // the same reason -- every stage, since binding the root signature drops
+    // all of them at once regardless of which stage last changed.
     dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
     dirty_flags_ |= DIRTY_FLAG_PS_SAMPLERS;
+    dirty_texture_stage_mask_ = 0xFF;
+    dirty_sampler_stage_mask_ = 0xFF;
   }
 
   // Set all the necessary roots. These addresses only change when the
@@ -2965,21 +3368,33 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   }
 
   if (dirty_flags_ & DIRTY_FLAG_PS_TEXTURES) {
-    // And all the textures.
+    // And all the textures -- but only the stages dirty_texture_stage_mask_
+    // actually marked touched. See its comment (device.h) for why this is a
+    // mask set at mutation time rather than inferred by comparing cached
+    // texture identities against the current binding.
+    const uint32_t mask =
+        kCacheDrawStateBindings ? dirty_texture_stage_mask_ : 0xFFu;
     for (int i = 0; i < kMaxTexStages; ++i) {
-      if (bound_textures_[i]) {
-        const auto gpu_handle =
-            srv_heap_.GetGPUHandleFor(bound_textures_[i]->srv_handle());
+      if (!(mask & (1u << i))) continue;
+      GpuTexture *tex =
+          bound_textures_[i] ? bound_textures_[i].Get() : nullptr;
+      if (tex) {
+        const auto gpu_handle = srv_heap_.GetGPUHandleFor(tex->srv_handle());
         cmd_list_->SetGraphicsRootDescriptorTable(textures_start_bindslot_ + i,
                                                   gpu_handle);
       }
     }
+    dirty_texture_stage_mask_ = 0;
     dirty_flags_ ^= DIRTY_FLAG_PS_TEXTURES;
   }
 
   if (dirty_flags_ & DIRTY_FLAG_PS_SAMPLERS) {
-    // Set all the samplers.
+    // Set the samplers -- only the stages dirty_sampler_stage_mask_ marked
+    // touched. Same reasoning as the texture loop just above.
+    const uint32_t mask =
+        kCacheDrawStateBindings ? dirty_sampler_stage_mask_ : 0xFFu;
     for (int i = 0; i < kMaxTexStages; ++i) {
+      if (!(mask & (1u << i))) continue;
       SamplerDesc desc(texture_stage_states_[i]);
       auto iter = sampler_cache_.find(desc);
       if (iter == sampler_cache_.end()) {
@@ -2993,6 +3408,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
       cmd_list_->SetGraphicsRootDescriptorTable(
           textures_start_bindslot_ + kMaxTexStages + i, iter->second);
     }
+    dirty_sampler_stage_mask_ = 0;
     dirty_flags_ ^= DIRTY_FLAG_PS_SAMPLERS;
   }
   return S_OK;
@@ -3001,6 +3417,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
 HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
                                                 UINT StartVertex,
                                                 UINT PrimitiveCount) {
+  ++draw_calls_this_frame_;
   // D3D12 has no fan topology. Emulate it with a generated index list (0,
   // i+1, i+2 for each triangle) drawn as a triangle list against the
   // already-bound vertex buffer, the same trick DrawPrimitiveUP already uses
@@ -3055,6 +3472,24 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
            PrimitiveType);
       break;
   }
+  // Coverage only: the glitch hunt has so far instrumented only the indexed
+  // path, on the strength of an earlier dump that showed the menu going
+  // through it. If the offending draw actually comes through here, that dump
+  // was not the whole picture and the detector has been looking in the wrong
+  // place -- which the counters will show rather than leave to assumption.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  {
+    static int dp_total = 0;
+    static uint64_t dp_last_frame = 0;
+    ++dp_total;
+    if (CurrentFrame() - dp_last_frame >= 600) {
+      dp_last_frame = CurrentFrame();
+      LOG(AixLog::Severity::error)
+          << "DRAWPRIM-COVERAGE " << std::dec
+          << "nonIndexedDraws=" << dp_total << "\n";
+    }
+  }
+#endif
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, StartVertex, vertex_count));
   cmd_list_->DrawInstanced(vertex_count, 1, StartVertex, 0);
   return S_OK;
@@ -3063,6 +3498,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
 HRESULT STDMETHODCALLTYPE Device::DrawPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount,
     CONST void *pVertexStreamZeroData, UINT VertexStreamZeroStride) {
+  ++draw_calls_this_frame_;
   if (!bound_vertex_shader_) {
     LOG_ERROR() << "Cannot use DrawPrimitiveUP without a vertex shader.\n";
     return D3DERR_INVALIDCALL;
@@ -3195,7 +3631,30 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitiveUP(
 HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
     D3DPRIMITIVETYPE PrimitiveType, UINT minIndex, UINT NumVertices,
     UINT startIndex, UINT primCount) {
-  if (!bound_index_buffer_) return D3DERR_INVALIDCALL;
+  ++draw_calls_this_frame_;
+  if (!bound_index_buffer_) {
+    // DIAGNOSTIC: a ground-tile draw is silently missing from some frames --
+    // no crash, no D3D12 trace (RenderDoc can't show a call that never
+    // reaches the command list), just an absent draw. This is the only
+    // early-return in the whole Draw* family that didn't already log before
+    // bailing (DrawPrimitiveUP/DrawIndexedPrimitiveUP both do for their
+    // equivalent "nothing bound" guard) -- if the game calls
+    // DrawIndexedPrimitive right after SetIndices(NULL, ...), or before ever
+    // calling SetIndices at all, this is exactly what a "the draw just isn't
+    // there" symptom with zero other evidence would look like.
+#ifdef DX8TO12_ENABLE_VALIDATION
+    static int no_ib_lines = 0;
+    if (no_ib_lines < 200) {
+      ++no_ib_lines;
+      LOG(AixLog::Severity::error)
+          << "DRAW-NO-INDEXBUFFER frame=" << CurrentFrame()
+          << " prim=" << PrimitiveType << " minIndex=" << minIndex
+          << " numVerts=" << NumVertices << " startIndex=" << startIndex
+          << " primCount=" << primCount << "\n";
+    }
+#endif
+    return D3DERR_INVALIDCALL;
+  }
 
   int index_count;
   switch (PrimitiveType) {
@@ -3229,35 +3688,304 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   // No primCount filter: RenderWare batches many 2D sprites (whole strings of
   // text) into a single draw, so filtering for small quads excluded exactly
   // the draws worth seeing. A line cap keeps the log manageable instead.
-  static int ui_dump_lines = 0;
-  if (ui_dump_enabled_ && ui_dump_lines < 40000) {
-    ++ui_dump_lines;
-    GpuTexture *tex0 =
-        bound_textures_[0] ? bound_textures_[0].Get() : nullptr;
-    std::ostringstream dump;
-    dump << "UIDUMP(indexed-vb) prim=" << PrimitiveType
-         << " prims=" << primCount << " minIndex=" << minIndex
-         << " numVerts=" << NumVertices << " startIndex=" << startIndex
-         << " tex0=" << tex0;
-    if (tex0) {
-      const D3D12_RESOURCE_DESC &desc = tex0->resource_desc();
-      dump << " tex0size=" << std::dec << desc.Width << "x" << desc.Height
-           << " fmt=" << static_cast<int>(desc.Format);
-    }
-    dump << " vs=" << bound_vertex_shader_ << " ps=" << bound_pixel_shader_
-         << " baseVertex=" << bound_base_vertex_;
-    if (bound_vertex_streams_[0]) {
-      Buffer *vb = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
-      dump << " vbBytes=" << vb->resource_desc().Width
-           << " vbDyn=" << vb->IsDynamic();
-    }
-    if (bound_index_buffer_) {
-      dump << " ibBytes=" << bound_index_buffer_->resource_desc().Width;
-    }
-    dump << " colorop=" << texture_stage_states_[0].color_op
-         << " alphaop=" << texture_stage_states_[0].alpha_op << "\n";
-    LOG(AixLog::Severity::error) << dump.str();
+  // Targeted replacement for the old blanket per-draw dump. Logging *every*
+  // draw cost ~145k lines and slowed the CPU enough to close the race window
+  // this is trying to catch -- the glitch reliably vanished while the dump ran,
+  // which made the instrument useless for the one thing it was built for. This
+  // check instead stays quiet unless a draw is about to read vertex memory
+  // nothing wrote this frame, so it costs a binary search per draw and prints
+  // only when there is something to see. It also runs unconditionally rather
+  // than behind F9, so no keypress is needed to catch the glitch.
+  // Separate caps per condition, not one shared budget -- "oversized" turned
+  // out to be dominated by a legitimate, harmless effect (a screen-covering
+  // quad with a tiny 64x64 texture, smoothly animated frame to frame --
+  // almost certainly rain/weather, not a bug) that burned through the entire
+  // shared 300-line cap in the first ~2600 frames of a session, leaving zero
+  // budget left to catch anything for the rest of a multi-thousand-frame
+  // play session. "stale" and "nonfinite" are the conditions that actually
+  // indicate memory corruption (reading un-written or NaN/Inf vertex data)
+  // and are rare/meaningful when they fire, so they get the generous
+  // budgets; "oversized" alone gets a small one since a handful of samples
+  // is enough to confirm/reject the "it's just the weather effect" theory
+  // without crowding out the other two.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  static int stale_lines = 0, oversized_lines = 0, nonfinite_lines = 0;
+  // Coverage counters for the check below. A detector that silently examines
+  // nothing is indistinguishable in the log from one that found nothing wrong,
+  // and that has already sent this investigation down a blind alley twice. So
+  // measure how much of the draw stream it actually looks at.
+  static int cov_total = 0, cov_dynamic = 0, cov_scannable = 0, cov_reported = 0;
+  static uint64_t cov_last_frame = 0;
+  ++cov_total;
+  if (CurrentFrame() - cov_last_frame >= 600) {
+    cov_last_frame = CurrentFrame();
+    LOG(AixLog::Severity::error)
+        << "BADDRAW-COVERAGE " << std::dec << "indexedDraws=" << cov_total
+        << " dynamicVB=" << cov_dynamic << " scannable=" << cov_scannable
+        << " reported=" << cov_reported << "\n";
   }
+  // Scan as long as *any* category still has budget left -- each condition
+  // below is checked and reported against its own cap individually, so a
+  // maxed-out "oversized" no longer blocks "stale"/"nonfinite" detection for
+  // the rest of the session.
+  if ((stale_lines < 2000 || oversized_lines < 20 || nonfinite_lines < 2000) &&
+      bound_vertex_streams_[0]) {
+    Buffer *vb = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
+    const int stride =
+        static_cast<int>(bound_vertex_stream_strides_[0]);
+    if (vb->IsDynamic() && stride > 0 && NumVertices > 0) {
+      ++cov_dynamic;
+      // DIAGNOSTIC: a water-simulation tile (dynamic buffer, stride 36,
+      // fixed-function vertex shader) was confirmed via RenderDoc to render
+      // in a wildly wrong place relative to 6 sibling tiles drawn the same
+      // frame -- comparing all 7 tiles' actual clip-space transforms showed
+      // the wrong one landing an order of magnitude off from where its
+      // neighbors clustered. That comparison used RenderDoc's final
+      // committed state; this logs the same comparison live, tagged by
+      // sequence so every tile drawn this way can be lined up frame-by-frame
+      // -- if one tile's D3DTS_WORLD turns out identical to a *different*
+      // tile's (or to whatever the previous, unrelated object drew with),
+      // that's a stale-transform bug; if all 7 are always genuinely
+      // distinct, the cause is elsewhere (most likely the game's own
+      // tile-placement logic, not this renderer).
+      if (stride == 36) {
+        static int water_xform_lines = 0;
+        static uint64_t water_xform_seq = 0;
+        if (water_xform_lines < 20000) {
+          ++water_xform_lines;
+          ++water_xform_seq;
+          D3DMATRIX world = GetTransform(D3DTS_WORLD);
+          LOG(AixLog::Severity::error)
+              << "WATERXFORM seq=" << water_xform_seq
+              << " frame=" << CurrentFrame() << " startIndex=" << startIndex
+              << " translate=(" << world._41 << "," << world._42 << ","
+              << world._43 << ") row0=(" << world._11 << "," << world._12
+              << "," << world._13 << ")\n";
+        }
+      }
+      const int64_t first_vertex =
+          static_cast<int64_t>(bound_base_vertex_) + minIndex;
+      const int64_t byte_offset = first_vertex * stride;
+      const int64_t byte_size = static_cast<int64_t>(NumVertices) * stride;
+      const bool in_bounds =
+          byte_offset >= 0 && byte_offset + byte_size <=
+                                  static_cast<int64_t>(vb->resource_desc().Width);
+      const char *verts =
+          in_bounds ? vb->DebugCpuPtr(static_cast<int>(byte_offset),
+                                      static_cast<int>(byte_size))
+                    : nullptr;
+      const bool stale =
+          in_bounds && !vb->IsRangeWrittenThisFrame(
+                           static_cast<int>(byte_offset),
+                           static_cast<int>(byte_size));
+      // Read the vertices the GPU is about to read. The stale-memory check
+      // above came back clean while the glitch was on screen, which rules out
+      // "the data was never written" and leaves "the data is wrong" -- so look
+      // at it. RenderWare's 2D drawing supplies pre-transformed (XYZRHW)
+      // vertices, i.e. these floats are screen pixels, and a UI quad spanning
+      // the whole viewport is by definition the glitch: the screenshot shows
+      // one skewed quad carrying the entire font atlas across the menu.
+      if (verts) ++cov_scannable;
+      bool covers_screen = false;
+      bool non_finite = false;
+      float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
+      if (verts && stride >= 2 * static_cast<int>(sizeof(float))) {
+        // Sample a handful of vertices spread across the range rather than
+        // reading them all. A buffer flagged D3DUSAGE_WRITEONLY lives in
+        // write-combined memory, where CPU reads are pathologically slow, and
+        // a scan costly enough to slow the frame down would close the very
+        // race window this is meant to catch. Opposite corners of a
+        // screen-spanning quad show up in any few samples.
+        const UINT kSamples = 8;
+        const UINT scanned = std::min<UINT>(NumVertices, kSamples);
+        const UINT step = std::max<UINT>(1, NumVertices / kSamples);
+        for (UINT i = 0; i < scanned; ++i) {
+          float pos[2];
+          memcpy(pos, verts + static_cast<size_t>(i) * step * stride,
+                 sizeof(pos));
+          if (!std::isfinite(pos[0]) || !std::isfinite(pos[1])) {
+            non_finite = true;
+            continue;
+          }
+          min_x = std::min(min_x, pos[0]);
+          max_x = std::max(max_x, pos[0]);
+          min_y = std::min(min_y, pos[1]);
+          max_y = std::max(max_y, pos[1]);
+        }
+        covers_screen = min_x <= max_x &&
+                        (max_x - min_x) > 0.8f * viewport_.Width &&
+                        (max_y - min_y) > 0.8f * viewport_.Height;
+      }
+      // Second stage, run only when the cheap batch-level scan already
+      // triggered. Batch bounds alone are a bad test: RenderWare packs ~192
+      // glyphs into one draw, and the text of a full menu legitimately spans
+      // the screen, so the first version reported those as suspects too. What
+      // actually matters is whether a *single* quad covers the screen. Doing
+      // this per draw would mean far more write-combined reads than the frame
+      // can afford, but as a second stage it costs nothing until something is
+      // already wrong.
+      int bad_quad = -1;
+      float q[4][2] = {};
+      float uv[4][2] = {};
+      if (covers_screen && verts && stride >= 28) {
+        covers_screen = false;
+        const UINT quads = std::min<UINT>(NumVertices / 4, 64);
+        for (UINT qi = 0; qi < quads && !covers_screen; ++qi) {
+          float qx0 = FLT_MAX, qy0 = FLT_MAX, qx1 = -FLT_MAX, qy1 = -FLT_MAX;
+          for (UINT v = 0; v < 4; ++v) {
+            const char *p = verts + (static_cast<size_t>(qi) * 4 + v) * stride;
+            memcpy(q[v], p, sizeof(q[v]));
+            // XYZRHW(16) + diffuse(4) + specular(4)... or + UV(8); at
+            // stride 28 the last 8 bytes are the texture coordinates.
+            memcpy(uv[v], p + stride - 8, sizeof(uv[v]));
+            if (!std::isfinite(q[v][0]) || !std::isfinite(q[v][1])) continue;
+            qx0 = std::min(qx0, q[v][0]);
+            qx1 = std::max(qx1, q[v][0]);
+            qy0 = std::min(qy0, q[v][1]);
+            qy1 = std::max(qy1, q[v][1]);
+          }
+          if (qx0 <= qx1 && (qx1 - qx0) > 0.8f * viewport_.Width &&
+              (qy1 - qy0) > 0.8f * viewport_.Height) {
+            covers_screen = true;
+            bad_quad = static_cast<int>(qi);
+          }
+        }
+      }
+      const bool report_stale = stale && stale_lines < 2000;
+      const bool report_oversized = covers_screen && oversized_lines < 20;
+      const bool report_nonfinite = non_finite && nonfinite_lines < 2000;
+      if (report_stale || report_oversized || report_nonfinite) {
+        if (report_stale) ++stale_lines;
+        if (report_oversized) ++oversized_lines;
+        if (report_nonfinite) ++nonfinite_lines;
+        ++cov_reported;
+        GpuTexture *tex0 =
+            bound_textures_[0] ? bound_textures_[0].Get() : nullptr;
+        std::ostringstream dump;
+        dump << "BADDRAW"
+             << (stale ? " stale" : "") << (covers_screen ? " oversized" : "")
+             << (non_finite ? " nonfinite" : "") << " prim=" << PrimitiveType
+             << " prims=" << primCount << " minIndex=" << minIndex
+             << " numVerts=" << NumVertices << " startIndex=" << startIndex
+             << " baseVertex=" << bound_base_vertex_ << " stride=" << stride
+             << " byteOff=" << byte_offset << " byteSize=" << byte_size
+             << " vbBytes=" << vb->resource_desc().Width << " tex0=" << tex0;
+        if (tex0) {
+          const D3D12_RESOURCE_DESC &desc = tex0->resource_desc();
+          dump << " tex0size=" << std::dec << desc.Width << "x" << desc.Height;
+        }
+        // The first vertex's raw floats separate "read uninitialised memory"
+        // from "read good data and transformed it wrong": plausible screen
+        // coordinates here would mean the geometry is fine and the fault lies
+        // downstream, in the transform or the stride.
+        dump << " vs=" << bound_vertex_shader_ << " ps=" << bound_pixel_shader_
+             << " viewport=" << viewport_.Width << "x" << viewport_.Height
+             << " vb{" << vb->DebugState() << "}";
+        if (tex0) {
+          const D3D12_RESOURCE_DESC &d = tex0->resource_desc();
+          dump << " tex0fmt=" << static_cast<int>(d.Format)
+               << " tex0mips=" << d.MipLevels;
+        }
+        if (bad_quad >= 0) {
+          dump << " badQuad=" << bad_quad;
+          for (int v = 0; v < 4; ++v) {
+            dump << " q" << v << "=(" << q[v][0] << "," << q[v][1] << ")uv=("
+                 << uv[v][0] << "," << uv[v][1] << ")";
+          }
+        }
+        if (min_x <= max_x) {
+          dump << " bounds=(" << min_x << "," << min_y << ")-(" << max_x << ","
+               << max_y << ")";
+        }
+        // The first few vertices in full. Whether these are plausible screen
+        // pixels or nonsense is what separates "wrong geometry" from "right
+        // geometry, wrong texture bound".
+        if (verts && stride >= 4 * static_cast<int>(sizeof(float))) {
+          const UINT scanned = std::min<UINT>(NumVertices, 4);
+          for (UINT i = 0; i < scanned; ++i) {
+            float f[4];
+            memcpy(f, verts + static_cast<size_t>(i) * stride, sizeof(f));
+            dump << " v" << i << "=[" << f[0] << "," << f[1] << "," << f[2]
+                 << "," << f[3] << "]";
+          }
+        }
+        dump << "\n";
+        LOG(AixLog::Severity::error) << dump.str();
+      }
+    }
+  }
+#endif
+
+  // DIAGNOSTIC: this draw's screen-space bbox, computed with the exact same
+  // world*view*proj this frame's actual PrepareDrawCall/vertex shader use --
+  // not a hand-rolled reconstruction done offline against a RenderDoc
+  // capture, which turned out to have its own pitfalls (matrix convention
+  // mistakes, degenerate bounds from near-plane vertices). A RenderDoc
+  // PixelHistory can show a screen pixel has no draw touching it; this is
+  // what lets that be cross-referenced against whether *any* draw this
+  // frame even aimed at that pixel, using the shim's own ground truth.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (bound_vertex_streams_[0] && bound_index_buffer_) {
+    Buffer *vb0 = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
+    const int stride0 = static_cast<int>(bound_vertex_stream_strides_[0]);
+    // Skip the screen-space RHW UI format (stride 28) -- its x/y are already
+    // pixel coordinates, not local-space positions to transform.
+    if (stride0 >= 12 && stride0 != 28) {
+      // minIndex/NumVertices describe the *range* of vertex-buffer entries
+      // the index buffer may reference for this draw (offset by
+      // bound_base_vertex_, same as the actual index->vertex lookup), not
+      // vertex 0..3 -- the first pass here only sampled the first 4 raw
+      // buffer entries regardless of minIndex, which for any draw that
+      // isn't already at the start of its vertex buffer silently measured
+      // the wrong geometry (or, for a >4-vertex mesh, only ever its first
+      // triangle's corner instead of the whole draw's true extent). A
+      // sanity check against a pixel with obviously-rendering, unmistakable
+      // road texture came back with zero covering draws, which is what
+      // caught this rather than the actual hole under investigation.
+      const UINT base = minIndex + bound_base_vertex_;
+      const UINT scanned = std::min<UINT>(NumVertices, 512);
+      const char *verts0 =
+          vb0->DebugCpuPtr(static_cast<int>(base) * stride0,
+                            static_cast<int>(scanned) * stride0);
+      if (verts0) {
+        using ::DirectX::SimpleMath::Matrix;
+        using ::DirectX::SimpleMath::Vector4;
+        Matrix wvp = MatrixFromD3D(GetTransform(D3DTS_WORLD)) *
+                     MatrixFromD3D(GetTransform(D3DTS_VIEW)) *
+                     MatrixFromD3D(GetTransform(D3DTS_PROJECTION));
+        float min_sx = FLT_MAX, min_sy = FLT_MAX;
+        float max_sx = -FLT_MAX, max_sy = -FLT_MAX;
+        bool any_visible = false;
+        for (UINT i = 0; i < scanned; ++i) {
+          float f[3];
+          memcpy(f, verts0 + static_cast<size_t>(i) * stride0, sizeof(f));
+          Vector4 clip =
+              Vector4::Transform(Vector4(f[0], f[1], f[2], 1.f), wvp);
+          if (clip.w <= 1e-4f) continue;
+          any_visible = true;
+          const float sx = (clip.x / clip.w * 0.5f + 0.5f) * viewport_.Width;
+          const float sy =
+              (1.f - (clip.y / clip.w * 0.5f + 0.5f)) * viewport_.Height;
+          min_sx = std::min(min_sx, sx);
+          max_sx = std::max(max_sx, sx);
+          min_sy = std::min(min_sy, sy);
+          max_sy = std::max(max_sy, sy);
+        }
+        static uint64_t drawbbox_seq = 0;
+        if (any_visible) {
+          ++drawbbox_seq;
+          GpuTexture *tex0 =
+              bound_textures_[0] ? bound_textures_[0].Get() : nullptr;
+          LOG(AixLog::Severity::error)
+              << "DRAWBBOX seq=" << drawbbox_seq << " frame=" << CurrentFrame()
+              << " tex0=" << tex0 << " cullmode=" << render_state_.cull_mode
+              << " bbox=(" << min_sx << "," << min_sy << ")-(" << max_sx
+              << "," << max_sy << ")\n";
+        }
+      }
+    }
+  }
+#endif
 
   HR_OR_RETURN(PrepareDrawCall(PrimitiveType, minIndex + bound_base_vertex_,
                                NumVertices));
@@ -3282,6 +4010,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
     UINT NumVertexIndices, UINT PrimitiveCount, CONST void *pIndexData,
     D3DFORMAT IndexDataFormat, CONST void *pVertexStreamZeroData,
     UINT VertexStreamZeroStride) {
+  ++draw_calls_this_frame_;
   TRACE_ENTRY(PrimitiveType, MinVertexIndex, NumVertexIndices, PrimitiveCount,
              pIndexData, IndexDataFormat, pVertexStreamZeroData,
              VertexStreamZeroStride);
@@ -3419,6 +4148,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
 }
 
 void Device::PollUiDumpHotkey() {
+#ifdef DX8TO12_ENABLE_VALIDATION
   // Edge-triggered so holding the key doesn't toggle every frame. Uses
   // GetAsyncKeyState rather than the app's input: this has to work while the
   // game has focus and is running its own message loop.
@@ -3442,6 +4172,7 @@ void Device::PollUiDumpHotkey() {
           << "=== UI DUMP STOPPED (frame budget reached) ===\n";
     }
   }
+#endif
 }
 
 HRESULT STDMETHODCALLTYPE Device::Present(CONST RECT *pSourceRect,
@@ -3465,6 +4196,7 @@ void Device::SubmitAndWait(bool should_present) {
       perf_frame_ticks_accum_ += perf_now.QuadPart - perf_last_frame_ticks_;
       perf_wait_ticks_accum_ += perf_wait_ticks_this_frame_;
       ++perf_frame_sample_count_;
+#ifdef DX8TO12_ENABLE_VALIDATION
       if (perf_frame_sample_count_ >= 120) {
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
@@ -3481,6 +4213,7 @@ void Device::SubmitAndWait(bool should_present) {
         perf_wait_ticks_accum_ = 0;
         perf_frame_sample_count_ = 0;
       }
+#endif
     }
     if (perf_last_frame_ticks_ != 0) {
       LARGE_INTEGER freq;
@@ -3545,6 +4278,19 @@ void Device::SubmitAndWait(bool should_present) {
                              : 0));
   }
 
+  // DIAGNOSTIC: see draw_calls_this_frame_ comment in device.h. Logged
+  // against the frame number that's ending (next_fence_ before increment),
+  // tagged with should_present so a mid-frame flush (e.g. a lockable-surface
+  // GPU readback) doesn't get mistaken for a real presented frame boundary
+  // when cross-referencing against a RenderDoc capture.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  LOG(AixLog::Severity::error)
+      << "FRAME-DRAWCOUNT frame=" << next_fence_
+      << " present=" << (should_present ? 1 : 0)
+      << " draws=" << draw_calls_this_frame_ << "\n";
+#endif
+  draw_calls_this_frame_ = 0;
+
   // Grab a new fence value, set it at the end of the command queue execution.
   fence_values_.at(current_back_buffer_) = next_fence_++;
   ASSERT_HR(cmd_queue_->Signal(cmd_list_done_fence_.get(),
@@ -3569,6 +4315,9 @@ void Device::SubmitAndWait(bool should_present) {
   // Likewise for the root signature, root arguments, and pipeline state.
   root_sig_bound_ = false;
   last_set_pso_ = nullptr;
+  last_stencil_ref_ = -1;
+  dirty_texture_stage_mask_ = 0xFF;
+  dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
 }
 
@@ -3628,6 +4377,15 @@ void Device::FreeFrameResources(uint64_t frame_number) {
 
   dynamic_ring_buffer_->HasCompletedFrame(frame_number);
   dynamic_ring_buffer_->SetCurrentFrame(CurrentFrame());
+
+  // Descriptor slots follow exactly the same lifetime rule as the frame
+  // resources above: safe to reuse only once the GPU has finished every frame
+  // whose command list could still name them.
+  for (DescriptorPoolHeap *heap :
+       {&srv_heap_, &rtv_heap_, &dsv_heap_, &sampler_heap_}) {
+    heap->ReleaseCompleted(frame_number);
+    heap->SetCurrentFrame(CurrentFrame());
+  }
 }
 
 uint64_t Device::CurrentFrame() const { return next_fence_; }

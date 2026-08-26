@@ -85,7 +85,14 @@ struct LightsCBuffer {
   // entirely for such meshes since the vertex shader variant for "no normal"
   // never called ComputeLighting at all.
   int lighting_enabled;
-  int pad[2];
+  // D3DRS_EMISSIVEMATERIALSOURCE. Lives here (with the other *_material_source
+  // fields) rather than next to material_emissive itself in PixelCBuffer,
+  // because the source selection has to run in the vertex shader alongside
+  // the other lighting terms -- material_emissive's *value* is read from
+  // PixelCBuffer (shared ALL-visibility), but which color feeds it is a
+  // per-vertex decision.
+  D3DMATERIALCOLORSOURCE emissive_material_source;
+  int pad;
   D3DCOLORVALUE global_ambient;
 };
 struct PixelCBuffer {
@@ -97,6 +104,22 @@ struct PixelCBuffer {
   float alpha_ref;
   float pad[2];
   D3DCOLORVALUE texture_factor;
+  // Fog (D3DRS_FOGENABLE/FOGCOLOR/FOGTABLEMODE/FOGVERTEXMODE/FOGSTART/
+  // FOGEND/FOGDENSITY). Deliberately routed through this cbuffer instead of
+  // shader permutation: the PSO key zeroes every fog field (see the comment
+  // at Device::CreatePSO on pso_key.rs.fog_*) specifically so distinct fog
+  // parameter values don't fragment the PSO cache, which only works if fog
+  // is a per-draw runtime value rather than a compiled-in constant.
+  int fog_enable;
+  // Effective fog mode: D3DRS_FOGTABLEMODE if set, else D3DRS_FOGVERTEXMODE
+  // -- real D3D8 prefers table (per-pixel) fog when the app requests it, and
+  // RenderWare-era titles commonly set only one of the two render states.
+  D3DFOGMODE fog_mode;
+  float fog_start;
+  float fog_end;
+  float fog_density;
+  float pad2[3];
+  D3DCOLORVALUE fog_color;
 };
 
 struct ConstantRegData {
@@ -119,6 +142,25 @@ struct VertexShaderDeclaration {
 
 VertexShaderDeclaration ParseShaderDeclaration(const DWORD* declaration);
 
+// A stable per-shader identity, handed out once and never reused -- unlike
+// the ID3DBlob* this shader wraps. VertexShader/PixelShader are RefCounted
+// (delete this at zero refs), and a programmable shader can be destroyed
+// mid-session via DeleteVertexShader/DeletePixelShader; a later, completely
+// unrelated shader is then free to land at that exact freed heap address.
+// PSOState (render_state.h) used to key its pso_cache_/ps_cache_ lookup on
+// the raw blob pointer, which made that scenario indistinguishable from
+// "this is the same shader as before" -- a stale cache hit would bind an
+// old, already-deleted shader's compiled PSO (wrong vertex transform, wrong
+// constant layout, wrong everything) to a draw call using the new one. Same
+// identity-reuse (ABA) hazard as the texture-descriptor rebind cache and
+// GetRenderTarget's surface cache (both already found and fixed this
+// session) -- a monotonic ID assigned at construction has no stale value to
+// alias against, unlike a pointer.
+inline uint64_t NextShaderId() {
+  static uint64_t next_id = 1;
+  return next_id++;
+}
+
 struct VertexShader : public RefCounted {
   VertexShaderDeclaration decl;
   ComPtr<ID3DBlob> blob;
@@ -129,6 +171,7 @@ struct VertexShader : public RefCounted {
   // was synthesized from an FVF rather than a real token stream).
   std::vector<DWORD> declaration_tokens;
   std::vector<DWORD> function_tokens;
+  uint64_t unique_id = NextShaderId();
 };
 
 struct PixelShader : public RefCounted {
@@ -136,6 +179,9 @@ struct PixelShader : public RefCounted {
   // Copy of the original DX8 token stream passed to CreatePixelShader, for
   // GetPixelShaderFunction.
   std::vector<DWORD> function_tokens;
+  // See VertexShader::unique_id above -- same reasoning, same fix, for
+  // pixel shaders deleted via DeletePixelShader.
+  uint64_t unique_id = NextShaderId();
 };
 
 VertexShader CreateFixedFunctionVertexShader(
