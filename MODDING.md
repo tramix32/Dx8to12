@@ -206,6 +206,30 @@ straight into the same command list and they composite on top, before
 `Present()` yourself from inside the callback -- Dx8to12 owns the command
 list's lifecycle; just record commands into it.
 
+**Descriptor heaps are shared state -- bind your own before using it**: the
+command list handed to your callback already has Dx8to12's own SRV/sampler
+descriptor heaps bound (via `SetDescriptorHeaps`) from its own rendering
+earlier in the frame. A D3D12 command list can only have one CBV/SRV/UAV heap
+and one sampler heap bound at a time, so if your callback uses its own
+descriptor heap for its own resources (e.g. `ImGui_ImplDX12_Init`'s SRV heap
+for the font atlas), you **must** call `SetDescriptorHeaps` with your own
+heap(s) yourself before issuing any draw or `SetGraphicsRootDescriptorTable`
+call that references a handle from it -- don't assume Dx8to12's heaps happen
+to work, and don't assume the ImGui DX12 backend does this for you: it
+doesn't, by design (see its own examples -- binding the heap is always left to
+the host application, since the backend has no way to know what else the host
+might have bound). Forgetting this produces a real bug, not just a debug-layer
+nag: the D3D12 debug layer reports it as `SET_DESCRIPTOR_TABLE_INVALID`
+("the descriptor heap containing handle ... is different from currently set
+descriptor heap"), but on a release build without the debug layer it's
+silent, undefined GPU behavior -- the draw may render garbage, sample an
+unrelated texture, or (depending on driver/hardware) work by coincidence most
+of the time and fail intermittently, which is exactly what makes it easy to
+ship unnoticed. Confirmed in practice: an ImGui-based trainer using this exact
+API called `ImGui_ImplDX12_RenderDrawData` without first rebinding its own
+heap, producing this error every frame; the fix was one `SetDescriptorHeaps`
+call right before the `RenderDrawData` call.
+
 **Surviving a device `Reset()`**: a window resize, fullscreen toggle, or
 format change destroys and recreates the back buffer resources (and can
 change their format/dimensions). If your PSO or other render-target-format-

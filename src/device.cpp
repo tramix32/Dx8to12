@@ -231,6 +231,45 @@ static void __stdcall DebugInfoQueueMessageCallback(
   }
   OutputDebugStringA(pDescription);
   LOG(log_severity) << pDescription << "\n";
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // DIAGNOSTIC: a SET_DESCRIPTOR_TABLE_INVALID error has been showing up
+  // every frame with a heap/handle that never matches anything either of
+  // PrepareDrawCall's two SetGraphicsRootDescriptorTable call sites log
+  // (ROOTTABLE-SRV/SAMPLER), and no mod ever registers a render callback
+  // (MODRENDERCALLBACK-REGISTERED never fires) -- ruling out both our own
+  // binding code and the native mod-render-callback API. This callback runs
+  // synchronously on the same thread that made the offending call
+  // (D3D12_MESSAGE_CALLBACK_FLAG_NONE, not deferred), so a stack trace here
+  // should show the real caller even if it's an injected overlay DLL.
+  if (strstr(pDescription, "is different from currently set descriptor heap")) {
+    static int lines = 0;
+    if (lines < 50) {
+      ++lines;
+      void *frames[24] = {};
+      USHORT count = CaptureStackBackTrace(0, 24, frames, nullptr);
+      std::ostringstream dump;
+      dump << "SETDESCTABLE-STACK (" << count << " frames):\n";
+      for (USHORT i = 0; i < count; ++i) {
+        HMODULE module = nullptr;
+        char module_path[MAX_PATH] = {};
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(frames[i]), &module) &&
+            GetModuleFileNameA(module, module_path, sizeof(module_path))) {
+          const uintptr_t offset =
+              reinterpret_cast<uintptr_t>(frames[i]) -
+              reinterpret_cast<uintptr_t>(module);
+          dump << "  #" << i << " " << frames[i] << " " << module_path
+               << "+0x" << std::hex << offset << std::dec << "\n";
+        } else {
+          dump << "  #" << i << " " << frames[i] << " <unresolved module>\n";
+        }
+      }
+      LOG(AixLog::Severity::error) << dump.str();
+    }
+  }
+#endif
   // Only CORRUPTION (actual GPU/driver memory corruption -- vanishingly rare
   // and always worth stopping for) is fatal. ERROR-severity messages used to
   // abort too, which is right for catching *our own* bugs during
@@ -605,6 +644,30 @@ void Device::RegisterModRenderCallback(ModRenderCallback callback) {
                 callback) != mod_render_callbacks_.end()) {
     return;
   }
+  // DIAGNOSTIC: identify which loaded module actually registered this --
+  // see the ROOTTABLE-SRV/SAMPLER diagnostics in PrepareDrawCall, which
+  // proved a SetGraphicsRootDescriptorTable-heap-mismatch error wasn't
+  // coming from our own binding code, pointing at an external mod using
+  // this exact API instead.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  {
+    HMODULE module = nullptr;
+    char module_path[MAX_PATH] = {};
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(callback), &module) &&
+        GetModuleFileNameA(module, module_path, sizeof(module_path))) {
+      LOG(AixLog::Severity::error)
+          << "MODRENDERCALLBACK-REGISTERED callback=" << (void *)callback
+          << " module=" << module_path << "\n";
+    } else {
+      LOG(AixLog::Severity::error)
+          << "MODRENDERCALLBACK-REGISTERED callback=" << (void *)callback
+          << " module=<unresolved>\n";
+    }
+  }
+#endif
   mod_render_callbacks_.push_back(callback);
 }
 
@@ -716,6 +779,10 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   ASSERT_HR(cmd_allocators_[current_back_buffer_]->Reset());
   ASSERT_HR(
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
+  {
+    ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
+    cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
+  }
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
   last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
   // A fresh command list has no root signature, root arguments, or pipeline
@@ -727,14 +794,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
   // Everything the renderer thinks is bound was dropped along with the old
-  // command list -- including the descriptor heaps, which only BeginScene
-  // ever binds. Without this, the first draw after a device reset could skip
-  // BeginScene (DIRTY_FLAG_OM having been left clear) and then call
-  // SetGraphicsRootDescriptorTable against heaps that were never bound,
-  // which the D3D12 debug layer flags as "the descriptor heap containing
-  // handle ... is different from currently set descriptor heap". The
-  // matching command list reset in SubmitAndWait already did this; this one
-  // was missing it.
+  // command list.
   dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
   ++swap_chain_generation_;
 
@@ -2736,14 +2796,17 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   if (!stage_has_texture[0] &&
       (texture_stage_states_[0].color_arg1 == D3DTA_TEXTURE ||
        texture_stage_states_[0].alpha_arg1 == D3DTA_TEXTURE)) {
-    static int wants_tex0_lines = 0;
-    if (wants_tex0_lines < 50) {
-      ++wants_tex0_lines;
-      LOG(AixLog::Severity::error)
-          << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
-          << " colorop=" << texture_stage_states_[0].color_op
-          << " colorarg1=" << texture_stage_states_[0].color_arg1 << "\n";
-    }
+    // Was capped at 50 -- confirmed tonight (braktekstur11.rdc, EID 358/1779)
+    // that a flat-colored "missing texture" quad's compiled PS declares zero
+    // texture resources, i.e. this is exactly the untextured-PSO case this
+    // diagnostic exists to catch -- but the cap meant only the first 50
+    // occurrences (all during startup/loading, per an earlier session's
+    // finding) ever got logged, silently going blind for the rest of the
+    // session, precisely where an actual gameplay repro would fire it.
+    LOG(AixLog::Severity::error)
+        << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
+        << " colorop=" << texture_stage_states_[0].color_op
+        << " colorarg1=" << texture_stage_states_[0].color_arg1 << "\n";
   }
 #endif
   ASSERT(bound_vertex_shader_ != 0);
@@ -3459,6 +3522,19 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
           bound_textures_[i] ? bound_textures_[i].Get() : nullptr;
       if (tex) {
         const auto gpu_handle = srv_heap_.GetGPUHandleFor(tex->srv_handle());
+#ifdef DX8TO12_ENABLE_VALIDATION
+        {
+          static int lines = 0;
+          if (lines < 2000) {
+            ++lines;
+            LOG(AixLog::Severity::error)
+                << "ROOTTABLE-SRV frame=" << CurrentFrame() << " stage=" << i
+                << " slot=" << (textures_start_bindslot_ + i)
+                << " handle=0x" << std::hex << gpu_handle.ptr
+                << " srv_heap=0x" << srv_heap_.heap() << std::dec << "\n";
+          }
+        }
+#endif
         cmd_list_->SetGraphicsRootDescriptorTable(textures_start_bindslot_ + i,
                                                   gpu_handle);
       }
@@ -3500,6 +3576,20 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
         iter = sampler_cache_.insert(iter, std::pair(desc, gpu_handle));
       }
       ASSERT(iter->second.ptr != 0);
+#ifdef DX8TO12_ENABLE_VALIDATION
+      {
+        static int lines = 0;
+        if (lines < 2000) {
+          ++lines;
+          LOG(AixLog::Severity::error)
+              << "ROOTTABLE-SAMPLER frame=" << CurrentFrame() << " stage=" << i
+              << " slot=" << (textures_start_bindslot_ + kMaxTexStages + i)
+              << " handle=0x" << std::hex << iter->second.ptr
+              << " sampler_heap=0x" << sampler_heap_.heap() << std::dec
+              << "\n";
+        }
+      }
+#endif
       cmd_list_->SetGraphicsRootDescriptorTable(
           textures_start_bindslot_ + kMaxTexStages + i, iter->second);
     }
@@ -4095,7 +4185,47 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   MarkResourceAsUsed(bound_index_buffer_);
   cmd_list_->IASetIndexBuffer(&ib_view);
 
-  cmd_list_->DrawIndexedInstanced(index_count, 1, startIndex,
+  // Clamp to what the bound index buffer actually holds. The game
+  // occasionally issues a draw whose (startIndex + index_count) reaches past
+  // the buffer it bound -- confirmed live via the D3D12 debug layer
+  // (COMMAND_LIST_DRAW_INDEX_BUFFER_TOO_SMALL, EXECUTION WARNING #213) on
+  // otherwise-ordinary draws, not just at any one known-bad spot. Real D3D8
+  // (no GPU-side bounds validation at all) just reads whatever bytes happen
+  // to follow the buffer in the allocator's memory and carries on -- usually
+  // harmless garbage, sometimes not, but never a rejected/dropped draw. D3D12
+  // is stricter: reading past the bound view's declared size is undefined
+  // behavior, and on this driver has been observed to make the whole draw
+  // (or the out-of-range tail of it) not rasterize at all -- a plausible
+  // mechanism for the missing-ground-tile family of bugs, since a strict
+  // "read nothing here" is a much better match for "no draw reaches this
+  // pixel" than "reads garbage and looks wrong" would be. Truncating the
+  // index count here is the closer-to-real-D3D8 behavior: draw as much of
+  // the primitive as the buffer actually holds instead of asking the GPU to
+  // read past it.
+  const UINT index_size =
+      bound_index_buffer_->index_buffer_fmt() == DXGI_FORMAT_R32_UINT ? 4 : 2;
+  const UINT indices_in_buffer =
+      safe_cast<UINT>(bound_index_buffer_->resource_desc().Width) /
+      index_size;
+  UINT clamped_index_count = static_cast<UINT>(index_count);
+  if (startIndex >= indices_in_buffer) {
+    clamped_index_count = 0;
+  } else if (startIndex + clamped_index_count > indices_in_buffer) {
+    clamped_index_count = indices_in_buffer - startIndex;
+  }
+#ifdef DX8TO12_ENABLE_VALIDATION
+  if (clamped_index_count != static_cast<UINT>(index_count)) {
+    {
+      LOG(AixLog::Severity::error)
+          << "DRAW-INDEX-CLAMPED frame=" << CurrentFrame()
+          << " requested=" << index_count << " startIndex=" << startIndex
+          << " indicesInBuffer=" << indices_in_buffer
+          << " clampedTo=" << clamped_index_count << "\n";
+    }
+  }
+#endif
+
+  cmd_list_->DrawIndexedInstanced(clamped_index_count, 1, startIndex,
                                   bound_base_vertex_, 0);
   return S_OK;
 }
@@ -4401,6 +4531,24 @@ void Device::SubmitAndWait(bool should_present) {
   ASSERT_HR(cmd_allocators_[current_back_buffer_]->Reset());
   ASSERT_HR(
       cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(), nullptr));
+  {
+    // A freshly-reset command list has no descriptor heaps bound. Only
+    // BeginScene() binds them (see there), and BeginScene() is only called
+    // again here if should_present && DIRTY_FLAG_OM is set (see above) --
+    // which is never true for a mid-frame flush (SubmitAndWait(false), e.g.
+    // BaseSurface::LockGpuReadback). Without this, every draw issued for the
+    // rest of that frame after a mid-frame flush uses SetGraphicsRootDescriptorTable
+    // against heaps the fresh command list never had bound, which the D3D12
+    // debug layer flags as "the descriptor heap containing handle ... is
+    // different from currently set descriptor heap" (EXECUTION ERROR #708
+    // SET_DESCRIPTOR_TABLE_INVALID) -- confirmed live, reproduced from the
+    // menu's blur/reflection effect (which does exactly this kind of
+    // lockable-surface readback). This is undefined behavior on the GPU side,
+    // not just a validation-layer nag -- explains why the resulting bad draws
+    // were inconsistent/intermittent rather than a hard crash.
+    ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
+    cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
+  }
   dirty_flags_ ^= DIRTY_FLAG_CMD_LIST_CLOSED;
   dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
   // Resetting the command list drops all IA state (topology included), so
