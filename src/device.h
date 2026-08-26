@@ -766,42 +766,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   ComPtr<Buffer> ps_creg_cbuffer_;
 
   ComPtr<ID3D12RootSignature> main_root_sig_;
-  // textures_start_bindslot_ is the root parameter index of the single
-  // descriptor table covering all kMaxTexStages SRV registers (t0..t7) --
-  // see InitRootSignatures. Samplers still get one root parameter per stage
-  // (SamplerDesc-keyed caching already keeps that side small and
-  // low-churn; the SRV side is the one that changes practically every
-  // draw), so their root parameters start right after this one table.
   unsigned int textures_start_bindslot_ = UINT32_MAX;
-  unsigned int samplers_start_bindslot_ = UINT32_MAX;
-
-  // A minimal bump allocator over a dedicated shader-visible CBV_SRV_UAV
-  // heap: PrepareDrawCall copies the current kMaxTexStages SRV descriptors
-  // (real texture, or null_srv_cpu_handle_ for an unbound stage) into a
-  // fresh contiguous block here every time any texture stage is dirty, then
-  // binds that one block with a single SetGraphicsRootDescriptorTable call
-  // -- replacing what used to be up to kMaxTexStages separate root-table
-  // binds per texture change. One heap per back-buffer slot, reset (offset
-  // back to 0) at the same point cmd_allocators_[current_back_buffer_]
-  // already resets -- that reset already waits for this slot's prior frame
-  // to be GPU-complete, so reusing its timing here needs no new fence
-  // tracking of its own.
-  struct LinearSrvHeap {
-    ComPtr<ID3D12DescriptorHeap> heap;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start = {};
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu_start = {};
-    UINT increment = 0;
-    int capacity = 0;
-    int next_offset = 0;
-  };
-  std::array<LinearSrvHeap, kNumBackBuffers> tex_scratch_heaps_;
-  // A permanent, never-freed SRV slot (allocated from srv_heap_) holding a
-  // null (resource = nullptr) shader resource view. D3D12 requires every
-  // descriptor in a bound table range to be a legitimate, initialized
-  // descriptor even for a register the currently-bound shader doesn't
-  // actually sample from -- an unbound texture stage gets this copied into
-  // its slot instead of leaving raw/uninitialized heap memory there.
-  D3D12_CPU_DESCRIPTOR_HANDLE null_srv_cpu_handle_ = {};
 
   DescriptorPoolHeap rtv_heap_;
   DescriptorPoolHeap srv_heap_;
