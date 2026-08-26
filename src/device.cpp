@@ -1261,6 +1261,9 @@ void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
   cmd_list_->ResourceBarrier(1, &barrier);
   texture->set_state(state_after);
   MarkResourceAsUsed(InternalPtr(texture));
+#ifdef DX8TO12_ENABLE_VALIDATION
+  LogBarrierStats(/*is_texture=*/true);
+#endif
 }
 
 void Device::TransitionBuffer(Buffer *buffer,
@@ -1270,7 +1273,31 @@ void Device::TransitionBuffer(Buffer *buffer,
       buffer->resource(), buffer->current_state(), state_after);
   cmd_list_->ResourceBarrier(1, &barrier);
   buffer->set_state(state_after);
+#ifdef DX8TO12_ENABLE_VALIDATION
+  LogBarrierStats(/*is_texture=*/false);
+#endif
 }
+
+#ifdef DX8TO12_ENABLE_VALIDATION
+// DIAGNOSTIC: plan/oportowanie.md section 8.1/8.3 -- "measure barrier and
+// copy counts" before considering barrier batching (section 6.1/8.3#8).
+// Both TransitionTexture/TransitionBuffer already skip a no-op transition
+// (same current/target state), so every call counted here is a real,
+// individual ResourceBarrier submission -- exactly what batching multiple
+// barriers into one ResourceBarrier() call (D3D12 accepts an array) would
+// collapse, if there's enough of them clustered together to be worth it.
+void Device::LogBarrierStats(bool is_texture) {
+  static uint64_t tex_barriers = 0, buf_barriers = 0;
+  (is_texture ? tex_barriers : buf_barriers)++;
+  const uint64_t total = tex_barriers + buf_barriers;
+  if (total % 5000 == 0) {
+    LOG(AixLog::Severity::error)
+        << "BARRIER-STATS frame=" << CurrentFrame()
+        << " texBarriers=" << tex_barriers << " bufBarriers=" << buf_barriers
+        << " total=" << total << "\n";
+  }
+}
+#endif
 
 void Device::CopyBuffer(Buffer *dest, int64_t dest_offset,
                         ID3D12Resource *src, int64_t src_offset,

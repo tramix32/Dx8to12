@@ -112,6 +112,11 @@ class Device : public IDirect3DDevice8, RefCounted {
   // buffer written-to-after-being-drawn-from in the same command list gets a
   // correct StateBefore instead of tripping the D3D12 debug layer.
   void TransitionBuffer(Buffer *buffer, D3D12_RESOURCE_STATES state_after);
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // See the definition (device.cpp, right after TransitionTexture/
+  // TransitionBuffer) for what this measures and why.
+  void LogBarrierStats(bool is_texture);
+#endif
 
   // Marks a dynamic buffer that needs to be persisted at the end of the frame.
   void MarkBufferForPersist(Buffer *buffer);
