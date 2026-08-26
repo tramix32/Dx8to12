@@ -2811,6 +2811,25 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   pso_key.rs.normalized_normals = FALSE;
 
   auto pso_cache_iter = pso_cache_.find(pso_key);
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // DIAGNOSTIC: plan/oportowanie.md section 8.3 item 7 -- cache hit/miss and
+  // compile counters. pso_cache_/ps_cache_ never evict (see the comment near
+  // their declarations), so a session that compiles many distinct PSOs
+  // could in principle grow without bound; this is the cheap first check
+  // before considering an actual eviction policy (which risks the same
+  // stale-PSO-still-referenced-by-an-in-flight-command-list hazard this
+  // session has already hit once with programmable shader identity).
+  {
+    static uint64_t hits = 0, misses = 0;
+    (pso_cache_iter != pso_cache_.end() ? hits : misses)++;
+    if ((hits + misses) % 2000 == 0) {
+      LOG(AixLog::Severity::error)
+          << "PSOCACHE-STATS frame=" << CurrentFrame() << " hits=" << hits
+          << " misses=" << misses << " distinctPSOs=" << pso_cache_.size()
+          << "\n";
+    }
+  }
+#endif
   if (pso_cache_iter != pso_cache_.end()) {
     return pso_cache_iter->second;
   }
@@ -3430,6 +3449,22 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
       if (!(mask & (1u << i))) continue;
       SamplerDesc desc(texture_stage_states_[i]);
       auto iter = sampler_cache_.find(desc);
+#ifdef DX8TO12_ENABLE_VALIDATION
+      // DIAGNOSTIC: same plan item as PSOCACHE-STATS above, for the sampler
+      // cache -- sampler_heap_ is a fixed-size pool (kMaxSamplerStates=64,
+      // device_limits.h) that never evicts either, so this also answers
+      // "is the distinct-sampler-state count anywhere near that limit."
+      {
+        static uint64_t hits = 0, misses = 0;
+        (iter != sampler_cache_.end() ? hits : misses)++;
+        if ((hits + misses) % 2000 == 0) {
+          LOG(AixLog::Severity::error)
+              << "SAMPLERCACHE-STATS frame=" << CurrentFrame()
+              << " hits=" << hits << " misses=" << misses
+              << " distinctSamplers=" << sampler_cache_.size() << "\n";
+        }
+      }
+#endif
       if (iter == sampler_cache_.end()) {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = sampler_heap_.Allocate();
         d3d12_device_->CreateSampler(&desc, cpu_handle);
