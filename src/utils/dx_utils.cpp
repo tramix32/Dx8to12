@@ -5,6 +5,7 @@
 
 #include <algorithm>
 
+#include "config.h"
 #include "render_state.h"
 
 namespace Dx8to12 {
@@ -39,15 +40,34 @@ static D3D12_FILTER EncodeFilter(D3DTEXTUREFILTERTYPE min_filter,
 
 SamplerDesc::SamplerDesc(const TextureStageState &ts) {
   D3DCOLORVALUE border = Dx8::Color(ts.border_color).ToValue();
+  // AnisotropicOverride (dx8to12.ini / Dx8to12_SetSettingInt, see config.h):
+  // -1 (default) leaves every sampler exactly as the app requested it --
+  // was documented and exposed via the mod API but never actually
+  // consumed anywhere in the sampler-building path until now, so setting
+  // it previously had zero effect regardless of value. A positive value
+  // forces real anisotropic filtering on every sampler, which is the
+  // standard fix for the aliasing/streaking a linearly-filtered,
+  // single-mip texture shows when a tiled surface (a wall, a road) is
+  // viewed at a grazing angle -- confirmed via a RenderDoc capture showing
+  // exactly that: FilterMode.Linear/Linear/Linear, MaxAnisotropy=0, on a
+  // 256x256 texture with only 1 mip level.
+  const int aniso_override = GetConfig().anisotropic_override;
+  const bool force_anisotropic = aniso_override > 0;
   *this = D3D12_SAMPLER_DESC{
-      .Filter = EncodeFilter(ts.min_filter, ts.mag_filter, ts.mip_filter),
+      .Filter = force_anisotropic
+                    ? D3D12_ENCODE_ANISOTROPIC_FILTER(
+                          D3D12_FILTER_REDUCTION_TYPE_STANDARD)
+                    : EncodeFilter(ts.min_filter, ts.mag_filter,
+                                   ts.mip_filter),
       // Luckily D3D12_TEXTURE_ADDRESS_MODE maps directly.
       .AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(ts.address_u),
       .AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(ts.address_v),
       .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
       // .AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(ts.address_w),
       .MipLODBias = std::clamp(ts.mipmap_lod_bias, -16.f, 15.99f),
-      .MaxAnisotropy = ts.max_anisotropy,
+      .MaxAnisotropy = force_anisotropic
+                           ? static_cast<UINT>(aniso_override)
+                           : ts.max_anisotropy,
       .ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS,
       .BorderColor = {border.r, border.g, border.b, border.a},
       .MinLOD = 0.f,
@@ -55,6 +75,10 @@ SamplerDesc::SamplerDesc(const TextureStageState &ts) {
       // levels" -- clamp to the single most-detailed level. Otherwise allow
       // the full chain; the GPU picks the appropriate level per-pixel based
       // on screen-space derivatives, same as real D3D8 hardware would.
+      // Forcing anisotropic doesn't change this -- a single-mip texture
+      // still only has level 0 to sample from either way, anisotropic
+      // filtering just samples it with a wider, angle-aware footprint
+      // instead of plain bilinear.
       .MaxLOD = ts.mip_filter == D3DTEXF_NONE ? 0.f : D3D12_FLOAT32_MAX,
   };
 }
