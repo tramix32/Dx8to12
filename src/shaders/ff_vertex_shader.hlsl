@@ -18,9 +18,15 @@ FFVertexOutput VSMain(VertexInput IN) {
   OUT.oPos = mul(world_view_proj, float4(IN.input_reg0, 1.f));
 
 #ifdef HAS_NORMAL
-  // TODO: Don't normalize if normalized_normals is set.
-  float3 view_normal =
-      normalize(mul(world_view, float4(IN.input_reg3, 0.f)).xyz);
+  // D3DRS_NORMALIZENORMALS defaults to FALSE -- real D3D8 fixed-function
+  // only renormalizes here when the app explicitly asks for it. Left
+  // unnormalized (the common case), a scaled world matrix scales the
+  // transformed normal's length too, which the lighting math in
+  // ComputeLighting then picks up as a genuine (if hardware-authentic)
+  // brightness change -- normalizing unconditionally was quietly hiding
+  // that on every scaled object.
+  float3 view_normal = mul(world_view, float4(IN.input_reg3, 0.f)).xyz;
+  if (normalize_normals) view_normal = normalize(view_normal);
   float3 view_pos = mul(world_view, float4(IN.input_reg0, 1.f)).xyz;
   OUT.oViewPos = view_pos;
   OUT.oViewNormal = view_normal;

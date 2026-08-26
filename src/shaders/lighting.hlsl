@@ -31,7 +31,7 @@ cbuffer Lights : register(b2) {
   int specular_enable;
   int lighting_enabled;
   int emissive_material_source;
-  int pad1;
+  int normalize_normals;  // D3DRS_NORMALIZENORMALS, see vertex_shader.h.
   float4 global_ambient;
 };
 

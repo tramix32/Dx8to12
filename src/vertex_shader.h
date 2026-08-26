@@ -92,7 +92,14 @@ struct LightsCBuffer {
   // PixelCBuffer (shared ALL-visibility), but which color feeds it is a
   // per-vertex decision.
   D3DMATERIALCOLORSOURCE emissive_material_source;
-  int pad;
+  // D3DRS_NORMALIZENORMALS (default FALSE). Real D3D8 fixed-function only
+  // renormalizes the post-world-transform normal when this is explicitly
+  // enabled -- by default a non-uniformly (or even just non-1.0-uniformly)
+  // scaled world matrix is supposed to scale the normal's length too, which
+  // then scales the N.L/N.H lighting terms with it. The vertex shader
+  // previously always normalized unconditionally, which is a real deviation
+  // from hardware behavior for any scaled object, not just an edge case.
+  int normalize_normals;
   D3DCOLORVALUE global_ambient;
 };
 struct PixelCBuffer {

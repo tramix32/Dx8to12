@@ -3273,6 +3273,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
                                    : D3DMCS_MATERIAL;
     cbuffer->specular_enable = render_state_.specular_enable;
     cbuffer->lighting_enabled = render_state_.lighting;
+    cbuffer->normalize_normals = render_state_.normalized_normals;
     cbuffer->global_ambient = Dx8::Color(render_state_.ambient).ToValue();
     ASSERT_HR(lights_cbuffer_->Unlock());
     dirty_flags_ ^= DIRTY_FLAG_LIGHTS;
