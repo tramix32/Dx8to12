@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <intrin.h>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -2803,10 +2805,80 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
     // occurrences (all during startup/loading, per an earlier session's
     // finding) ever got logged, silently going blind for the rest of the
     // session, precisely where an actual gameplay repro would fire it.
-    LOG(AixLog::Severity::error)
-        << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
-        << " colorop=" << texture_stage_states_[0].color_op
-        << " colorarg1=" << texture_stage_states_[0].color_arg1 << "\n";
+    // Every legitimate call site sets a texture before drawing, so whatever
+    // called *through* d3d8.dll to land here (game code, or a mod hooking a
+    // D3D8 API) is the culprit. This fires ~4x/frame -- too often to log a
+    // full 24-frame stack every time without flooding log.txt -- so resolve
+    // just the first frame outside d3d8.dll (skipping our own internal call
+    // chain, which is identical on every occurrence) and dedupe on that: one
+    // compact line per occurrence for frequency counting via grep, and the
+    // full stack only the first time a given external caller is seen.
+    {
+      static HMODULE self_module = [] {
+        HMODULE m = nullptr;
+        // _ReturnAddress() here is CreatePSO's own call site inside
+        // PrepareDrawCall -- any address known to live inside d3d8.dll,
+        // used purely to identify "our own module" for the skip-filter
+        // below.
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(_ReturnAddress()), &m);
+        return m;
+      }();
+      void *frames[24] = {};
+      USHORT count = CaptureStackBackTrace(0, 24, frames, nullptr);
+      void *caller = nullptr;
+      HMODULE caller_module = nullptr;
+      char caller_path[MAX_PATH] = {};
+      uintptr_t caller_offset = 0;
+      for (USHORT i = 0; i < count; ++i) {
+        HMODULE module = nullptr;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(frames[i]), &module) &&
+            module != self_module) {
+          caller = frames[i];
+          caller_module = module;
+          GetModuleFileNameA(module, caller_path, sizeof(caller_path));
+          caller_offset = reinterpret_cast<uintptr_t>(frames[i]) -
+                          reinterpret_cast<uintptr_t>(module);
+          break;
+        }
+      }
+      LOG(AixLog::Severity::error)
+          << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
+          << " colorop=" << texture_stage_states_[0].color_op
+          << " colorarg1=" << texture_stage_states_[0].color_arg1
+          << " caller=" << caller_path << "+0x" << std::hex << caller_offset
+          << std::dec << "\n";
+      static std::set<void *> seen_callers;
+      if (caller && seen_callers.insert(caller).second) {
+        std::ostringstream dump;
+        dump << "PSO-WANTS-TEX0-BUT-NONE-BOUND-STACK (new caller "
+             << caller_path << "+0x" << std::hex << caller_offset << std::dec
+             << ", " << count << " frames):\n";
+        for (USHORT i = 0; i < count; ++i) {
+          HMODULE module = nullptr;
+          char module_path[MAX_PATH] = {};
+          if (GetModuleHandleExA(
+                  GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                  reinterpret_cast<LPCSTR>(frames[i]), &module) &&
+              GetModuleFileNameA(module, module_path, sizeof(module_path))) {
+            const uintptr_t offset =
+                reinterpret_cast<uintptr_t>(frames[i]) -
+                reinterpret_cast<uintptr_t>(module);
+            dump << "  #" << i << " " << frames[i] << " " << module_path
+                 << "+0x" << std::hex << offset << std::dec << "\n";
+          } else {
+            dump << "  #" << i << " " << frames[i] << " <unresolved module>\n";
+          }
+        }
+        LOG(AixLog::Severity::error) << dump.str();
+      }
+    }
   }
 #endif
   ASSERT(bound_vertex_shader_ != 0);
