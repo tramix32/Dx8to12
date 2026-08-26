@@ -3375,6 +3375,38 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     // texture identities against the current binding.
     const uint32_t mask =
         kCacheDrawStateBindings ? dirty_texture_stage_mask_ : 0xFFu;
+#ifdef DX8TO12_ENABLE_VALIDATION
+    // DIAGNOSTIC: an external analysis of the reverted single-descriptor-
+    // table experiment (see git branch descriptor-table-perf-investigation)
+    // pointed out the real cost wasn't the copy API chosen -- it was
+    // rebuilding all kMaxTexStages slots on every dirty event regardless of
+    // how many stages actually changed. Before attempting a partial-update
+    // or cached-table redesign (both of which reintroduce the same class of
+    // stale-descriptor lifetime risk this session has spent all night
+    // chasing elsewhere), measure whether that premise even holds for this
+    // game: how many of the 8 stages does a typical dirty event actually
+    // touch? Histogram bucketed by popcount(mask), logged periodically
+    // rather than per-event to avoid SETTEX0-scale log volume for something
+    // that's just a distribution question.
+    {
+      static uint64_t histogram[kMaxTexStages + 1] = {};
+      static uint64_t total_events = 0;
+      int changed = 0;
+      for (uint32_t m = mask; m; m &= (m - 1)) ++changed;
+      ++histogram[changed];
+      ++total_events;
+      if (total_events % 5000 == 0) {
+        std::ostringstream dump;
+        dump << "TEXDIRTY-HISTOGRAM frame=" << CurrentFrame()
+             << " totalEvents=" << total_events << " counts=[";
+        for (int i = 0; i <= kMaxTexStages; ++i) {
+          dump << histogram[i] << (i < kMaxTexStages ? "," : "");
+        }
+        dump << "]\n";
+        LOG(AixLog::Severity::error) << dump.str();
+      }
+    }
+#endif
     for (int i = 0; i < kMaxTexStages; ++i) {
       if (!(mask & (1u << i))) continue;
       GpuTexture *tex =
