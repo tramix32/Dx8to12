@@ -33,6 +33,18 @@ struct Config {
   // depth-stencil format switch (see the D3DRS_ZBIAS gap in ROADMAP.md).
   bool high_precision_depth = false;
 
+  // Lowers the log file's sink severity threshold from Severity::info to
+  // Severity::trace, i.e. turns on TRACE_ENTRY's full per-call D3D8 API
+  // trace (function name + every argument, for essentially every
+  // IDirect3DDevice8 method) for the whole session. Off by default because
+  // the volume is enormous (dllmain.cpp measured ~15k SetTexture calls/sec
+  // alone in a busy scene) -- meant to be turned on only for a short,
+  // deliberately narrow repro session chasing a specific bug, then turned
+  // back off. Only takes effect in a DX8TO12_ENABLE_VALIDATION (dev) build;
+  // TRACE_ENTRY compiles to nothing at all in release regardless of this
+  // setting.
+  bool full_trace_log = false;
+
   // Every field above, by name, for the generic string-keyed Get/Set API in
   // dx8to12_api.cpp and the INI parser in config.cpp. Keep this in sync when
   // adding a field -- see the kFields table at the top of config.cpp.

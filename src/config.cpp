@@ -98,6 +98,9 @@ void LoadConfig(HMODULE dll_module) {
       } else if (EqualsIgnoreCase(key, "HighPrecisionDepth")) {
         applied = SetConfigValueBool(
             key, EqualsIgnoreCase(value, "true") || value == "1");
+      } else if (EqualsIgnoreCase(key, "FullTraceLog")) {
+        applied = SetConfigValueBool(
+            key, EqualsIgnoreCase(value, "true") || value == "1");
       } else {
         LOG(AixLog::Severity::error)
             << "LoadConfig: dx8to12.ini line " << line_number
@@ -121,7 +124,8 @@ void LoadConfig(HMODULE dll_module) {
       << "AnisotropicOverride=" << g_config.anisotropic_override
       << " MSAASamples=" << g_config.msaa_samples
       << " SharpenStrength=" << g_config.sharpen_strength
-      << " HighPrecisionDepth=" << g_config.high_precision_depth << "\n";
+      << " HighPrecisionDepth=" << g_config.high_precision_depth
+      << " FullTraceLog=" << g_config.full_trace_log << "\n";
 }
 
 bool GetConfigValueInt(const std::string &key, int *out_value) {
@@ -172,12 +176,20 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.high_precision_depth;
     return true;
   }
+  if (EqualsIgnoreCase(key, "FullTraceLog")) {
+    *out_value = g_config.full_trace_log;
+    return true;
+  }
   return false;
 }
 
 bool SetConfigValueBool(const std::string &key, bool value) {
   if (EqualsIgnoreCase(key, "HighPrecisionDepth")) {
     g_config.high_precision_depth = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "FullTraceLog")) {
+    g_config.full_trace_log = value;
     return true;
   }
   return false;

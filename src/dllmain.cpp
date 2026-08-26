@@ -136,9 +136,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                       LPVOID lpReserved) {
   switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
-      AixLog::Log::init<AixLog::SinkFile>(AixLog::Severity::info,
-                                          CURRENT_SOURCE_DIR "/log.txt");
+    case DLL_PROCESS_ATTACH: {
+      auto log_sink = AixLog::Log::init<AixLog::SinkFile>(
+          AixLog::Severity::info, CURRENT_SOURCE_DIR "/log.txt");
       AddVectoredExceptionHandler(1 /* call first */,
                                   LogCrashAndContinueSearch);
       LOG(AixLog::Severity::info)
@@ -176,7 +176,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
         }
       }
       Dx8to12::LoadConfig(hModule);
+      // FullTraceLog (dx8to12.ini): lower the sink's own severity threshold
+      // from info to trace *after* LoadConfig has run, since LoadConfig
+      // itself needs to log through the already-initialized sink above at
+      // the normal (info) threshold. Sink::filter is public specifically to
+      // allow this -- see AixLog::Filter::add_filter, which just overwrites
+      // the "*" tag's threshold, so this is a real, in-place raise of the
+      // verbosity floor, not a second sink or a reinit.
+      if (Dx8to12::GetConfig().full_trace_log) {
+        log_sink->filter.add_filter(AixLog::Severity::trace);
+        LOG(AixLog::Severity::info)
+            << "FullTraceLog enabled -- every IDirect3DDevice8 call will be "
+               "logged via TRACE_ENTRY for the rest of this session. Expect "
+               "a very large log.txt; turn this back off in dx8to12.ini "
+               "once done.\n";
+      }
       break;
+    }
     case DLL_THREAD_ATTACH:
       // Cheap breadcrumb for the thread-ID cross-referencing above -- lets
       // us see whether a crash on some other thread is one the game spun up
