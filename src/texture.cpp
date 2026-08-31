@@ -35,6 +35,14 @@ BaseTexture *BaseTexture::Create(Device *device, TextureKind kind,
   if (HasFlag(d3d8_usage, D3DUSAGE_DYNAMIC) && pool != D3DPOOL_DEFAULT)
     return nullptr;
 
+  // Depth-stencil resources are created typeless: a concrete-format resource
+  // can only ever get a DSV, never also an SRV (needed so mods can read the
+  // depth buffer via the Dx8to12_GetDepthBuffer* mod API -- see
+  // GpuTexture::InitViews, which recovers the concrete DSV/SRV formats from
+  // this typeless resource format).
+  DXGI_FORMAT resource_format = DXGIFromD3DFormat(format);
+  if (d3d8_usage & D3DUSAGE_DEPTHSTENCIL)
+    resource_format = DepthTypelessFromConcrete(resource_format);
   D3D12_RESOURCE_DESC resource_desc = {
       .Dimension = kTextureKindToDimension[(int)kind],
       .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
@@ -42,7 +50,7 @@ BaseTexture *BaseTexture::Create(Device *device, TextureKind kind,
       .Height = height,
       .DepthOrArraySize = safe_cast<uint16_t>(depth),
       .MipLevels = safe_cast<uint16_t>(mip_levels),
-      .Format = DXGIFromD3DFormat(format),
+      .Format = resource_format,
       .SampleDesc = {.Count = 1, .Quality = 0},
       .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN};
   if (resource_desc.MipLevels == 0) {
@@ -165,15 +173,28 @@ D3DSURFACE_DESC BaseTexture::GetSurfaceDesc(uint32_t subresource) const {
 
 HRESULT STDMETHODCALLTYPE BaseTexture::QueryInterface(REFIID riid,
                                                        void **ppvObj) {
-  if (riid == IID_IUnknown || riid == IID_IDirect3DResource8 ||
-      riid == IID_IDirect3DBaseTexture8 ||
-      (kind_ == TextureKind::Texture2d && riid == IID_IDirect3DTexture8)) {
+  if (riid == IID_IDirect3DTexture8 && kind_ == TextureKind::Texture2d) {
     *ppvObj = static_cast<IDirect3DTexture8 *>(this);
     AddRef();
     return S_OK;
   }
-  if (kind_ == TextureKind::Cube && riid == IID_IDirect3DCubeTexture8) {
+  if (riid == IID_IDirect3DCubeTexture8 && kind_ == TextureKind::Cube) {
     *ppvObj = static_cast<IDirect3DCubeTexture8 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  // IID_IDirect3DBaseTexture8 must return the BaseTexture subobject itself.
+  // Returning the 2D interface address here is not pointer-compatible with
+  // the base interface in this multiple-inheritance implementation; a game
+  // that QI's a texture and passes it back to SetTexture would then feed an
+  // invalid `this` pointer through the shim.
+  if (riid == IID_IUnknown || riid == IID_IDirect3DResource8 ||
+      riid == IID_IDirect3DBaseTexture8) {
+    *ppvObj = kind_ == TextureKind::Texture2d
+                  ? static_cast<IDirect3DBaseTexture8 *>(
+                        static_cast<IDirect3DTexture8 *>(this))
+                  : static_cast<IDirect3DBaseTexture8 *>(
+                        static_cast<IDirect3DCubeTexture8 *>(this));
     AddRef();
     return S_OK;
   }
@@ -336,6 +357,10 @@ void CpuTexture::CopySubresourceToGpuTexture(
              compact_pitch);
     }
   }
+  // The upload ring is also used as a vertex/index buffer.  D3D12 requires
+  // an explicit COPY_SOURCE state before using it as the source of a texture
+  // copy; without this, mip uploads are undefined under a fast GPU queue.
+  device_->TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
   // Issue the CopyTextureRegion.
   D3D12_TEXTURE_COPY_LOCATION src_location{
       .pResource = device_->dynamic_ring_buffer()->GetBackingResource(),
@@ -362,8 +387,15 @@ GpuTexture::GpuTexture(Device *device, TextureKind kind, Dx8::Usage usage,
     current_state_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   else
     current_state_ = D3D12_RESOURCE_STATE_COMMON;
+  subresource_states_.assign(footprints_.size(), current_state_);
 
-  D3D12_CLEAR_VALUE clear_value = {.Format = resource_desc_.Format};
+  // The optimized clear value's Format must be a concrete DSV-compatible
+  // format, not the (now typeless, see BaseTexture::Create) resource format
+  // -- D3D12 rejects a typeless Format here for depth-stencil resources.
+  D3D12_CLEAR_VALUE clear_value = {
+      .Format = HasFlag(resource_desc_.Flags, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                    ? DepthDsvFormatFromTypeless(resource_desc_.Format)
+                    : resource_desc_.Format};
   if (HasFlag(resource_desc_.Flags, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     clear_value.Color[0] = 1.f;
   D3D12_CLEAR_VALUE *p_clear_value =
@@ -383,15 +415,22 @@ GpuTexture::GpuTexture(Device *device, ComPtr<ID3D12Resource> resource)
                   D3DPOOL_DEFAULT, resource->GetDesc()),
       resource_(resource),
       current_state_(D3D12_RESOURCE_STATE_COMMON) {
+  subresource_states_.assign(footprints_.size(), current_state_);
   InitViews();
 }
 
 void GpuTexture::InitViews() {
-  // Allocate a spot in the SRV heap.
-  if (!HasFlag(usage_, D3DUSAGE_DEPTHSTENCIL)) {
+  // Allocate a spot in the SRV heap. Depth-stencil textures get one too --
+  // the resource is typeless (see BaseTexture::Create), so the SRV needs its
+  // own concrete, SRV-compatible format instead of resource_desc_.Format
+  // (which is only valid for the DSV below). This is what
+  // Dx8to12_GetDepthBuffer*'s mod API reads back via srv_handle().
+  {
     srv_handle_ = device_->srv_heap().Allocate();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{
-        .Format = resource_desc_.Format,
+        .Format = HasFlag(usage_, D3DUSAGE_DEPTHSTENCIL)
+                      ? DepthSrvFormatFromTypeless(resource_desc_.Format)
+                      : resource_desc_.Format,
         .ViewDimension = kTextureKindToSrvDimension[static_cast<int>(kind_)],
         .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         // Hacky, but TextureCube and Texture2D share the same layout.
@@ -419,7 +458,7 @@ void GpuTexture::InitViews() {
     ASSERT(kind_ == TextureKind::Texture2d);
     ASSERT_TODO(resource_desc_.MipLevels == 1, "Depth targets with > 1 mip.");
     D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{
-        .Format = resource_desc_.Format,
+        .Format = DepthDsvFormatFromTypeless(resource_desc_.Format),
         .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
         .Flags = D3D12_DSV_FLAG_NONE,
         .Texture2D = {}};

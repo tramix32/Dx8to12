@@ -159,6 +159,18 @@ class GpuTexture : public BaseTexture {
   const D3D12_RESOURCE_DESC& resource_desc() const { return resource_desc_; }
   D3D12_RESOURCE_STATES current_state() const { return current_state_; }
   void set_state(D3D12_RESOURCE_STATES state) { current_state_ = state; }
+  D3D12_RESOURCE_STATES current_state(uint32_t subresource) const {
+    return subresource_states_.empty() ? current_state_
+                                       : subresource_states_[subresource];
+  }
+  void set_state(uint32_t subresource, D3D12_RESOURCE_STATES state) {
+    if (!subresource_states_.empty()) subresource_states_[subresource] = state;
+    current_state_ = state;
+  }
+  void set_all_states(D3D12_RESOURCE_STATES state) {
+    current_state_ = state;
+    for (auto &s : subresource_states_) s = state;
+  }
 
   DWORD d3d8_usage() const { return usage_; }
   D3DPOOL d3d8_pool() const { return pool_; }
@@ -203,6 +215,7 @@ class GpuTexture : public BaseTexture {
   D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle_ = {};
 
   D3D12_RESOURCE_STATES current_state_;
+  std::vector<D3D12_RESOURCE_STATES> subresource_states_;
 
   ComPtr<CpuTexture> cpu_tex_;
   uint64_t last_update_frame_ = 0;

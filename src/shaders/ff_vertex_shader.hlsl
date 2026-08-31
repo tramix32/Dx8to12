@@ -16,6 +16,10 @@ FFVertexOutput VSMain(VertexInput IN) {
 
 #ifndef HAS_TRANSFORM
   OUT.oPos = mul(world_view_proj, float4(IN.input_reg0, 1.f));
+  // See the comment on FFVertexOutput::oPerPixelLightingEligible
+  // (common.hlsl) -- this whole branch is real (non-pretransformed) 3D
+  // geometry, the only kind D3D8 fixed-function lighting ever applies to.
+  OUT.oPerPixelLightingEligible = 1.f;
 
 #ifdef HAS_NORMAL
   // D3DRS_NORMALIZENORMALS defaults to FALSE -- real D3D8 fixed-function
@@ -38,10 +42,18 @@ FFVertexOutput VSMain(VertexInput IN) {
   // geometry, including roads), did not. A model authored to be unlit (flat
   // baked vertex colors, D3DRS_LIGHTING off) got re-lit by whatever the
   // scene's lights/ambient happened to be instead of showing its own colors.
+#ifndef PER_PIXEL_LIGHTING
+  // Under PER_PIXEL_LIGHTING, ff_pixel_shader.cpp's generated PSMain does
+  // this same ComputeLighting call itself, per pixel, using the interpolated
+  // (and there, renormalized) oViewPos/oViewNormal below -- doing it here too
+  // would light the geometry twice. lighting_enabled is still read there at
+  // pixel-shader time, so D3DRS_LIGHTING's on/off semantics are unchanged;
+  // only *where* the lit color gets computed moves.
   if (lighting_enabled) {
     vertex_diffuse = ComputeLighting(view_pos, view_normal, vertex_diffuse,
                                      vertex_specular, specular_lighting);
   }
+#endif
   OUT.oFog = ComputeFogFactor(length(view_pos));
 #else
   // No normal stream, so per-light diffuse/specular can't be computed (their
@@ -53,11 +65,24 @@ FFVertexOutput VSMain(VertexInput IN) {
   // (common for unlit-looking static geometry) rendered solid black instead
   // of getting lit by the scene's ambient term.
   float3 view_pos = mul(world_view, float4(IN.input_reg0, 1.f)).xyz;
+  // Needed so PER_PIXEL_LIGHTING's pixel-shader ComputeLighting call (which
+  // has no other way to get this branch's position) can still compute
+  // correct point/spot-light attenuation distance even without a normal --
+  // previously unset here since nothing in the non-per-pixel path after this
+  // point read it.
+  OUT.oViewPos = view_pos;
+#ifndef PER_PIXEL_LIGHTING
+  // See the PER_PIXEL_LIGHTING comment in the HAS_NORMAL branch above --
+  // same reasoning. oViewNormal is left at its zero-initialized default here
+  // (no normal stream to derive it from), which the pixel shader's
+  // ComputeLighting call treats the same way this one does: a zero normal
+  // zeroes out diffuse/specular, leaving ambient/emissive only.
   if (lighting_enabled) {
     float4 unused_specular;
     vertex_diffuse = ComputeLighting(view_pos, float3(0, 0, 0), vertex_diffuse,
                                      vertex_specular, unused_specular);
   }
+#endif
   OUT.oFog = ComputeFogFactor(length(view_pos));
 #endif
 #else
@@ -93,7 +118,15 @@ FFVertexOutput VSMain(VertexInput IN) {
 #endif
 
   OUT.oD0 = vertex_diffuse;
+#ifdef PER_PIXEL_LIGHTING
+  // ComputeLighting in the pixel shader still needs the original COLOR2 /
+  // material-specular input when D3DMCS_COLOR2 is selected. Passing the
+  // (not yet computed) specular_lighting value here made that source always
+  // zero in per-pixel and RT modes.
+  OUT.oD1 = vertex_specular;
+#else
   OUT.oD1 = specular_lighting;
+#endif
 
 // Forward texture coordinates.
 #ifdef HAS_T0

@@ -18,6 +18,16 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format);
 DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format);
 int DXGIFormatSize(DXGI_FORMAT format);
 
+// Depth-stencil resources need a typeless resource format (DSV and SRV can't
+// both bind a concrete-format resource) -- these three only ever need to
+// handle the three concrete depth formats DXGIFromD3DFormat can produce
+// (D32_FLOAT/D16_UNORM/D24_UNORM_S8_UINT). Used by BaseTexture::Create (to
+// pick the resource's actual Format) and GpuTexture::InitViews (to recover
+// the concrete DSV/SRV formats from that typeless resource format).
+DXGI_FORMAT DepthTypelessFromConcrete(DXGI_FORMAT concrete_depth);
+DXGI_FORMAT DepthDsvFormatFromTypeless(DXGI_FORMAT typeless);
+DXGI_FORMAT DepthSrvFormatFromTypeless(DXGI_FORMAT typeless);
+
 // Block-compressed (S3TC/DXT -> BC1/BC2/BC3) formats are addressed in 4x4
 // texel blocks, not individual texels -- DXGIFormatSize's "bytes per pixel"
 // contract doesn't apply to them at all (BC1 averages 0.5 bytes/texel, which

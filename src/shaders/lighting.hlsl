@@ -79,7 +79,11 @@ float4 ComputeLighting(float3 view_pos, float3 view_normal,
           attenuation = 0;
         else {
           float dist = sqrt(dist_sq);
-          dir_to_light /= dist;
+          // A vertex/pixel may coincide exactly with a point light. Avoid
+          // 0/0 here: there is no stable direction at the light origin, so
+          // diffuse/specular are zero while ambient still receives the
+          // finite attenuation below.
+          dir_to_light = dist > 1e-6f ? dir_to_light / dist : 0;
           attenuation =
               saturate(rcp(light.attentuation0 + light.attentuation1 * dist +
                            light.attentuation2 * dist_sq));

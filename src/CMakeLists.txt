@@ -29,6 +29,10 @@ target_sources(
           device_limits.h
           config.h
           config.cpp
+          raytracing.h
+          raytracing.cpp
+          rt_helper_client.h
+          rt_helper_client.cpp
           dx8to12_api.cpp)
 
 add_subdirectory(utils)

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "aixlog.hpp"
+#include "config.h"
 #include "d3d8types.h"
 #include "device_limits.h"
 #include "shader_parser.h"
@@ -227,7 +228,21 @@ VertexShader CreateFixedFunctionVertexShader(
   }
 
   std::vector<D3D_SHADER_MACRO> defines;
-  defines.reserve(13);
+  defines.reserve(14);
+  // Config::lighting_mode == PerPixel (1): skip this shader's own
+  // ComputeLighting call and let ff_pixel_shader.cpp's generated PSMain do it
+  // instead, per pixel -- see the PER_PIXEL_LIGHTING comments in
+  // ff_vertex_shader.hlsl. Read fresh on every (re)compile, which is exactly
+  // when this matters: Device::OnLightingModeChanged (device.cpp) forces
+  // every fixed-function vertex shader to recompile when the mode changes, so
+  // there's never a stale shader compiled against a since-abandoned mode.
+  // Every RT mode builds on the same per-pixel direct-lighting baseline.
+  // The helper may add shadows/reflections/GI later, but the x86 fixed-
+  // function path must not silently fall back to vertex lighting in modes
+  // 2-4 while those results are being composed.
+  if (Dx8to12::GetConfig().lighting_mode >= 1) {
+    defines.push_back({"PER_PIXEL_LIGHTING", "1"});
+  }
   if (has_diffuse) defines.push_back({"HAS_DIFFUSE", "1"});
   if (has_specular) defines.push_back({"HAS_SPECULAR", "1"});
   if (has_normal) defines.push_back({"HAS_NORMAL", "1"});

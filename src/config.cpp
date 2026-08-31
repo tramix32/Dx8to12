@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "aixlog.hpp"
+#include "device.h"
 
 namespace Dx8to12 {
 
@@ -30,6 +31,15 @@ bool EqualsIgnoreCase(const std::string &a, const std::string &b) {
 }
 
 Config g_config;
+
+// LightingMode values 2+ need a raytracing-capable device; there either isn't
+// one yet (config load happens at DLL_PROCESS_ATTACH, long before device
+// creation) or the adapter doesn't support DXR. Either way, refuse to hand
+// out a mode nothing can render and say why.
+bool RaytracingSupported() {
+  Device *device = GetCurrentDeviceForModApi();
+  return device && device->raytracing_supported();
+}
 
 }  // namespace
 
@@ -93,6 +103,8 @@ void LoadConfig(HMODULE dll_module) {
         applied = SetConfigValueInt(key, std::stoi(value));
       } else if (EqualsIgnoreCase(key, "MSAASamples")) {
         applied = SetConfigValueInt(key, std::stoi(value));
+      } else if (EqualsIgnoreCase(key, "LightingMode")) {
+        applied = SetConfigValueInt(key, std::stoi(value));
       } else if (EqualsIgnoreCase(key, "SharpenStrength")) {
         applied = SetConfigValueFloat(key, std::stof(value));
       } else if (EqualsIgnoreCase(key, "HighPrecisionDepth")) {
@@ -125,7 +137,8 @@ void LoadConfig(HMODULE dll_module) {
       << " MSAASamples=" << g_config.msaa_samples
       << " SharpenStrength=" << g_config.sharpen_strength
       << " HighPrecisionDepth=" << g_config.high_precision_depth
-      << " FullTraceLog=" << g_config.full_trace_log << "\n";
+      << " FullTraceLog=" << g_config.full_trace_log
+      << " LightingMode=" << g_config.lighting_mode << "\n";
 }
 
 bool GetConfigValueInt(const std::string &key, int *out_value) {
@@ -135,6 +148,10 @@ bool GetConfigValueInt(const std::string &key, int *out_value) {
   }
   if (EqualsIgnoreCase(key, "MSAASamples")) {
     *out_value = g_config.msaa_samples;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "LightingMode")) {
+    *out_value = g_config.lighting_mode;
     return true;
   }
   return false;
@@ -149,6 +166,33 @@ bool SetConfigValueInt(const std::string &key, int value) {
   if (EqualsIgnoreCase(key, "MSAASamples")) {
     if (value != 1 && value != 2 && value != 4 && value != 8) return false;
     g_config.msaa_samples = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "LightingMode")) {
+    if (value < 0 || value > 4) return false;
+    if (value >= 2 && !RaytracingSupported()) {
+      LOG(AixLog::Severity::error)
+          << "LightingMode " << value
+          << " requires raytracing support that isn't available yet (no "
+             "device, or the adapter doesn't support DXR) -- staying on "
+             "PerPixel (1) instead.\n";
+      value = 1;
+    }
+    if (value != g_config.lighting_mode) {
+      g_config.lighting_mode = value;
+      // Fixed-function vertex/pixel shader generation bakes lighting_mode in
+      // at compile time (vertex_shader.cpp, ff_pixel_shader.cpp) -- anything
+      // already compiled under the old mode has to be thrown away, or the
+      // game would keep drawing with stale-mode shaders until whichever
+      // FVF/texture-stage combination they were cached under happened to
+      // never recur. No-op before device creation (LoadConfig at
+      // DLL_PROCESS_ATTACH): there's nothing compiled yet to invalidate, and
+      // RaytracingSupported() above already refused any device-less request
+      // for a raytraced mode anyway.
+      if (Device *device = GetCurrentDeviceForModApi()) {
+        device->OnLightingModeChanged();
+      }
+    }
     return true;
   }
   return false;

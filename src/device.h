@@ -2,7 +2,9 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -29,11 +31,50 @@ namespace D3D12MA {
 class Allocator;
 }
 
+// Level 1 mod-API scene metadata struct (dx8to12_api.cpp / MODDING.md) -- a
+// flat, ABI-stable mirror of D3DLIGHT8's fields for a currently-active D3D8
+// light. Deliberately not D3DLIGHT8 itself: that type isn't guaranteed
+// ABI-stable across compilers/SDKs for an external mod DLL to link against
+// directly (see MODDING.md's "Scene metadata for mods" section).
+struct Dx8to12_LightInfo {
+  int type;  // D3DLIGHT8 numeric type: 1=POINT, 2=SPOT, 3=DIRECTIONAL.
+  float diffuse[4];
+  float specular[4];
+  float ambient[4];
+  float position[3];
+  float direction[3];
+  float range;
+  float falloff;
+  float attenuation0;
+  float attenuation1;
+  float attenuation2;
+  float theta;
+  float phi;
+};
+
+// Level 3 mod-API: injects a custom HLSL fragment into the generated
+// fixed-function pixel shader (ff_pixel_shader.cpp's CreatePixelShaderFromState)
+// -- see MODDING.md's "Pixel shader injection" section. Called once per
+// (re)compile of a given fixed-function pixel shader permutation, not once
+// per frame/draw. Return the number of bytes written to out_hlsl_snippet (0
+// = inject nothing); a return value greater than out_hlsl_snippet_capacity
+// is treated as "wrote nothing" (never truncated or read past the buffer).
+struct Dx8to12_PixelShaderInjectionContext {
+  int has_normal;
+  int has_view_pos;
+  int texture_stage_count;
+};
+using Dx8to12_PixelShaderInjectionFn = size_t(__cdecl *)(
+    const Dx8to12_PixelShaderInjectionContext* context,
+    char* out_hlsl_snippet, size_t out_hlsl_snippet_capacity);
+
 namespace Dx8to12 {
 class Buffer;
 class BaseSurface;
 class DynamicRingBuffer;
 class GpuTexture;
+class RaytracingScene;
+class RtHelperClient;
 
 class Device : public IDirect3DDevice8, RefCounted {
  public:
@@ -46,6 +87,7 @@ class Device : public IDirect3DDevice8, RefCounted {
               const D3DPRESENT_PARAMETERS &presentParams);
 
   ID3D12Device *device() const { return d3d12_device_.get(); }
+  IDXGIAdapter *adapter() const { return adapter_.get(); }
   ID3D12GraphicsCommandList *cmd_list() const { return cmd_list_.get(); }
   // False between the Close() and Reset() of a frame's command list, during
   // which nothing may be recorded into it.
@@ -56,6 +98,39 @@ class Device : public IDirect3DDevice8, RefCounted {
   HWND window() const { return window_; }
   UINT sync_interval() const { return sync_interval_; }
   bool tearing_supported() const { return tearing_supported_; }
+  bool native_raytracing_supported() const { return raytracing_supported_; }
+  // `raytracing_supported_` is the native x86 D3D12 capability. NVIDIA's
+  // x86 runtime can report Tier 0 on DXR-capable hardware, so the provisioned
+  // x64 helper is also a valid RT backend for the public mod API.
+  bool raytracing_supported() const;
+  void* rt_shadow_output_resource() const;
+  void* rt_shadow_done_fence() const;
+  uint64_t rt_shadow_done_fence_value() const;
+  uint32_t rt_shadow_output_width() const;
+  uint32_t rt_shadow_output_height() const;
+  uint32_t rt_shadow_output_format() const;
+
+  // Level 1 mod-API scene metadata (dx8to12_api.cpp / MODDING.md). See the
+  // "Scene metadata for mods" section there for the full contract.
+  bool RequestDepthBufferAccess(bool enable);
+  // Not const: bound_depth_target_ is an InternalPtr<GpuTexture>, whose
+  // operator-> (unlike std::unique_ptr's) isn't const-qualified.
+  void* depth_buffer_srv_resource();
+  uint64_t depth_buffer_srv_gpu_handle();
+  uint32_t depth_buffer_srv_format();
+  bool GetViewProjMatrix(float out_matrix[16]) const;
+  int GetActiveLightCount() const;
+  bool GetActiveLight(int index, Dx8to12_LightInfo* out) const;
+
+  bool GetRtDirectionalLight(D3DVECTOR* direction) const;
+  uint32_t RtCurrentNormalByteOffset();
+  // Called by config.cpp's SetConfigValueInt when LightingMode actually
+  // changes. Fixed-function vertex/pixel shader generation (vertex_shader.cpp,
+  // ff_pixel_shader.cpp) reads Config::lighting_mode only at (re)compile time,
+  // so anything already compiled under the old mode has to be thrown away --
+  // see the method's definition (device.cpp) for how, without leaving
+  // vertex_shaders_ missing a handle mid-frame.
+  void OnLightingModeChanged();
   DXGI_FORMAT backbuffer_format() const;
   // Bumped once per Device::Reset() (window resize, fullscreen toggle,
   // format change): back buffer resources, format, and dimensions are all
@@ -93,6 +168,22 @@ class Device : public IDirect3DDevice8, RefCounted {
   void RegisterModRenderCallback(ModRenderCallback callback);
   void UnregisterModRenderCallback(ModRenderCallback callback);
 
+  // Level 3 mod-API: fixed-function pixel shader HLSL injection (see
+  // Dx8to12_PixelShaderInjectionFn above / MODDING.md). Only one callback
+  // may be registered at a time -- Register returns false if a *different*
+  // one already is (re-registering the same pointer is a no-op success).
+  // Both advance a generation; the render thread clears ps_cache_ before
+  // its next lookup so registration never mutates the cache concurrently.
+  bool RegisterPixelShaderInjection(Dx8to12_PixelShaderInjectionFn callback);
+  bool UnregisterPixelShaderInjection(Dx8to12_PixelShaderInjectionFn callback);
+  bool GetPixelShaderInjectionState(uint64_t* generation) const;
+  size_t InvokePixelShaderInjection(
+      const Dx8to12_PixelShaderInjectionContext* context,
+      char* out_hlsl_snippet, size_t capacity) const;
+  // For a mod that wants to change what its already-registered callback
+  // produces at runtime without a full Unregister/Register cycle.
+  void InvalidatePixelShaderCache();
+
   uint64_t CurrentFrame() const;
   // True while the F9 UI dump is running -- see PollUiDumpHotkey.
   bool ui_dump_enabled() const { return ui_dump_enabled_; }
@@ -104,6 +195,7 @@ class Device : public IDirect3DDevice8, RefCounted {
                            uint32_t dest_x = 0, uint32_t dest_y = 0);
   void TransitionTexture(GpuTexture *texture, uint32_t subresource,
                          D3D12_RESOURCE_STATES state_after);
+  void TransitionDynamicRingBuffer(D3D12_RESOURCE_STATES state_after);
   // Buffers (vertex/index) rely on D3D12's implicit state promotion from
   // COMMON for read usages, but that promotion is tracked/validated per
   // command list and does NOT cover write usages like being a
@@ -466,7 +558,21 @@ class Device : public IDirect3DDevice8, RefCounted {
   StateSnapshot state_block_recording_start_;
 
   // See RegisterModRenderCallback.
+  // Register/Unregister may be called from an ASI worker thread while the
+  // render thread is iterating callbacks in SubmitAndWait.
+  mutable std::mutex mod_render_callbacks_mutex_;
   std::vector<ModRenderCallback> mod_render_callbacks_;
+
+  // See RegisterPixelShaderInjection -- same cross-thread-registration
+  // reasoning as mod_render_callbacks_mutex_ above, just a single slot since
+  // only one injection callback is supported at a time.
+  mutable std::mutex pixel_shader_injection_mutex_;
+  Dx8to12_PixelShaderInjectionFn pixel_shader_injection_callback_ = nullptr;
+  uint64_t pixel_shader_injection_generation_ = 1;
+  // Render-thread snapshot. Worker-thread API calls only advance the guarded
+  // generation; CreatePSO performs the actual cache clear, avoiding a data
+  // race with its unordered_map lookup/insert.
+  uint64_t applied_pixel_shader_injection_generation_ = 0;
 
   uint64_t swap_chain_generation_ = 1;
 
@@ -656,6 +762,11 @@ class Device : public IDirect3DDevice8, RefCounted {
   InternalPtr<GpuTexture> bound_render_target_;
   InternalPtr<GpuTexture> bound_depth_target_;
 
+  // See RequestDepthBufferAccess -- gates the per-frame transition pair
+  // around the mod render callback loop in Present() so it costs nothing
+  // when no mod has asked to read the depth buffer.
+  bool depth_buffer_access_requested_ = false;
+
   // Viewport.
   D3D12_VIEWPORT viewport_ = {.MaxDepth = 1.f};
   // Present()'s SyncInterval, derived from the app's requested
@@ -670,6 +781,12 @@ class Device : public IDirect3DDevice8, RefCounted {
   // Present(0, ...) can fail outright rather than just presenting with
   // vsync anyway.
   bool tearing_supported_ = false;
+  // Whether the adapter supports DXR (D3D12_RAYTRACING_TIER_1_0 or higher),
+  // checked once at Create() time via ID3D12Device5::CheckFeatureSupport.
+  // Gates which LightingMode values config.cpp will accept -- see
+  // raytracing_supported() and Dx8to12_GetRaytracingSupported in
+  // dx8to12_api.cpp.
+  bool raytracing_supported_ = false;
   // Material.
   D3DMATERIAL8 material_ = {};
   // Light definitions.
@@ -777,6 +894,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   DescriptorPoolHeap srv_heap_;
   DescriptorPoolHeap sampler_heap_;
   DescriptorPoolHeap dsv_heap_;
+  // Declared after descriptor heaps so its destructor can safely return the
+  // TLAS SRV slot before the heap itself is destroyed.
+  std::unique_ptr<RaytracingScene> raytracing_scene_;
+  std::unique_ptr<RtHelperClient> rt_helper_client_;
 
   std::array<std::vector<InternalPtr<RefCounted>>, kNumBackBuffers>
       frame_resources_to_free_;
@@ -804,10 +925,23 @@ static constexpr D3D12_HEAP_PROPERTIES kSystemMemHeapProps = {
     .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
     .MemoryPoolPreference = D3D12_MEMORY_POOL_L0};
 
-ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s);
+// has_normal/has_view_pos describe the vertex shader currently bound at the
+// call site that triggered this (re)compile. Both are included in the
+// PixelShaderState cache key, so the callback never inherits context from an
+// unrelated vertex declaration that happened to compile first.
+ComPtr<ID3DBlob> CreatePixelShaderFromState(
+    const PixelShaderState &s, bool has_normal, bool has_view_pos,
+    const Device* injection_device);
 
 // The single live Device instance, for dx8to12_api.cpp (see device.cpp).
 // Returns null before device creation / after device destruction.
 Device *GetCurrentDeviceForModApi();
+
+// Compact diagnostic sink that still works in release-mindebug builds, where
+// LOG(...) is compiled away entirely (see pch.h / DX8TO12_DISABLE_LOGGING).
+// Writes into the same log.txt as the draw-outcome diagnostics, so findings
+// from different files can be correlated by frame number. No-op unless
+// DX8TO12_ENABLE_MINDEBUG is on.
+void WriteMindebugDiagnosticLine(const std::string &line);
 
 }  // namespace Dx8to12

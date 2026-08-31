@@ -79,6 +79,14 @@ struct FFVertexOutput {
   float3 oViewPos : NORMAL2;
 
   float oFog : FOG;
+  // 1 for ordinary transformed (non-XYZRHW) geometry, 0 for pretransformed
+  // screen-space vertices (2D UI/menu quads) -- real D3D8 never lights those,
+  // so per-pixel lighting (ff_pixel_shader.cpp) must not either, and can't
+  // tell the two apart on its own the way the vertex shader's HAS_TRANSFORM
+  // permutation define does. Uniform across a whole draw (every vertex in one
+  // draw call takes the same branch in ff_vertex_shader.hlsl), so ordinary
+  // linear interpolation of 0/1 never produces a fractional value.
+  float oPerPixelLightingEligible : LITFLAG0;
 };
 
 // #define FFVertexOutput VertexOutput

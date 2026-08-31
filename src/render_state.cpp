@@ -7,6 +7,21 @@ namespace Dx8to12 {
 
 void RenderState::Reset() { *this = RenderState(); }
 
+// Whether a given D3DTEXTUREOP actually reads its Arg1/Arg2 input. Almost
+// every op uses both, but D3DTOP_SELECTARG1/D3DTOP_SELECTARG2 each use only
+// one of the two (and D3DTOP_DISABLE uses neither) -- see ApplyOperation in
+// ff_pixel_shader.cpp, the single source of truth this must stay consistent
+// with. Real D3D8 only falls back to DISABLE-like behavior for a texture
+// stage when a *used* argument references D3DTA_TEXTURE with no texture
+// bound -- e.g. ColorOp=SELECTARG2 with ColorArg1=D3DTA_TEXTURE-but-unbound
+// is not actually affected, because SELECTARG2 never reads Arg1 at all.
+static bool TexOpUsesArg1(D3DTEXTUREOP op) {
+  return op != D3DTOP_DISABLE && op != D3DTOP_SELECTARG2;
+}
+static bool TexOpUsesArg2(D3DTEXTUREOP op) {
+  return op != D3DTOP_DISABLE && op != D3DTOP_SELECTARG1;
+}
+
 DWORD &RenderState::GetEnumAtIndex(D3DRENDERSTATETYPE index) {
   switch (index) {
     case D3DRS_ZENABLE:
@@ -175,8 +190,21 @@ PixelShaderState::PixelShaderState(
 
   for (int i = 0; i < kMaxTexStages; ++i) {
     const TextureStageState &stage = texture_stage_states[i];
-    if (stage.color_op == D3DTOP_DISABLE ||
-        (stage.color_arg1 == D3DTA_TEXTURE && !stage_has_texture[i])) {
+    // Confirmed live (2026-08-27, PSO-WANTS-TEX0-BUT-NONE-BOUND's caller
+    // stack trace): a real draw with ColorOp=D3DTOP_SELECTARG2 and a stale,
+    // *unused* ColorArg1=D3DTA_TEXTURE (left over from the game's previous
+    // draw at this stage, now unbound) was being force-disabled here even
+    // though SELECTARG2 never reads Arg1 at all -- discarding whatever
+    // Arg2 would have correctly evaluated to (diffuse/current/tfactor/etc.)
+    // in favor of an unconditional DISABLE fallback, rendering flat/wrong
+    // instead of what real D3D8 would show. Only the arg(s) the op actually
+    // reads should trigger the fallback -- see TexOpUsesArg1/2 above.
+    const bool color_missing_tex =
+        (TexOpUsesArg1(stage.color_op) && stage.color_arg1 == D3DTA_TEXTURE &&
+         !stage_has_texture[i]) ||
+        (TexOpUsesArg2(stage.color_op) && stage.color_arg2 == D3DTA_TEXTURE &&
+         !stage_has_texture[i]);
+    if (stage.color_op == D3DTOP_DISABLE || color_missing_tex) {
       ts[i].color_op = D3DTOP_DISABLE;  // D3DTOP_DISABLE=1, so must set!
       break;
     }
@@ -202,9 +230,16 @@ PixelShaderState::PixelShaderState(
                               // omitted here (despite being tracked in
                               // TextureStageState) since nothing consumed it.
                               .result_arg = stage.result_arg};
-    if (stage.alpha_arg1 == D3DTA_TEXTURE && !stage_has_texture[i]) {
+    // Same used-arg gating as the color side above, plus the previously-
+    // missing Arg2 case (only Arg1 was ever checked here).
+    if (TexOpUsesArg1(stage.alpha_op) && stage.alpha_arg1 == D3DTA_TEXTURE &&
+        !stage_has_texture[i]) {
       // Default argument is DIFFUSE if no texture is set.
       ts[i].alpha_arg1 = D3DTA_DIFFUSE;
+    }
+    if (TexOpUsesArg2(stage.alpha_op) && stage.alpha_arg2 == D3DTA_TEXTURE &&
+        !stage_has_texture[i]) {
+      ts[i].alpha_arg2 = D3DTA_DIFFUSE;
     }
   }
 }

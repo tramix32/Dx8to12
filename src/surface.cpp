@@ -57,7 +57,7 @@ HRESULT BaseSurface::LockGpuReadback(GpuTexture* texture, uint32_t subresource,
       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
       IID_PPV_ARGS(readback_resource_.GetForInit())));
 
-  const D3D12_RESOURCE_STATES prior_state = texture->current_state();
+  const D3D12_RESOURCE_STATES prior_state = texture->current_state(subresource);
   device_->TransitionTexture(texture, subresource,
                              D3D12_RESOURCE_STATE_COPY_SOURCE);
 
@@ -78,6 +78,17 @@ HRESULT BaseSurface::LockGpuReadback(GpuTexture* texture, uint32_t subresource,
   // Flush and block until the GPU has actually performed the copy above --
   // D3D8's LockRect is a synchronous call, the caller expects pBits to be
   // readable the moment this returns.
+  // DIAGNOSTIC: this is a full synchronous GPU flush+wait mid-frame, with no
+  // real analog on actual D3D8 hardware (a real driver's Lock on a lockable
+  // render target is typically much cheaper). Investigating whether this is
+  // what disrupts RenderWare's own timing assumptions for the missing-
+  // ground-texture bug (see SETTEX0-NULL-CALLER in device.cpp) -- log every
+  // occurrence to correlate against that diagnostic's frame numbers.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  LOG(AixLog::Severity::error)
+      << "MIDFRAME-LOCKREADBACK-FLUSH frame=" << device_->CurrentFrame()
+      << "\n";
+#endif
   device_->SubmitAndWait(false);
 
   D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};

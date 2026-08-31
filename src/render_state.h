@@ -204,6 +204,12 @@ struct PixelShaderState {
 
   bool color_vertex : 1;
   D3DMATERIALCOLORSOURCE diffuse_material_source : 2;
+  // Shader-injection context affects the generated source and therefore is
+  // part of the cache key. Without these bits, whichever vertex declaration
+  // compiled a PixelShaderState first dictated has_normal/has_view_pos for
+  // every later draw that happened to share the texture/render state.
+  bool injection_has_normal : 1;
+  bool injection_has_view_pos : 1;
   // TODO: Any stage after a non-active stage is also not active.
   uint8_t stage_has_texture_flag : 8;
   uint8_t alpha_func_minus1 : 3;

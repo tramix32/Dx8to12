@@ -45,6 +45,23 @@ struct Config {
   // setting.
   bool full_trace_log = false;
 
+  // How scene lighting is computed. Values ramp from "runs on anything" to
+  // "needs a DXR-capable GPU", so mods (e.g. a settings menu) should let the
+  // player choose based on their hardware rather than assuming the top mode
+  // is always best:
+  //   0 = Vertex      -- stock D3D8 fixed-function per-vertex lighting.
+  //   1 = PerPixel     -- same lighting model, computed per pixel instead.
+  //   2 = RTShadows    -- NOT YET IMPLEMENTED. Per-pixel lighting +
+  //                       raytraced shadow visibility per light.
+  //   3 = RTReflections -- NOT YET IMPLEMENTED. Per-pixel lighting +
+  //                       raytraced reflections on reflective surfaces.
+  //   4 = RTFullGI     -- NOT YET IMPLEMENTED. Full raytraced multi-bounce
+  //                       global illumination.
+  // SetConfigValueInt clamps 2-4 down to 1 (logging why) when
+  // Device::raytracing_supported() is false -- there is no native DXR device
+  // or provisioned x64 helper backend to run any RT mode on.
+  int lighting_mode = 0;
+
   // Every field above, by name, for the generic string-keyed Get/Set API in
   // dx8to12_api.cpp and the INI parser in config.cpp. Keep this in sync when
   // adding a field -- see the kFields table at the top of config.cpp.

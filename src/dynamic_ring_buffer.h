@@ -34,10 +34,18 @@ class DynamicRingBuffer {
   Allocation Allocate(
       size_t num_bytes,
       uint32_t alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+  // Same, but reports exhaustion instead of FAIL()ing. For callers that have a
+  // correct (if less desirable) fallback and would rather degrade than take
+  // the whole process down -- the ring only reclaims space at frame
+  // granularity, so a single frame doing unusually heavy streaming can run it
+  // out even though nothing is wrong.
+  bool TryAllocate(size_t num_bytes, uint32_t alignment, Allocation* out);
   char* GetCpuPtrFor(Allocation offset);
   GpuPtr GetGpuPtrFor(Allocation offset);
 
   ID3D12Resource* GetBackingResource() { return buffer_.get(); }
+  D3D12_RESOURCE_STATES current_state() const { return current_state_; }
+  void set_state(D3D12_RESOURCE_STATES state) { current_state_ = state; }
 
  private:
   ComPtr<ID3D12Resource> buffer_;
@@ -50,6 +58,7 @@ class DynamicRingBuffer {
 
   std::deque<std::pair<uint64_t, size_t>> frame_heads_;
   uint64_t current_frame_ = 0;
+  D3D12_RESOURCE_STATES current_state_ = D3D12_RESOURCE_STATE_COMMON;
 
   const uint32_t min_align_ = 256;
 

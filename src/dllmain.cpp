@@ -9,6 +9,7 @@
 
 namespace {
 
+#ifndef DX8TO12_DISABLE_LOGGING
 #if defined(_M_IX86)
 // Reads a DWORD from a possibly-invalid address without risking a second,
 // nested crash inside the crash handler itself. Needs its own function (no
@@ -128,6 +129,7 @@ LONG WINAPI LogCrashAndContinueSearch(EXCEPTION_POINTERS *info) {
 
   return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif  // DX8TO12_DISABLE_LOGGING
 
 }  // namespace
 
@@ -137,6 +139,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                       LPVOID lpReserved) {
   switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH: {
+#ifndef DX8TO12_DISABLE_LOGGING
       auto log_sink = AixLog::Log::init<AixLog::SinkFile>(
           AixLog::Severity::info, CURRENT_SOURCE_DIR "/log.txt");
       AddVectoredExceptionHandler(1 /* call first */,
@@ -175,7 +178,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                  "\n";
         }
       }
+#endif
       Dx8to12::LoadConfig(hModule);
+#ifndef DX8TO12_DISABLE_LOGGING
       // FullTraceLog (dx8to12.ini): lower the sink's own severity threshold
       // from info to trace *after* LoadConfig has run, since LoadConfig
       // itself needs to log through the already-initialized sink above at
@@ -191,6 +196,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
                "a very large log.txt; turn this back off in dx8to12.ini "
                "once done.\n";
       }
+#endif
       break;
     }
     case DLL_THREAD_ATTACH:

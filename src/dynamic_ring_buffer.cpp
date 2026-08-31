@@ -47,6 +47,15 @@ DynamicRingBuffer::~DynamicRingBuffer() {
 
 DynamicRingBuffer::Allocation DynamicRingBuffer::Allocate(size_t num_bytes,
                                                           uint32_t align) {
+  Allocation alloc{};
+  if (!TryAllocate(num_bytes, align, &alloc)) {
+    FAIL("OOM: Could not allocate %zu bytes.", num_bytes);
+  }
+  return alloc;
+}
+
+bool DynamicRingBuffer::TryAllocate(size_t num_bytes, uint32_t align,
+                                    Allocation* out) {
   ASSERT(head_ <= max_size_ && tail_ <= max_size_);
   ASSERT(IsPow2(align));
   align = std::max(align, min_align_);
@@ -70,15 +79,14 @@ DynamicRingBuffer::Allocation DynamicRingBuffer::Allocate(size_t num_bytes,
   } else {
     is_oom = true;
   }
-  if (is_oom) {
-    FAIL("OOM: Could not allocate %zu bytes.", num_bytes);
-  }
+  if (is_oom) return false;
   ASSERT(alloc.offset + alloc.size <= (int)max_size_);
 #ifdef DX8TO12_ENABLE_VALIDATION
   CheckForOverlap(alloc);
   live_allocs_.push_back(alloc);
 #endif
-  return alloc;
+  *out = alloc;
+  return true;
 }
 
 #ifdef DX8TO12_ENABLE_VALIDATION

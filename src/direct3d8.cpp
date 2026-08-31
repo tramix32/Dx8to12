@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <dxgi.h>
 #include <dxgi1_3.h>
+#include <dxgi1_6.h>
 
 #include "aixlog.hpp"
 #include "device.h"
@@ -11,7 +12,8 @@ namespace Dx8to12 {
 Direct3D8::Direct3D8() {
   LOG(TRACE) << "Creating Direct3D8.\n";
   UINT Flags = 0;
-#ifdef DX8TO12_ENABLE_VALIDATION
+#if defined(DX8TO12_ENABLE_VALIDATION) || \
+    defined(DX8TO12_ENABLE_D3D12_DEBUG_LAYER)
   Flags = DXGI_CREATE_FACTORY_DEBUG;
   // The debug layer has to be enabled before *any* D3D12 device exists --
   // turning it on afterwards invalidates the devices already created, which
@@ -332,9 +334,44 @@ HRESULT STDMETHODCALLTYPE Direct3D8::CreateDevice(
   ASSERT(!(BehaviorFlags & D3DCREATE_MULTITHREADED));
   ASSERT(!HasFlag(BehaviorFlags, D3DCREATE_DISABLE_DRIVER_MANAGEMENT));
   *ppReturnedDeviceInterface = nullptr;
+  // D3DADAPTER_DEFAULT is numerically zero in D3D8.  Keep the public
+  // enumeration order intact for applications that explicitly inspect it,
+  // but use DXGI's modern high-performance preference for the device that a
+  // normal "default adapter" game creates.  This avoids accidentally
+  // running a discrete-GPU game (and its DXR probe) on a listed-first iGPU.
+  IDXGIAdapter *selected_adapter = adapters_[Adapter];
+  UINT selected_adapter_index = Adapter;
+  if (Adapter == D3DADAPTER_DEFAULT) {
+    ComPtr<IDXGIFactory6> factory6;
+    ComPtr<IDXGIAdapter1> preferred_adapter;
+    if (SUCCEEDED(dxgi_factory_->QueryInterface(
+            IID_PPV_ARGS(factory6.GetForInit()))) &&
+        SUCCEEDED(factory6->EnumAdapterByGpuPreference(
+            0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            IID_PPV_ARGS(preferred_adapter.GetForInit())))) {
+      DXGI_ADAPTER_DESC1 preferred_desc = {};
+      if (SUCCEEDED(preferred_adapter->GetDesc1(&preferred_desc))) {
+        for (UINT i = 0; i < adapters_.size(); ++i) {
+          DXGI_ADAPTER_DESC candidate_desc = {};
+          if (SUCCEEDED(adapters_[i]->GetDesc(&candidate_desc)) &&
+              candidate_desc.AdapterLuid.LowPart ==
+                  preferred_desc.AdapterLuid.LowPart &&
+              candidate_desc.AdapterLuid.HighPart ==
+                  preferred_desc.AdapterLuid.HighPart) {
+            selected_adapter = adapters_[i];
+            selected_adapter_index = i;
+            LOG(INFO) << "CreateDevice: D3DADAPTER_DEFAULT mapped to "
+                      << "DXGI high-performance adapter index " << i << "\n";
+            break;
+          }
+        }
+      }
+    }
+  }
+
   Device *device = new Device(this);
-  if (!device->Create(hFocusWindow, dxgi_factory_, ComWrap(adapters_[Adapter]),
-                      Adapter, *pPresentationParameters)) {
+  if (!device->Create(hFocusWindow, dxgi_factory_, ComWrap(selected_adapter),
+                      selected_adapter_index, *pPresentationParameters)) {
     delete device;
     return D3DERR_INVALIDDEVICE;
   }

@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -32,62 +32,35 @@ Output is `build/d3d8.dll` (target name `d3d8`), with `build/d3d8.pdb` next to i
 Notable CMake options (top of `CMakeLists.txt`):
 - `DX8TO12_USE_ALLOCATOR` (default OFF) — pulls in D3D12MemoryAllocator via `FetchContent` instead of manual suballocation.
 - `DX8TO12_ENABLE_VALIDATION` (default ON) — enables the D3D12 debug layer (`EnableDebugLayer()`) and `TRACE_ENTRY` (a per-call trace log built into every single `IDirect3DDevice8` method, gated to compile to nothing when this is off). Both are genuinely expensive on a game issuing thousands of draws/state-changes per frame — measured, disabling this roughly doubled FPS in a light test scene. See the dev vs. release build split below.
+- `DX8TO12_ENABLE_MINDEBUG` (default OFF) — enables only explicitly selected, low-overhead diagnostic counters for a `release-mindebug` build. It requires validation to be OFF. Ordinary `LOG(...)` calls remain compiled out; the selected diagnostic owns its small `log.txt` writer.
 
-### Build profiles
+### Dev, release-mindebug, and release builds
 
-Same source, one or two CMake flags apart. All of them are `RelWithDebInfo`
-and all produce a `d3d8.pdb`, so a crash stays symbolicatable in every profile.
-Every build tree is gitignored (`build-*/`).
-
-| Profile | Directory | Extra CMake flags | Writes `log.txt`? | Use for |
-|---|---|---|---|---|
-| **Dev** | `build-x86` | *(none — validation is ON by default)* | Yes, everything | Active development on this codebase |
-| **Release** | `build-x86-release` | `-DDX8TO12_ENABLE_VALIDATION=OFF` | No | The general-purpose build; any D3D8 game |
-| **Release-VC** | `build-x86-release-vc` | `... =OFF -DDX8TO12_DRAW_STATE_CACHE=ON` | No | Playing GTA: Vice City at maximum speed |
-| **Mindebug** | `build-x86-release-mindebug*` | `... =OFF -DDX8TO12_ENABLE_MINDEBUG=ON` | Yes, compact only | Diagnosing a bug at full frame rate |
+Keep the three profiles in separate build directories:
 
 ```
-# Dev: full D3D12 debug-layer validation + TRACE_ENTRY.
+# Dev (default): full D3D12 debug-layer validation + TRACE_ENTRY, for active debugging.
 cmake -S . -B build-x86 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build-x86 --target d3d8
 
-# Release: same optimization level and PDB (still RelWithDebInfo, not plain Release --
-# see the PDB rationale above), but DX8TO12_ENABLE_VALIDATION off.
+# Release-mindebug: release performance settings, no validation/TRACE_ENTRY,
+# only the currently selected compact diagnostics.
+cmake -S . -B build-x86-release-mindebug -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DDX8TO12_ENABLE_VALIDATION=OFF -DDX8TO12_ENABLE_MINDEBUG=ON
+cmake --build build-x86-release-mindebug --target d3d8
+
+# Clean release: same optimization level and PDB (still RelWithDebInfo, not
+# plain Release), no validation and no runtime file logging.
 cmake -S . -B build-x86-release -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DDX8TO12_ENABLE_VALIDATION=OFF
 cmake --build build-x86-release --target d3d8
-
-# Release-VC: release plus the draw-state binding cache.
-cmake -S . -B build-x86-release-vc -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DDX8TO12_ENABLE_VALIDATION=OFF -DDX8TO12_DRAW_STATE_CACHE=ON
-cmake --build build-x86-release-vc --target d3d8
 ```
 
-Use `build-x86/dist/` while actively working on this codebase (a real bug is much easier to diagnose with the debug layer's resource-state/descriptor validation and a full log.txt). Use a release profile for actually playing/benchmarking. Only the debug-layer + trace-log overhead differs between them, not crash-diagnosability.
-
-**"Release-VC" is about tuning, not about hardcoding a game.** Nothing in it keys off GTA: Vice City -- it is the ordinary release plus `DX8TO12_DRAW_STATE_CACHE`, an optimisation that was switched off during the missing-geometry investigation and has not yet been proven across a long session on other games. The name records where it has actually been exercised, nothing more.
-
-**Do not run a `mindebug` build against any game other than GTA: Vice City.** Those builds read *and write* the host process's memory at addresses hardcoded for VC 1.0 (entity lists, streaming tables, and with `DX8TO12_KEEP_TARGET_LOD` a model's alpha byte). Under a different executable those addresses are meaningless. All of it lives inside `#ifdef DX8TO12_ENABLE_MINDEBUG` in `device.cpp` and is compiled out of every other profile -- `kGtaPreferredImageBase` is defined inside that block, so a stray use outside it would fail to link rather than ship silently.
-
-### CMake options
-
-| Option | Default | Effect |
-|---|---|---|
-| `DX8TO12_ENABLE_VALIDATION` | ON | D3D12 debug layer + `TRACE_ENTRY` + full AixLog. Roughly halves FPS; turn off for anything but development. |
-| `DX8TO12_ENABLE_MINDEBUG` | OFF | Compact GTA VC-specific diagnostics through `WriteMindebugDiagnosticLine` instead of AixLog. Requires `ENABLE_VALIDATION=OFF`. |
-| `DX8TO12_PAD_BUFFERS` | **ON** | Over-allocates every vertex/index buffer and hides the pad from `GetDesc`. Fixes the "disappearing road/building" bug -- GTA VC writes past the end of its own static index buffers and the draw count was then clamped, dropping the trailing triangles. Turn OFF only to reproduce that bug. See `MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md`. |
-| `DX8TO12_DRAW_STATE_CACHE` | OFF | Skips re-recording PSO/root/vertex-buffer bindings when nothing changed. Faster, but the only optimisation that skips *recording* commands -- read `kCacheDrawStateBindings` in `device_limits.h` first. |
-| `DX8TO12_BUFFER_SHADOW` | OFF | Diagnostic: gives every buffer a full CPU shadow with a guard page, so writes past a buffer's end are caught instead of corrupting the heap. This is what identified the bug `PAD_BUFFERS` fixes. |
-| `DX8TO12_KEEP_TARGET_LOD` | OFF | Pins one VC road model in its fading state so its LOD is never culled. Writes to game memory every frame; pollutes any baseline measurement. |
-| `DX8TO12_FORCE_GPU_IDLE` | OFF | Waits for the just-submitted frame. Note it waits *after* submission, so it does not remove aliasing within one unsubmitted command list. |
-| `DX8TO12_PASSTHROUGH_OOB_INDICES` | OFF | Submits out-of-bounds indexed draws untruncated. Undefined behaviour in D3D12; `PAD_BUFFERS` is the supported fix for the same symptom. |
-| `DX8TO12_VALIDATE_DEVICE_ALWAYS_FAIL` | OFF | Makes `ValidateDevice` fail like the d3d8to11 reference port (compatibility A/B). |
-| `DX8TO12_ENABLE_D3D12_DEBUG_LAYER` | OFF | Debug layer without the dev trace logging. |
-| `DX8TO12_USE_ALLOCATOR` | OFF | D3D12MemoryAllocator instead of manual suballocation. Note the option currently defines `USE_ALLOCATOR`, while parts of the code test `DX8TO12_USE_ALLOCATOR` -- do not copy this option's wiring as a template. |
+Use `build-x86/dist/` for full debug-layer investigation, `build-x86-release-mindebug/dist/` when a bug must be reproduced at normal FPS with a very small targeted log, and `build-x86-release/dist/` for playing/benchmarking. All profiles still produce a matching PDB. The vectored-exception log is installed only in the dev profile; clean release deliberately does not create `log.txt`.
 
 On Clang, warnings are treated as errors (`-Werror`); MSVC uses `/W4` with a couple of disabled warnings. Precompiled header covers `aixlog.hpp` and `<d3d12.h>`.
 
-Logging goes to `log.txt` next to the source tree (`CURRENT_SOURCE_DIR` baked in at compile time), via AixLog (`third_party/aixlog.hpp`).
+Dev logging goes to `log.txt` next to the source tree (`CURRENT_SOURCE_DIR` baked in at compile time), via AixLog (`third_party/aixlog.hpp`). A release-mindebug diagnostic may write its own compact `log.txt`; clean release performs no runtime file logging.
 
-`dllmain.cpp` also installs a vectored exception handler (`AddVectoredExceptionHandler`) that logs a `=== Unhandled exception ===` block to `log.txt` — code, faulting address, and the module+offset it falls in — on native crashes (access violations, stack overflow, etc.) before letting the crash proceed normally. This catches crashes `ASSERT`/`FAIL`/`NOT_IMPLEMENTED()` can't, since those only fire on paths that are explicitly guarded. When a game crashes with no `FAIL`/`ASSERT` message in the log, check for this block first — it narrows down the faulting module/offset even when nothing on the D3D12 debug-layer side reported anything.
+In the dev profile, `dllmain.cpp` also installs a vectored exception handler (`AddVectoredExceptionHandler`) that logs a `=== Unhandled exception ===` block to `log.txt` — code, faulting address, and the module+offset it falls in — on native crashes (access violations, stack overflow, etc.) before letting the crash proceed normally. This catches crashes `ASSERT`/`FAIL`/`NOT_IMPLEMENTED()` can't, since those only fire on paths that are explicitly guarded. When a dev build crashes with no `FAIL`/`ASSERT` message in the log, check for this block first — it narrows down the faulting module/offset even when nothing on the D3D12 debug-layer side reported anything.
 
 ## Architecture
 

@@ -40,6 +40,22 @@ SharpenStrength=0.0
 ; true/false or 1/0. NOT YET IMPLEMENTED -- reserved for a future
 ; higher-precision depth-stencil format switch.
 HighPrecisionDepth=false
+
+; How scene lighting is computed:
+;   0 = Vertex        -- stock D3D8 fixed-function per-vertex lighting.
+;   1 = PerPixel       -- same lighting model, computed per pixel instead.
+;   2 = RTShadows      -- NOT YET IMPLEMENTED. Per-pixel lighting +
+;                         raytraced shadow visibility per light.
+;   3 = RTReflections  -- NOT YET IMPLEMENTED. Per-pixel lighting +
+;                         raytraced reflections on reflective surfaces.
+;   4 = RTFullGI       -- NOT YET IMPLEMENTED. Full raytraced multi-bounce
+;                         global illumination.
+; 2-4 need a DXR-capable GPU -- see Dx8to12_GetRaytracingSupported below.
+; Requesting one without support silently falls back to PerPixel (1) and logs
+; why. Since dx8to12.ini is read before device creation, a raytracing mode
+; requested here always falls back at startup; set it after startup instead,
+; via Dx8to12_SetSettingInt once Dx8to12_GetRaytracingSupported returns true.
+LightingMode=0
 ```
 
 An unrecognized key, or a value out of the documented range, is logged as an
@@ -115,11 +131,26 @@ unchanged in that case.
 | `Dx8to12_SetSettingFloat` | `bool __cdecl (const char *key, float value)` |
 | `Dx8to12_GetSettingBool` | `bool __cdecl (const char *key, bool *out_value)` |
 | `Dx8to12_SetSettingBool` | `bool __cdecl (const char *key, bool value)` |
+| `Dx8to12_GetRaytracingSupported` | `bool __cdecl ()` |
+| `Dx8to12_GetRtShadowOutputResource` | `void * __cdecl ()` |
+| `Dx8to12_GetRtShadowDoneFence` | `void * __cdecl ()` |
+| `Dx8to12_GetRtShadowDoneFenceValue` | `unsigned long long __cdecl ()` |
+| `Dx8to12_GetRtShadowOutputWidth` | `unsigned int __cdecl ()` |
+| `Dx8to12_GetRtShadowOutputHeight` | `unsigned int __cdecl ()` |
+| `Dx8to12_GetRtShadowOutputFormat` | `unsigned int __cdecl ()` |
 
 `key` is one of the names documented in the `dx8to12.ini` section above
 (`AnisotropicOverride`, `MSAASamples`, `SharpenStrength`,
-`HighPrecisionDepth`), case-insensitive, matched against the correctly-typed
-function (e.g. `HighPrecisionDepth` only responds to the `*Bool` functions).
+`HighPrecisionDepth`, `LightingMode`), case-insensitive, matched against the
+correctly-typed function (e.g. `HighPrecisionDepth` only responds to the
+`*Bool` functions).
+
+**`Dx8to12_GetRaytracingSupported`** reports whether the adapter supports DXR
+(`D3D12_RAYTRACING_TIER_1_0` or higher), checked once at device creation.
+Returns `false` before device creation too. A mod's settings UI should call
+this to grey out `LightingMode` values 2-4 rather than letting the player pick
+one that `Dx8to12_SetSettingInt` would silently clamp back down to `PerPixel`
+(1) anyway.
 
 Changes made through this API are **in-memory only for the current process
 session** -- they do not get written back to `dx8to12.ini`. A mod that wants
@@ -179,6 +210,12 @@ void Example(HMODULE d3d8) {
 | `Dx8to12_UnregisterRenderCallback` | `bool __cdecl (void(__cdecl*)(void*))` | Removes a previously registered callback. |
 | `Dx8to12_GetSwapChainGeneration` | `unsigned long long __cdecl ()` | Counter bumped once per device `Reset()`; see below. Returns 0 if there's no device yet. |
 | `Dx8to12_GetLastFrameMs` | `double __cdecl ()` | Milliseconds between the last two presented frames; see below. Returns 0 before the second frame or if there's no device. |
+| `Dx8to12_GetRtShadowOutputResource` | `void* __cdecl ()` | Borrowed x86-local `ID3D12Resource*` (`Texture2D`); null until the first completed result upload. |
+| `Dx8to12_GetRtShadowDoneFence` | `void* __cdecl ()` | Legacy compatibility export. Protocol v13 returns null because upload and callbacks share one command list. |
+| `Dx8to12_GetRtShadowDoneFenceValue` | `unsigned long long __cdecl ()` | Legacy compatibility export. Protocol v13 returns 0; do not queue-wait when the texture itself is valid. |
+| `Dx8to12_GetRtShadowOutputWidth` | `unsigned int __cdecl ()` | Current mask width (320). Returns 0 before the first upload. |
+| `Dx8to12_GetRtShadowOutputHeight` | `unsigned int __cdecl ()` | Current mask height (180). Returns 0 before the first upload. |
+| `Dx8to12_GetRtShadowOutputFormat` | `unsigned int __cdecl ()` | Protocol v14: `DXGI_FORMAT_R8G8B8A8_UNORM` (R shadow, G reflection hit, B diffuse visibility/GI, A geometry validity). Returns 0 when unavailable. |
 
 **Measuring framerate**: `Dx8to12_GetLastFrameMs()` returns the interval
 between the last two `Present` calls -- the frames the game actually put on
@@ -230,6 +267,16 @@ API called `ImGui_ImplDX12_RenderDrawData` without first rebinding its own
 heap, producing this error every frame; the fix was one `SetDescriptorHeaps`
 call right before the `RenderDrawData` call.
 
+**Multiple registered callbacks share the same command list, in registration
+order**: Dx8to12 rebinds its own heaps before invoking *each* callback, so
+every mod always starts from Dx8to12's own known heap state regardless of
+what an earlier-registered mod's callback did -- you don't need to guard
+against another mod's leftover heap binding, only against your own callback
+leaving Dx8to12's heap unbound *within* your own draws if you switch to your
+own heap mid-callback (rebind before your own draws, per the paragraph
+above, same as always). If you don't switch heaps at all, you can rely on
+Dx8to12's heap being bound at the start of your callback unconditionally.
+
 **Surviving a device `Reset()`**: a window resize, fullscreen toggle, or
 format change destroys and recreates the back buffer resources (and can
 change their format/dimensions). If your PSO or other render-target-format-
@@ -248,6 +295,151 @@ yet, retry after detecting `IDirect3DDevice8` creation (e.g. by hooking
 `Direct3DCreate8`/`CreateDevice`, or simply polling
 `Dx8to12_GetD3D12Device` for a non-null result).
 
+## Scene metadata for mods
+
+`Dx8to12_RegisterRenderCallback` only ever hands a mod the finished, flat 2D
+backbuffer -- enough for an overlay, but not for anything that needs to know
+how the frame was actually built (world-space reconstruction, per-pixel
+effects driven by the scene's own lights, screen-space ambient occlusion).
+This section adds three read-only accessors for that: the current frame's
+depth buffer, the combined view*projection matrix, and the list of
+currently-active D3D8 lights.
+
+### Function reference (scene metadata)
+
+| Function | Signature | Notes |
+|---|---|---|
+| `Dx8to12_RequestDepthBufferAccess` | `bool __cdecl (bool enable)` | Opt in (or back out) to depth buffer access; see below. Returns `false` if there's no device yet. |
+| `Dx8to12_GetDepthBufferSrv` | `void* __cdecl ()` | Borrowed `ID3D12Resource*` for the current depth buffer. Null unless requested and ready. |
+| `Dx8to12_GetDepthBufferSrvGpuHandle` | `unsigned long long __cdecl ()` | `D3D12_GPU_DESCRIPTOR_HANDLE.ptr` for an SRV Dx8to12 already created against that resource, in its own `srv_heap()`. 0 unless requested and ready. |
+| `Dx8to12_GetDepthBufferFormat` | `unsigned int __cdecl ()` | `DXGI_FORMAT` to use if you build your own SRV desc against `Dx8to12_GetDepthBufferSrv`'s resource instead. 0 unless requested and ready. |
+| `Dx8to12_GetViewProjMatrix` | `bool __cdecl (float out_matrix[16])` | Combined view*projection matrix, row-major (D3D8/`D3DMATRIX` convention). Returns `false` if there's no device yet. |
+| `Dx8to12_GetActiveLightCount` | `int __cdecl ()` | Number of currently-enabled D3D8 lights (0-8). |
+| `Dx8to12_GetActiveLight` | `bool __cdecl (int index, Dx8to12_LightInfo*)` | Fills in the light at `index` (`[0, GetActiveLightCount())`); see the struct below. Returns `false` for an out-of-range index or no device. |
+
+```c
+// Flat mirror of D3DLIGHT8's fields -- not D3DLIGHT8 itself, since that
+// type isn't guaranteed ABI-stable across compilers/SDKs for an external
+// mod DLL to link against directly.
+typedef struct {
+  int type;              // D3DLIGHT8 numeric type: 1=POINT, 2=SPOT, 3=DIRECTIONAL
+  float diffuse[4], specular[4], ambient[4];  // r,g,b,a
+  float position[3], direction[3];            // world space, x,y,z
+  float range, falloff;
+  float attenuation0, attenuation1, attenuation2;
+  float theta, phi;
+} Dx8to12_LightInfo;
+```
+
+**Depth buffer access is opt-in, and takes one frame to arrive**: creating
+the depth buffer's SRV is free (a one-time descriptor allocation at texture
+creation, not a per-frame cost), but actually letting a mod *sample* it
+during its render callback isn't -- the depth buffer otherwise sits in
+`D3D12_RESOURCE_STATE_DEPTH_WRITE` for the whole frame, and making it
+readable requires a resource-state transition (and a symmetric one back,
+afterward) around every render callback invocation that frame. To keep that
+cost at zero for mods that don't need it, nothing is transitioned until you
+call `Dx8to12_RequestDepthBufferAccess(true)` -- and because `Present()`
+decides whether to do that transition once, at the top of the frame, before
+your callback runs, calling it for the first time *from inside* your own
+callback only takes effect starting the *next* frame (the same "may need a
+frame to arrive" caveat `Dx8to12_RegisterRenderCallback` already has for
+device creation). Call it once, e.g. right after your render callback
+registers successfully, rather than gating it behind per-frame logic.
+
+While depth access is enabled, Dx8to12 detaches the writable DSV before
+transitioning that resource to SRV state. Render callbacks can sample the
+depth texture and render to the color target, but must not assume the game's
+writable DSV remains bound or attempt depth writes during that callback.
+
+**Two ways to read the depth buffer**: `Dx8to12_GetDepthBufferSrvGpuHandle`
+is the direct path -- Dx8to12's own SRV/sampler heaps are already bound on
+the command list your render callback gets (see "Descriptor heaps are
+shared state" above), so you can call `SetGraphicsRootDescriptorTable`
+against that handle immediately, no heap of your own required, as long as
+you sample the depth buffer *before* switching the command list to your own
+heap (e.g. for ImGui) in the same callback. If your mod would rather keep
+everything in its own heap, use `Dx8to12_GetDepthBufferSrv` (the raw
+resource) plus `Dx8to12_GetDepthBufferFormat` (the format to put in your own
+`D3D12_SHADER_RESOURCE_VIEW_DESC`) instead -- same pattern as
+`Dx8to12_GetRtShadowOutputResource` below. Either way, the pointer/handle is
+owned by Dx8to12 and becomes invalid at device destruction/reset -- re-fetch
+it (and don't call `Release`) the same as any other borrowed resource here.
+
+```cpp
+// World-space reconstruction from depth, inside your render callback.
+float view_proj[16];
+get_view_proj(view_proj);  // Dx8to12_GetViewProjMatrix
+// Invert view_proj yourself (D3DXMatrixInverse/DirectXMath), then in your
+// pixel shader: sample depth at this pixel's UV via the GPU handle above,
+// reconstruct clip-space {u*2-1, (1-v)*2-1, depth, 1}, multiply by the
+// inverse, divide by w -- that's the pixel's world-space position.
+```
+
+## Pixel shader injection
+
+Beyond reading scene metadata yourself (above), a mod can also inject a
+custom HLSL fragment directly into the fixed-function pixel shader Dx8to12
+generates -- e.g. adding a glow term to `diffuse_color` using
+`Dx8to12_GetActiveLight`, without needing a full post-process pass. The
+callback runs once per (re)compile of a given fixed-function pixel shader
+*permutation*, not once per frame or per draw call.
+
+```c
+typedef struct {
+  int has_normal;              // exact for this compiled permutation
+  int has_view_pos;            // exact for this compiled permutation
+  int texture_stage_count;
+} Dx8to12_PixelShaderInjectionContext;
+
+// Return the number of bytes written to out_hlsl_snippet (0 = inject
+// nothing this compile). A return value greater than
+// out_hlsl_snippet_capacity is treated as "wrote nothing".
+typedef size_t (__cdecl *Dx8to12_PixelShaderInjectionFn)(
+    const Dx8to12_PixelShaderInjectionContext* context,
+    char* out_hlsl_snippet, size_t out_hlsl_snippet_capacity);
+
+bool __cdecl Dx8to12_RegisterPixelShaderInjection(Dx8to12_PixelShaderInjectionFn callback);
+bool __cdecl Dx8to12_UnregisterPixelShaderInjection(Dx8to12_PixelShaderInjectionFn callback);
+```
+
+| Function | Signature | Notes |
+|---|---|---|
+| `Dx8to12_RegisterPixelShaderInjection` | `bool __cdecl (Dx8to12_PixelShaderInjectionFn)` | Only one callback at a time -- returns `false` for null or if a *different* one is already registered (re-registering the same pointer is a no-op success). Invalidates the pixel shader cache on the render thread. |
+| `Dx8to12_UnregisterPixelShaderInjection` | `bool __cdecl (Dx8to12_PixelShaderInjectionFn)` | Returns `false` for null or if `callback` isn't the one currently registered. Waits for an invocation already in progress, then invalidates the pixel shader cache on the render thread. |
+| `Dx8to12_InvalidatePixelShaderCache` | `bool __cdecl ()` | Forces every fixed-function pixel shader to regenerate on next use -- call this if your registered callback's *output* changes at runtime (a toggle, a setting) without a full Unregister/Register cycle. |
+
+**Where your snippet runs**: right after `diffuse_color`/`specular_color`
+are set from the vertex output (and after per-pixel lighting, if
+`LightingMode` has it enabled, has already updated them) but *before* any
+texture stage or `result_color` exists -- your snippet may read/write
+`diffuse_color` and `specular_color` and read `IN` (`FFVertexOutput`,
+declared in `ff_vertex_shader.hlsl`), plus everything `lighting.hlsl`/
+`ps_common.hlsl` already provide (both `#include`d ahead of your snippet).
+It runs *before* the texture stage chain, so it cannot see or modify
+`result_color`/`temp_color` -- those don't exist yet at this point.
+
+**`has_normal`/`has_view_pos` are part of the shader-cache key**: every
+compiled permutation now matches the vertex declaration that supplied these
+flags. `IN.oViewNormal`/`IN.oViewPos` always exist in `FFVertexOutput`, but a
+zero flag means their contents are not meaningful for that draw shape.
+
+The injection callback is serialized with register/unregister so an ASI may
+unload safely after unregister returns. Keep the callback pure and fast: do
+not call the injection registration/invalidation exports recursively from
+inside it, and do not perform GPU work there. It runs during shader creation.
+
+**A snippet that fails to compile does not break the game**: if the shader
+with your injected fragment fails to compile, Dx8to12 logs the HLSL compiler
+error and recompiles that permutation *without* your injection instead --
+your effect silently doesn't apply for that permutation, but the rest of the
+game keeps rendering normally. Check `log.txt` for
+`Dx8to12_PixelShaderInjectionFn produced HLSL that failed to compile` while
+developing your snippet. There is no protection against HLSL that *compiles*
+but is pathologically expensive or hangs the GPU (an accidental infinite
+loop, etc.) -- that's a real TDR/driver-reset risk exactly like any other
+shader bug, so test incrementally.
+
 ### Adding a new setting (for anyone extending this project)
 
 Add the field to `Dx8to12::Config` (`src/config.h`), then a case for it
@@ -256,3 +448,76 @@ INI key-parsing `if`/`else if` chain in `src/config.cpp` -- there's a single
 source of truth per setting (the field), touched from a small, consistent
 set of places; no separate registration/reflection system. Document the new
 key in this file's INI example and the function-reference table above.
+
+**H4 helper result channel.** `Dx8to12_GetRtShadowOutputResource` returns a
+borrowed `ID3D12Resource*` containing the helper's current RT result;
+`Dx8to12_GetRtShadowDoneFence` and
+`Dx8to12_GetRtShadowDoneFenceValue` are retained for ABI compatibility with
+the old shared-GPU prototype. Protocol v13 returns a null fence and zero value:
+the result upload is recorded on the game's current command list before mod
+callbacks, so no queue wait is needed. The resource stays null until the
+helper's startup handshake and first completed scene batch. Pointers are owned by
+Dx8to12 and become invalid at device destruction/reset; a mod must not call
+`Release` on them or retain them across a reset.
+
+**Current safety status:** protocol v14 enables bounded BLAS/TLAS building and
+a 320x180 shadow `DispatchRays`. Geometry is copied into an 8 MiB shared-memory payload;
+the x64 helper creates its own UPLOAD resources from those bytes. It no longer
+opens x86-created vertex/index resources, waits on the x86 render queue or
+inserts geometry-copy commands into the game's command list. Submissions are
+limited to one batch per 500 ms. This isolation replaces the mixed-device GPU
+resource path that caused repeated NVIDIA device removals and one system hang.
+
+The helper reads its own uint shadow buffer back into the IPC mapping. Dx8to12
+then uploads that byte mask into an **x86-local `Texture2D` in
+`DXGI_FORMAT_R8G8B8A8_UNORM`**, transitions it to `PIXEL_SHADER_RESOURCE`, and only
+then invokes mod callbacks. No D3D12 resource or fence crosses the x86/x64
+device boundary.
+
+Before recording any command that samples the result, queue a GPU wait rather
+than blocking the CPU:
+
+```cpp
+auto* output = static_cast<ID3D12Resource*>(get_rt_output());
+auto* fence = static_cast<ID3D12Fence*>(get_rt_fence());
+const uint64_t value = get_rt_fence_value();
+if (output && fence && value != 0) { // Legacy shared-result protocol only.
+  command_queue->Wait(fence, value);
+}
+if (output) {
+  // Protocol v13: sample directly in this render callback. The upload and
+  // PIXEL_SHADER_RESOURCE transition are earlier on the same command list.
+}
+```
+
+### Integrating the RT shadow mask in a companion mod
+
+A companion ASI such as VCVisual12 should load these exports with
+`GetProcAddress` after Dx8to12 has created its device:
+
+```cpp
+using GetRtShadowOutputFn = void *(__cdecl *)();
+using GetRtShadowFenceFn = void *(__cdecl *)();
+using GetRtShadowFenceValueFn = unsigned long long(__cdecl *)();
+using GetRtShadowOutputDimensionFn = unsigned int(__cdecl *)();
+using GetRtShadowOutputFormatFn = unsigned int(__cdecl *)();
+using RegisterRenderCallbackFn = bool(__cdecl *)(void(__cdecl *)(void *));
+```
+
+Register a render callback and, from that callback, obtain the borrowed
+`ID3D12Resource*`, `ID3D12Fence*`, and fence value. For protocol v14 the
+resource is valid while fence/value are null/zero: do not skip composition in
+that case and do not add a queue wait. If a future/legacy implementation
+returns a non-null fence and nonzero value, use the GPU queue wait shown above.
+Do **not** call `SetEventOnCompletion` plus a CPU wait on every frame.
+
+The callback then records its fullscreen composite on the command list passed
+by `Dx8to12_RegisterRenderCallback`. The backbuffer is already bound and has
+the game's fully rendered image, so the composite belongs before returning
+from that callback. The mod must create its SRV/PSO resources itself and
+recreate any backbuffer-format-dependent state after
+`Dx8to12_GetSwapChainGeneration` changes.
+
+Query the width, height, and format exports instead of assuming resource
+dimensions. The current object is an x86-local RGBA8 texture. Do not CPU-wait and
+do not retain the borrowed pointer over a device reset.

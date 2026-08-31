@@ -35,6 +35,10 @@ class DescriptorPoolHeap {
 
   D3D12_GPU_DESCRIPTOR_HANDLE GetGPUHandleFor(
       D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle) const;
+  // Stable slot number for a descriptor allocated by this heap.  Scene
+  // tracking uses this as an opaque material key; it never dereferences it
+  // outside the heap that produced it.
+  UINT GetIndexFor(D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle) const;
 
   ID3D12DescriptorHeap* heap() { return heap_.get(); }
 

@@ -63,6 +63,143 @@ __declspec(dllexport) bool __cdecl Dx8to12_SetSettingBool(const char *key,
   return ::Dx8to12::SetConfigValueBool(key, value);
 }
 
+// Whether an RT backend is available: native D3D12 DXR, or the provisioned
+// x64 helper used when NVIDIA's x86 D3D12 runtime reports Tier 0. LightingMode values that need raytracing
+// (see config.h) are clamped by SetConfigValueInt when this is false, but a
+// mod's UI should check this itself too -- to grey those choices out instead
+// of letting the user pick a mode that silently gets clamped underneath them.
+// Returns false (not just "unsupported") before device creation as well.
+__declspec(dllexport) bool __cdecl Dx8to12_GetRaytracingSupported() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->raytracing_supported() : false;
+}
+
+// H4 result-channel accessors. The resource is a borrowed x86-local RGBA8
+// Texture2D, never AddRef'd, and stays null until the first result upload.
+// Protocol v13's fence accessor/value intentionally return null/zero because
+// upload and mod callbacks are ordered on the same command list.
+__declspec(dllexport) void* __cdecl Dx8to12_GetRtShadowOutputResource() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_output_resource() : nullptr;
+}
+
+__declspec(dllexport) void* __cdecl Dx8to12_GetRtShadowDoneFence() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_done_fence() : nullptr;
+}
+
+__declspec(dllexport) unsigned long long __cdecl
+Dx8to12_GetRtShadowDoneFenceValue() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_done_fence_value() : 0;
+}
+
+__declspec(dllexport) unsigned int __cdecl Dx8to12_GetRtShadowOutputWidth() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_output_width() : 0;
+}
+
+__declspec(dllexport) unsigned int __cdecl Dx8to12_GetRtShadowOutputHeight() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_output_height() : 0;
+}
+
+// DXGI_FORMAT value; currently DXGI_FORMAT_R8G8B8A8_UNORM (28), or UNKNOWN when
+// the helper channel does not exist.
+__declspec(dllexport) unsigned int __cdecl Dx8to12_GetRtShadowOutputFormat() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->rt_shadow_output_format() : 0;
+}
+
+// Level 1 mod-API scene metadata -- see MODDING.md's "Scene metadata for
+// mods" section for the full contract (in particular: the depth buffer
+// accessors return null/0 until Dx8to12_RequestDepthBufferAccess(true) has
+// been called, and take one extra frame to become valid after that call).
+
+__declspec(dllexport) bool __cdecl Dx8to12_RequestDepthBufferAccess(
+    bool enable) {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->RequestDepthBufferAccess(enable) : false;
+}
+
+__declspec(dllexport) void *__cdecl Dx8to12_GetDepthBufferSrv() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->depth_buffer_srv_resource() : nullptr;
+}
+
+// D3D12_GPU_DESCRIPTOR_HANDLE.ptr for an SRV already created (in Dx8to12's
+// own srv_heap(), which the render callback's command list already has
+// bound -- see MODDING.md's "Descriptor heaps are shared state" note)
+// against the resource Dx8to12_GetDepthBufferSrv returns. Usable directly
+// with SetGraphicsRootDescriptorTable with no extra work on the mod's side.
+__declspec(dllexport) unsigned long long __cdecl
+Dx8to12_GetDepthBufferSrvGpuHandle() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->depth_buffer_srv_gpu_handle() : 0;
+}
+
+// DXGI_FORMAT to use if building your own SRV desc against the resource
+// Dx8to12_GetDepthBufferSrv returns (e.g. if your own descriptor heap is
+// bound instead of Dx8to12_GetDepthBufferSrvGpuHandle's).
+__declspec(dllexport) unsigned int __cdecl Dx8to12_GetDepthBufferFormat() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->depth_buffer_srv_format() : 0;
+}
+
+// Combined view*projection matrix, row-major (D3D8 convention -- the same
+// layout D3DMATRIX/SetTransform uses), as a flat 16-float array. Returns
+// false if there's no device yet (out_matrix is left untouched).
+__declspec(dllexport) bool __cdecl Dx8to12_GetViewProjMatrix(
+    float out_matrix[16]) {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->GetViewProjMatrix(out_matrix) : false;
+}
+
+__declspec(dllexport) int __cdecl Dx8to12_GetActiveLightCount() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->GetActiveLightCount() : 0;
+}
+
+// index ranges over [0, Dx8to12_GetActiveLightCount()) -- see MODDING.md for
+// the Dx8to12_LightInfo struct layout.
+__declspec(dllexport) bool __cdecl Dx8to12_GetActiveLight(
+    int index, Dx8to12_LightInfo *out) {
+  if (!out) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->GetActiveLight(index, out) : false;
+}
+
+// Level 3 mod-API: inject a custom HLSL fragment into the generated
+// fixed-function pixel shader -- see MODDING.md's "Pixel shader injection"
+// section for the full contract (in particular: only one callback may be
+// registered at a time, and a fragment that fails to compile is silently
+// dropped for that shader permutation, logged, and does not affect the rest
+// of the game's rendering).
+
+__declspec(dllexport) bool __cdecl Dx8to12_RegisterPixelShaderInjection(
+    Dx8to12_PixelShaderInjectionFn callback) {
+  if (!callback) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->RegisterPixelShaderInjection(callback) : false;
+}
+
+__declspec(dllexport) bool __cdecl Dx8to12_UnregisterPixelShaderInjection(
+    Dx8to12_PixelShaderInjectionFn callback) {
+  if (!callback) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  return device ? device->UnregisterPixelShaderInjection(callback) : false;
+}
+
+// For a mod that wants to change what its already-registered callback
+// produces at runtime without a full Unregister/Register cycle -- forces
+// every fixed-function pixel shader to regenerate on next use.
+__declspec(dllexport) bool __cdecl Dx8to12_InvalidatePixelShaderCache() {
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  if (!device) return false;
+  device->InvalidatePixelShaderCache();
+  return true;
+}
+
 // Native D3D12 rendering access for mods (e.g. an ImGui-based trainer/
 // overlay) that want to draw directly through the real device instead of
 // needing a D3D9 (or other) compatibility shim -- see MODDING.md. All of

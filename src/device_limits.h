@@ -88,7 +88,21 @@ static constexpr bool kPersistentBufferMapping = true;
 // could leave a command list depending on state it never set -- which is
 // what a GPU device removal during capture replay looks like. Switchable
 // while bisecting that.
+// Was disabled to isolate the Vice City near-field texture disappearance.
+// That investigation is now closed and the cause was unrelated -- the game
+// writes past its own static index buffers and the draw's index count was
+// being clamped (see MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md and
+// DX8TO12_PAD_BUFFERS) -- so nothing about that bug argues for keeping the
+// per-draw rebinds. Re-enabling is still opt-in rather than flipped outright:
+// it is the one optimisation that skips *recording* commands, so a mistake
+// here shows up as a command list depending on state it never set, which is
+// exactly what a device removal during capture replay looks like. Prove it on
+// a real session (build-x86-release-vc) before making it the default.
+#ifdef DX8TO12_DRAW_STATE_CACHE
 static constexpr bool kCacheDrawStateBindings = true;
+#else
+static constexpr bool kCacheDrawStateBindings = false;
+#endif
 
 // Will implicitly disable Pso cache.
 static constexpr bool kDisablePixelShaderCache = false;
@@ -96,5 +110,9 @@ static constexpr bool kDisablePsoCache = false;
 
 // Does not bother keeping a CPU copy of managed resources. Frees up memory,
 // helpful when trying to do a GPU capture.
-static constexpr bool kDisableManagedResources = true;
+// Keep a CPU shadow for D3DPOOL_MANAGED textures.  Vice City updates some
+// streamed mip levels through LockRect/UnlockRect; retaining the shadow makes
+// those updates explicit and matches the D3D8 contract instead of relying on
+// the disabled driver-managed-resource path.
+static constexpr bool kDisableManagedResources = false;
 }  // namespace Dx8to12

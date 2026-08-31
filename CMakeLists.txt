@@ -3,6 +3,26 @@ cmake_minimum_required(VERSION 3.11...3.26)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(DX8TO12_USE_ALLOCATOR "Use D3D12MemoryAllocator instead of manual suballocation" OFF)
 option(DX8TO12_ENABLE_VALIDATION "Enable the D3D12 debug layer and TRACE_ENTRY logging (dev builds)" ON)
+option(DX8TO12_ENABLE_MINDEBUG "Enable only targeted low-overhead diagnostics (release-mindebug builds)" OFF)
+option(DX8TO12_ENABLE_D3D12_DEBUG_LAYER "Enable only the D3D12/DXGI debug layer without dev TRACE logging" OFF)
+option(DX8TO12_FORCE_GPU_IDLE "Wait for the just-submitted GPU frame (diagnostic A/B)" OFF)
+option(DX8TO12_PASSTHROUGH_OOB_INDICES "Submit out-of-bounds indexed draws without truncating them (compatibility A/B)" OFF)
+option(DX8TO12_VALIDATE_DEVICE_ALWAYS_FAIL "Return D3DERR_INVALIDCALL from ValidateDevice like the D3D11 reference port (compatibility A/B)" OFF)
+option(DX8TO12_BUFFER_SHADOW "Give every vertex/index buffer a full CPU shadow and upload dirty ranges through the command list, like the d3d8to11 reference port (missing-geometry A/B)" OFF)
+option(DX8TO12_KEEP_TARGET_LOD "Keep the diagnosed near-road model permanently faded so its LOD is never culled (in-process probe; pollutes baseline measurements)" OFF)
+# ON by default: this is a confirmed fix, not an experiment. GTA VC writes past
+# the end of its own static index buffers (measured: 219 distinct buffers in one
+# session) and then draws those indices; without the pad, DrawIndexedPrimitive
+# clamps the count and silently drops the trailing triangles of a material --
+# the "disappearing road/building" bug. Turn OFF only to reproduce that bug for
+# an A/B. See MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md.
+option(DX8TO12_PAD_BUFFERS "Over-allocate vertex/index buffers so the game's writes and draws past their declared end stay in valid memory instead of being clamped away" ON)
+option(DX8TO12_DRAW_STATE_CACHE "Skip re-recording PSO/root/vertex-buffer bindings when nothing they depend on changed (faster; see kCacheDrawStateBindings in device_limits.h before enabling)" OFF)
+
+if(DX8TO12_ENABLE_VALIDATION AND DX8TO12_ENABLE_MINDEBUG)
+  message(FATAL_ERROR
+          "DX8TO12_ENABLE_MINDEBUG requires DX8TO12_ENABLE_VALIDATION=OFF")
+endif()
 
 project(
   Dx8to12
@@ -16,7 +36,7 @@ set_property(TARGET d3d8 PROPERTY CXX_STANDARD_REQUIRED ON)
 add_subdirectory(src)
 
 target_link_libraries(d3d8 PUBLIC DXGI.lib D3D12.lib D3DCompiler.lib dxguid.lib)
-target_include_directories(d3d8 PUBLIC src src/DirectX8 third_party)
+target_include_directories(d3d8 PUBLIC src src/DirectX8 third_party shared)
 target_compile_definitions(
   d3d8 PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS NOMINMAX
                CURRENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -27,11 +47,45 @@ endif()
 if(DX8TO12_ENABLE_VALIDATION)
   target_compile_definitions(d3d8 PRIVATE DX8TO12_ENABLE_VALIDATION)
 endif()
+if(DX8TO12_ENABLE_MINDEBUG)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_ENABLE_MINDEBUG)
+endif()
+if(DX8TO12_ENABLE_D3D12_DEBUG_LAYER)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_ENABLE_D3D12_DEBUG_LAYER)
+endif()
+if(DX8TO12_FORCE_GPU_IDLE)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_FORCE_GPU_IDLE)
+endif()
+if(DX8TO12_PASSTHROUGH_OOB_INDICES)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_PASSTHROUGH_OOB_INDICES)
+endif()
+if(DX8TO12_VALIDATE_DEVICE_ALWAYS_FAIL)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_VALIDATE_DEVICE_ALWAYS_FAIL)
+endif()
+if(DX8TO12_BUFFER_SHADOW)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_BUFFER_SHADOW)
+endif()
+if(DX8TO12_KEEP_TARGET_LOD)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_KEEP_TARGET_LOD)
+endif()
+if(DX8TO12_PAD_BUFFERS)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_PAD_BUFFERS)
+endif()
+if(DX8TO12_DRAW_STATE_CACHE)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_DRAW_STATE_CACHE)
+endif()
+
+# Dev builds retain the normal AixLog sink and crash diagnostics. Both release
+# profiles compile ordinary LOG(...) statements away completely: the clean
+# release has no file logging at all, while release-mindebug writes only its
+# explicitly selected compact diagnostics through a dedicated path.
+if(NOT DX8TO12_ENABLE_VALIDATION)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_DISABLE_LOGGING)
+endif()
 
 # target_compile_options(d3d8 PRIVATE "$<$<CONFIG:Debug>:/Ox>")
 
-target_precompile_headers(d3d8 PRIVATE third_party/aixlog.hpp <windows.h>
-                          <d3d12.h>)
+target_precompile_headers(d3d8 PRIVATE src/pch.h)
 
 if(MSVC)
   target_compile_options(d3d8 PRIVATE /W4 /wd4100 /wd4505)

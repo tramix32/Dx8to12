@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <fstream>
 #include <intrin.h>
 #include <set>
 #include <sstream>
@@ -15,7 +16,10 @@
 #include "SimpleMath.h"
 #include "aixlog.hpp"
 #include "buffer.h"
+#include "config.h"
 #include "dynamic_ring_buffer.h"
+#include "raytracing.h"
+#include "rt_helper_client.h"
 #include "shader_parser.h"
 #include "surface.h"
 #include "texture.h"
@@ -37,6 +41,11 @@
 
 namespace Dx8to12 {
 
+// Protocol v12 transports bounded CPU snapshots only. The helper creates all
+// DXR input resources on its own x64 device, so this path no longer mutates
+// the game's command list or shares geometry allocations across devices.
+constexpr bool kEnableExperimentalHelperSceneSubmission = true;
+
 // The single live Device instance, exposed to dx8to12_api.cpp so the C mod
 // API can reach it without every caller needing a Device* of their own.
 // There is only ever one Device (one D3D12 device/swap chain per process),
@@ -44,6 +53,737 @@ namespace Dx8to12 {
 static Device *g_current_device = nullptr;
 
 Device *GetCurrentDeviceForModApi() { return g_current_device; }
+
+#ifdef DX8TO12_ENABLE_MINDEBUG
+namespace {
+
+// GTA: Vice City 1.0 / RenderWare call-site diagnostics for the intermittent
+// missing-near-road investigation.  RenderDoc established that the affected
+// pixel is missing a whole material draw, rather than sampling a corrupt D3D12
+// texture.  The local reVC source plus Ghidra identify the renderer involved:
+//
+//   0x674380  default material render
+//   0x674510  MatFX dual-pass render
+//   0x674EE0  MatFX environment-map render
+//   0x6756F0  MatFX bump-map render
+//   0x676460  top-level MatFX mesh callback
+//
+// All calls below go through tiny RenderWare D3D8 wrappers first, so a normal
+// stack trace stops at the same wrapper address for every material.  The x86
+// CALL instructions still leave their exact return addresses on the raw
+// stack, however.  Match those known return addresses and aggregate them for
+// 30 presented frames: this says which RenderWare branch stopped issuing the
+// missing draw without producing the multi-gigabyte, timing-altering log that
+// the previous per-SetTexture diagnostic did.
+constexpr uintptr_t kGtaPreferredImageBase = 0x00400000u;
+
+constexpr std::array<uintptr_t, 29> kRwSetTextureCallSites = {
+    0x00674393u, 0x0067454fu, 0x006745feu, 0x00674717u, 0x0067475bu,
+    0x0067483bu, 0x006748c1u, 0x006749c4u, 0x00674a2bu, 0x00674a54u,
+    0x00674b0bu, 0x00674b4cu, 0x00674b93u, 0x00674c7bu, 0x00674cd5u,
+    0x00674e81u, 0x00674fadu, 0x0067502fu, 0x0067523cu, 0x006752aeu,
+    0x0067542au, 0x006755dcu, 0x00675743u, 0x006757a0u, 0x006758b4u,
+    0x0067596du, 0x00676517u, 0x00678c49u, 0x00678cc1u,
+};
+
+constexpr std::array<uintptr_t, 16> kRwIndexedDrawCallSites = {
+    0x0067442du, 0x006744e2u, 0x00674ae4u, 0x00674ddeu,
+    0x006750cfu, 0x0067521du, 0x0067528fu, 0x00675318u,
+    0x0067540du, 0x006754f1u, 0x00675894u, 0x006758fau,
+    0x00675935u, 0x006759e0u, 0x00675a4du, 0x00678d8au,
+};
+
+constexpr std::array<uintptr_t, 14> kRwPrimitiveDrawCallSites = {
+    0x00674443u, 0x006744f8u, 0x00674cc1u, 0x00674df4u, 0x006751b0u,
+    0x00675230u, 0x006752a2u, 0x00675420u, 0x00675504u, 0x006758a8u,
+    0x00675949u, 0x006759f4u, 0x00675a61u, 0x00678da0u,
+};
+
+template <size_t N>
+size_t FindGtaCallerOnStack(const std::array<uintptr_t, N> &call_sites) {
+  const auto *stack =
+      reinterpret_cast<const uintptr_t *>(_AddressOfReturnAddress());
+  MEMORY_BASIC_INFORMATION memory = {};
+  if (VirtualQuery(stack, &memory, sizeof(memory)) != sizeof(memory) ||
+      memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) ||
+      (memory.Protect & PAGE_NOACCESS)) {
+    return N;
+  }
+
+  const uintptr_t region_end = reinterpret_cast<uintptr_t>(memory.BaseAddress) +
+                               static_cast<uintptr_t>(memory.RegionSize);
+  // Release-mindebug's one-frame spatial snapshot adds a fairly large local
+  // frame to DrawIndexedPrimitive.  In that build the RenderWare return
+  // address can sit beyond the first 64 DWORDs even though it is still only a
+  // couple of call frames above us.  Keep the walk bounded, but large enough
+  // that enabling the diagnostic does not make every draw "unmatched".
+  constexpr size_t kMaxStackSlots = 256;
+  const uintptr_t requested_end =
+      reinterpret_cast<uintptr_t>(stack + kMaxStackSlots);
+  const auto *scan_end = reinterpret_cast<const uintptr_t *>(
+      std::min(region_end, requested_end));
+  static const uintptr_t rebase =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) -
+      kGtaPreferredImageBase;
+
+  // All arrays are sorted.  Most stack values fail the range check, while a
+  // candidate needs only a binary search rather than N comparisons.
+  const uintptr_t first_return = call_sites.front() + 5u + rebase;
+  const uintptr_t last_return = call_sites.back() + 5u + rebase;
+  size_t generic_fallback = N;
+  for (const uintptr_t *slot = stack; slot < scan_end; ++slot) {
+    if (*slot < first_return || *slot > last_return) continue;
+    // Every listed instruction is a five-byte E8 rel32 CALL.
+    const uintptr_t preferred_call_site = *slot - 5u - rebase;
+    const auto match =
+        std::lower_bound(call_sites.begin(), call_sites.end(),
+                         preferred_call_site);
+    if (match != call_sites.end() && *match == preferred_call_site) {
+      const size_t index = static_cast<size_t>(match - call_sites.begin());
+      // 0x678cxx/0x678dxx are the common RenderWare D3D8 wrappers. They are
+      // nearest on the stack and used by nearly every world draw, so returning
+      // them immediately hides the more useful MatFX/default-material call
+      // site a little deeper down. Preserve the wrapper as a fallback for
+      // ordinary draws, but prefer a concrete renderer branch when present.
+      if (preferred_call_site < 0x00678000u) return index;
+      if (generic_fallback == N) generic_fallback = index;
+    }
+  }
+  return generic_fallback;
+}
+
+struct RwCallDiagnostics {
+  std::array<uint32_t, kRwSetTextureCallSites.size()> texture_nonnull = {};
+  std::array<uint32_t, kRwSetTextureCallSites.size()> texture_null = {};
+  std::array<uint32_t, kRwSetTextureCallSites.size()> texture_input_nonnull = {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_draws = {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_emitted = {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_no_ib = {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_zero_clamp = {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_partial_clamp =
+      {};
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> indexed_prepare_failed =
+      {};
+  std::array<uint32_t, kRwPrimitiveDrawCallSites.size()> primitive_draws = {};
+  uint32_t texture_unmatched = 0;
+  uint32_t indexed_unmatched = 0;
+  uint32_t primitive_unmatched = 0;
+  uint32_t indexed_emitted_total = 0;
+  uint32_t indexed_no_ib_total = 0;
+  uint32_t indexed_zero_clamp_total = 0;
+  uint32_t indexed_partial_clamp_total = 0;
+  uint32_t indexed_prepare_failed_total = 0;
+  uint32_t presented_frames = 0;
+  uint64_t first_frame = 0;
+};
+
+static RwCallDiagnostics g_rw_call_diagnostics;
+
+// One-frame draw snapshots used to compare the last visible distant LOD with
+// the first frame where the near geometry is missing.  Keeping the strings in
+// memory and writing them only at Present avoids turning every captured draw
+// into synchronous file I/O (which previously changed the timing enough to
+// hide high-FPS bugs).
+static bool g_rw_snapshot_active = false;
+static char g_rw_snapshot_label = '?';
+static bool g_rw_snapshot_f8_was_down = false;
+static bool g_rw_snapshot_f9_was_down = false;
+static uint64_t g_rw_snapshot_frame = 0;
+static std::vector<std::string> g_rw_snapshot_lines;
+static int16_t g_rw_target_lod_model = -1;
+static int16_t g_rw_target_near_model = -1;
+
+static void RememberGtaLodPair(int16_t lod_model) {
+  // The beach road IDs are contiguous in the retail IDE. Downtown uses a
+  // different allocation, so retain its explicitly proven IPL pair too.
+  if (lod_model >= 4259 && lod_model <= 4272) {
+    g_rw_target_lod_model = lod_model;
+    g_rw_target_near_model = lod_model - 14;
+  } else if (lod_model == 2031) {
+    g_rw_target_lod_model = 2031;
+    g_rw_target_near_model = 2060;
+  }
+}
+
+static void WriteRwDiagnosticLine(const std::string &line) {
+  // This is deliberately separate from AixLog: ordinary LOG(...) calls are
+  // compiled out in both release profiles.  The file is opened lazily, once,
+  // and flushed only twice per 30 frames.
+  static std::ofstream output(CURRENT_SOURCE_DIR "/log.txt",
+                              std::ofstream::out | std::ofstream::trunc);
+  static bool wrote_header = false;
+  if (!output) return;
+  if (!wrote_header) {
+    output << "DX8TO12-MINDEBUG validation=off compiled=" __DATE__ " "
+               __TIME__
+#ifdef DX8TO12_PASSTHROUGH_OOB_INDICES
+               " oobIndices=passthrough\n";
+#else
+               " oobIndices=clamped\n";
+#endif
+    wrote_header = true;
+  }
+  output << line;
+  output.flush();
+}
+
+static bool RwSnapshotActive() { return g_rw_snapshot_active; }
+
+static void AppendRwSnapshotLine(std::string line) {
+  if (g_rw_snapshot_active) g_rw_snapshot_lines.push_back(std::move(line));
+}
+
+struct GtaVec3 {
+  float x;
+  float y;
+  float z;
+};
+
+struct GtaColPoint {
+  GtaVec3 point;
+  float field_c;
+  GtaVec3 normal;
+  float field_1c;
+  uint8_t surface_a;
+  uint8_t piece_a;
+  uint8_t surface_b;
+  uint8_t piece_b;
+  uint32_t field_24;
+};
+static_assert(sizeof(GtaColPoint) == 0x28);
+
+template <typename T>
+static bool ReadGtaMemory(uintptr_t address, T *value) {
+  SIZE_T bytes_read = 0;
+  return ReadProcessMemory(GetCurrentProcess(),
+                           reinterpret_cast<const void *>(address), value,
+                           sizeof(*value), &bytes_read) &&
+         bytes_read == sizeof(*value);
+}
+
+static std::string DescribeGtaCenterRay() {
+  const uintptr_t image_base =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  const uintptr_t rebase = image_base - kGtaPreferredImageBase;
+
+  // Retail VC 1.0 CWorld::ProcessLineOfSight. Refuse to call through this
+  // address unless the unmodified prologue is present; an unsupported exe is
+  // a diagnostic miss, not permission to jump into arbitrary game code.
+  constexpr uintptr_t kProcessLineOfSight = 0x004d92d0u;
+  constexpr std::array<uint8_t, 10> kExpectedPrologue = {
+      0x53, 0x56, 0x57, 0x55, 0x81, 0xec, 0x60, 0x02, 0x00, 0x00};
+  std::array<uint8_t, kExpectedPrologue.size()> actual_prologue = {};
+  SIZE_T bytes_read = 0;
+  if (!ReadProcessMemory(
+          GetCurrentProcess(),
+          reinterpret_cast<const void *>(kProcessLineOfSight + rebase),
+          actual_prologue.data(), actual_prologue.size(), &bytes_read) ||
+      bytes_read != actual_prologue.size() ||
+      actual_prologue != kExpectedPrologue) {
+    return "RWRAY unsupported-exe\n";
+  }
+
+  GtaVec3 camera = {};
+  GtaVec3 forward = {};
+  if (!ReadGtaMemory(0x007e46b8u + rebase, &camera) ||
+      !ReadGtaMemory(0x007e4698u + rebase, &forward) ||
+      !std::isfinite(camera.x) || !std::isfinite(camera.y) ||
+      !std::isfinite(camera.z) || !std::isfinite(forward.x) ||
+      !std::isfinite(forward.y) || !std::isfinite(forward.z)) {
+    return "RWRAY camera-unavailable\n";
+  }
+
+  const float forward_length = std::sqrt(forward.x * forward.x +
+                                         forward.y * forward.y +
+                                         forward.z * forward.z);
+  if (forward_length < 0.5f || forward_length > 1.5f) {
+    std::ostringstream bad_forward;
+    bad_forward << "RWRAY bad-forward camera=(" << camera.x << ","
+                << camera.y << "," << camera.z << ") forward=(" << forward.x
+                << "," << forward.y << "," << forward.z << ")\n";
+    return bad_forward.str();
+  }
+
+  const float ray_length = 2000.f / forward_length;
+  const GtaVec3 target = {camera.x + forward.x * ray_length,
+                          camera.y + forward.y * ray_length,
+                          camera.z + forward.z * ray_length};
+  GtaColPoint collision = {};
+  uintptr_t entity = 0;
+  using ProcessLineOfSightFn = bool(__cdecl *)(
+      const GtaVec3 &, const GtaVec3 &, GtaColPoint &, uintptr_t &, bool, bool,
+      bool, bool, bool, bool, bool, bool);
+  const auto process_line_of_sight = reinterpret_cast<ProcessLineOfSightFn>(
+      kProcessLineOfSight + rebase);
+  // Roads are buildings. Include objects and dummies as well, but exclude
+  // moving actors so Tommy/a vehicle between the camera and the road cannot
+  // steal the diagnostic hit.
+  const bool hit = process_line_of_sight(
+      camera, target, collision, entity, true, false, false, true, true,
+      false, false, false);
+
+  std::ostringstream line;
+  line << "RWRAY hit=" << hit << " camera=(" << camera.x << "," << camera.y
+       << "," << camera.z << ") forward=(" << forward.x << "," << forward.y
+       << "," << forward.z << ")";
+  if (!hit || entity == 0) {
+    line << " entity=0\n";
+    return line.str();
+  }
+
+  uint8_t type_and_status = 0;
+  int16_t model = -1;
+  uintptr_t rw_object = 0;
+  GtaVec3 entity_position = {};
+  const bool entity_readable =
+      ReadGtaMemory(entity + 0x50u, &type_and_status) &&
+      ReadGtaMemory(entity + 0x5cu, &model) &&
+      ReadGtaMemory(entity + 0x4cu, &rw_object) &&
+      ReadGtaMemory(entity + 0x34u, &entity_position);
+  line << " point=(" << collision.point.x << "," << collision.point.y << ","
+       << collision.point.z << ") entity=0x" << std::hex << entity << std::dec;
+  if (!entity_readable) {
+    line << " entity-unreadable\n";
+    return line.str();
+  }
+  line << " type=" << static_cast<int>(type_and_status & 7u)
+       << " model=" << model << " epos=(" << entity_position.x << ","
+       << entity_position.y << "," << entity_position.z << ") rw=0x"
+       << std::hex << rw_object << std::dec;
+
+  // The operand of `mov ebx, 0x94ddd0` in LoadAllRequestedModels is patched
+  // by limit adjusters when they relocate CStreaming::ms_aInfoForModel. Read
+  // that live operand instead of assuming the retail array address. Each
+  // CStreamingInfo is 0x14 bytes; load state and flags are at +8/+9.
+  uintptr_t streaming_base = 0;
+  uint32_t streaming_base32 = 0;
+  if (ReadGtaMemory(0x0040b6e3u + rebase, &streaming_base32))
+    streaming_base = streaming_base32;
+  uint8_t load_state = 0xff;
+  uint8_t stream_flags = 0xff;
+  if (model >= 0 && streaming_base != 0) {
+    const uintptr_t stream_info =
+        streaming_base + static_cast<uintptr_t>(model) * 0x14u;
+    ReadGtaMemory(stream_info + 8u, &load_state);
+    ReadGtaMemory(stream_info + 9u, &stream_flags);
+  }
+  line << " streamBase=0x" << std::hex << streaming_base
+       << " state=0x" << static_cast<int>(load_state)
+       << " flags=0x" << static_cast<int>(stream_flags) << std::dec << "\n";
+  return line.str();
+}
+
+// A CEntity normally remains in a caller's saved register/spill slot while
+// RenderWare emits its atomic.  For the one draw which really covers the
+// screen centre, inspect that bounded part of the current stack and retain
+// only values which look like a live VC entity at the atomic's world
+// translation.  This gives us the exact model ID without touching the
+// renderer or changing streaming state.
+static std::string DescribeGtaCenterDrawEntities(float world_x, float world_y,
+                                                 float world_z) {
+  const uintptr_t image_base =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  const uintptr_t rebase = image_base - kGtaPreferredImageBase;
+  const uintptr_t image_end = image_base + 0x00614000u;
+  const auto *stack =
+      reinterpret_cast<const uintptr_t *>(_AddressOfReturnAddress());
+  MEMORY_BASIC_INFORMATION memory = {};
+  if (VirtualQuery(stack, &memory, sizeof(memory)) != sizeof(memory) ||
+      memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) ||
+      (memory.Protect & PAGE_NOACCESS)) {
+    return "RWCENTER-STACK unavailable\n";
+  }
+  constexpr size_t kMaxStackSlots = 2048;
+  const uintptr_t region_end = reinterpret_cast<uintptr_t>(memory.BaseAddress) +
+                               static_cast<uintptr_t>(memory.RegionSize);
+  const auto *scan_end = reinterpret_cast<const uintptr_t *>(std::min(
+      region_end, reinterpret_cast<uintptr_t>(stack + kMaxStackSlots)));
+
+  uintptr_t streaming_base = 0;
+  uint32_t streaming_base32 = 0;
+  if (ReadGtaMemory(0x0040b6e3u + rebase, &streaming_base32))
+    streaming_base = streaming_base32;
+
+  std::ostringstream line;
+  line << "RWCENTER-STACK target=(" << world_x << "," << world_y << ","
+       << world_z << ") matches=";
+  size_t matches = 0;
+  std::array<uintptr_t, 16> seen = {};
+  for (const uintptr_t *slot = stack; slot < scan_end; ++slot) {
+    const uintptr_t entity = *slot;
+    if (entity < 0x01000000u ||
+        std::find(seen.begin(), seen.end(), entity) != seen.end())
+      continue;
+    uintptr_t vtable = 0;
+    uint8_t type_and_status = 0;
+    int16_t model = -1;
+    uintptr_t rw_object = 0;
+    GtaVec3 position = {};
+    if (!ReadGtaMemory(entity, &vtable) || vtable < image_base ||
+        vtable >= image_end || !ReadGtaMemory(entity + 0x50u, &type_and_status) ||
+        !ReadGtaMemory(entity + 0x5cu, &model) ||
+        !ReadGtaMemory(entity + 0x4cu, &rw_object) ||
+        !ReadGtaMemory(entity + 0x34u, &position))
+      continue;
+    const uint8_t type = type_and_status & 7u;
+    if (type == 0 || type > 5 || model < 0 || model > 20000 ||
+        !std::isfinite(position.x) || !std::isfinite(position.y) ||
+        !std::isfinite(position.z))
+      continue;
+    const float dx = position.x - world_x;
+    const float dy = position.y - world_y;
+    const float dz = position.z - world_z;
+    // Atomic and entity transforms are ordinarily exact.  Ten metres still
+    // admits parented/interior objects without filling the compact log.
+    if (dx * dx + dy * dy + dz * dz > 100.f) continue;
+    if (matches < seen.size()) seen[matches] = entity;
+    ++matches;
+    // Remember the actual centre-hit pair so frame B probes the same road
+    // even if the player has moved to another block.
+    RememberGtaLodPair(model);
+    uint8_t load_state = 0xff;
+    uint8_t stream_flags = 0xff;
+    if (streaming_base != 0) {
+      const uintptr_t stream_info =
+          streaming_base + static_cast<uintptr_t>(model) * 0x14u;
+      ReadGtaMemory(stream_info + 8u, &load_state);
+      ReadGtaMemory(stream_info + 9u, &stream_flags);
+    }
+    line << " [slot=" << (slot - stack) << " ent=0x" << std::hex << entity
+         << " model=" << std::dec << model << " type="
+         << static_cast<int>(type) << " pos=(" << position.x << ","
+         << position.y << "," << position.z << ") rw=0x" << std::hex
+         << rw_object << " state=0x" << static_cast<int>(load_state)
+         << " flags=0x" << static_cast<int>(stream_flags) << std::dec << "]";
+  }
+  line << "\n";
+  return line.str();
+}
+
+// The matched IPL pair is nb_road02 (4246) and its distant replacement
+// LODroad02 (4260).  Report their live streaming records for both snapshots;
+// this is deliberately a read-only probe of the array Limit Adjuster may move.
+static std::string DescribeGtaTargetRoadStreaming() {
+  const uintptr_t image_base =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  const uintptr_t rebase = image_base - kGtaPreferredImageBase;
+  uint32_t streaming_base32 = 0;
+  if (!ReadGtaMemory(0x0040b6e3u + rebase, &streaming_base32) ||
+      streaming_base32 == 0) {
+    return "RWMODEL target streamBase=unavailable\n";
+  }
+  if (g_rw_target_lod_model < 0 || g_rw_target_near_model < 0)
+    return "RWMODEL target=unknown\n";
+  std::ostringstream line;
+  line << "RWMODEL target streamBase=0x" << std::hex << streaming_base32;
+  for (const int16_t model : {g_rw_target_near_model, g_rw_target_lod_model}) {
+    const uintptr_t info = static_cast<uintptr_t>(streaming_base32) +
+                           static_cast<uintptr_t>(model) * 0x14u;
+    uint8_t state = 0xff;
+    uint8_t flags = 0xff;
+    ReadGtaMemory(info + 8u, &state);
+    ReadGtaMemory(info + 9u, &flags);
+    line << " m" << std::dec << model << "=s0x" << std::hex
+         << static_cast<int>(state) << "/f0x" << static_cast<int>(flags);
+  }
+  line << std::dec << "\n";
+  return line.str();
+}
+
+static std::string DescribeGtaTargetVisibleEntities() {
+  if (g_rw_target_lod_model < 0 || g_rw_target_near_model < 0)
+    return "RWENTITY target=unknown\n";
+  const uintptr_t image_base =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  const uintptr_t rebase = image_base - kGtaPreferredImageBase;
+  // GTA VC 1.0 CRenderer::ms_aVisibleEntityPtrs and its count. Both locations
+  // are read-only diagnostic inputs; all individual pointers are validated
+  // before their fields are inspected.
+  constexpr uintptr_t kVisibleEntities = 0x007d54f8u;
+  constexpr uintptr_t kVisibleCount = 0x00a0d1e4u;
+  uint32_t count = 0;
+  if (!ReadGtaMemory(kVisibleCount + rebase, &count) || count > 1000u)
+    return "RWENTITY target visible-list=unavailable\n";
+  std::ostringstream line;
+  line << "RWENTITY target visibleCount=" << count << " near=" << g_rw_target_near_model
+       << " lod=" << g_rw_target_lod_model;
+  size_t matches = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uintptr_t entity = 0;
+    if (!ReadGtaMemory(kVisibleEntities + rebase + i * sizeof(entity),
+                       &entity) || entity == 0)
+      continue;
+    int16_t model = -1;
+    uintptr_t rw_object = 0;
+    uint8_t flags = 0;
+    GtaVec3 pos = {};
+    if (!ReadGtaMemory(entity + 0x5cu, &model) ||
+        (model != g_rw_target_near_model && model != g_rw_target_lod_model) ||
+        !ReadGtaMemory(entity + 0x4cu, &rw_object) ||
+        !ReadGtaMemory(entity + 0x50u, &flags) ||
+        !ReadGtaMemory(entity + 0x34u, &pos))
+      continue;
+    line << " [i=" << i << " m=" << model << " ent=0x" << std::hex
+         << entity << " rw=0x" << rw_object << std::dec << " type="
+         << static_cast<int>(flags & 7u) << " pos=(" << pos.x << ","
+         << pos.y << "," << pos.z << ")]";
+    ++matches;
+  }
+  line << " matches=" << matches << "\n";
+  return line.str();
+}
+
+// VC 1.0's CModelInfo::ms_modelInfoPtrs operand.  Keep only the diagnosed
+// near-road model in the fade state for one frame: SetupBigBuildingVisibility
+// otherwise removes its LOD as soon as this byte reaches 255, even though the
+// near mesh leaves the observed hole.  This is a reversible in-process
+// compatibility probe, not a game-file patch.
+//
+// Gated behind its own CMake option (default OFF) rather than plain
+// ENABLE_MINDEBUG: it writes to the game's own memory every single frame, so
+// leaving it on silently changed game state underneath every measurement in
+// every release-mindebug build.  A baseline run has to observe the unmodified
+// game, so this now has to be asked for explicitly.
+static void KeepGtaTargetRoadLodVisible() {
+#ifndef DX8TO12_KEEP_TARGET_LOD
+  return;
+#else
+  if (g_rw_target_near_model < 0) return;
+  const uintptr_t image_base =
+      reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  const uintptr_t rebase = image_base - kGtaPreferredImageBase;
+  uint32_t model_infos32 = 0;
+  if (!ReadGtaMemory(0x0055f7e3u + rebase, &model_infos32) ||
+      model_infos32 < 0x01000000u)
+    return;
+  uint32_t model_info32 = 0;
+  const uintptr_t slot = static_cast<uintptr_t>(model_infos32) +
+                         static_cast<uintptr_t>(g_rw_target_near_model) * 4u;
+  if (!ReadGtaMemory(slot, &model_info32) || model_info32 < 0x01000000u)
+    return;
+  constexpr uintptr_t kSimpleModelInfoAlpha = 0x41u;
+  const uint8_t fading_alpha = 0;
+  SIZE_T written = 0;
+  WriteProcessMemory(GetCurrentProcess(),
+                     reinterpret_cast<void *>(static_cast<uintptr_t>(model_info32) +
+                                               kSimpleModelInfoAlpha),
+                     &fading_alpha, sizeof(fading_alpha), &written);
+#endif  // DX8TO12_KEEP_TARGET_LOD
+}
+
+static void PollRwSnapshotHotkeys(uint64_t frame) {
+  // A snapshot armed at the previous Present has now collected exactly the
+  // frame that just ended. Flush it before accepting another request.
+  if (g_rw_snapshot_active) {
+    WriteRwDiagnosticLine(DescribeGtaTargetRoadStreaming());
+    WriteRwDiagnosticLine(DescribeGtaTargetVisibleEntities());
+    std::ostringstream header;
+    header << "=== RWDRAW-SNAPSHOT " << g_rw_snapshot_label
+           << " frame=" << g_rw_snapshot_frame
+           << " lines=" << g_rw_snapshot_lines.size() << " ===\n";
+    WriteRwDiagnosticLine(header.str());
+    for (const std::string &line : g_rw_snapshot_lines)
+      WriteRwDiagnosticLine(line);
+    std::ostringstream footer;
+    footer << "=== RWDRAW-SNAPSHOT " << g_rw_snapshot_label << " END ===\n";
+    WriteRwDiagnosticLine(footer.str());
+    g_rw_snapshot_lines.clear();
+    g_rw_snapshot_active = false;
+  }
+
+  const SHORT f8_state = GetAsyncKeyState(VK_F8);
+  const SHORT f9_state = GetAsyncKeyState(VK_F9);
+  const bool f8_down = (f8_state & 0x8000) != 0;
+  const bool f9_down = (f9_state & 0x8000) != 0;
+  const bool f8_pressed = (f8_state & 1) != 0 ||
+                          (f8_down && !g_rw_snapshot_f8_was_down);
+  const bool f9_pressed = (f9_state & 1) != 0 ||
+                          (f9_down && !g_rw_snapshot_f9_was_down);
+  if (f8_pressed || f9_pressed) {
+    g_rw_snapshot_label = f8_pressed ? 'A' : 'B';
+    g_rw_snapshot_frame = frame + 1;
+    g_rw_snapshot_lines.clear();
+    g_rw_snapshot_lines.reserve(1024);
+    g_rw_snapshot_active = true;
+    std::ostringstream armed;
+    armed << "RWDRAW-SNAPSHOT-ARMED " << g_rw_snapshot_label
+          << " targetFrame=" << g_rw_snapshot_frame << "\n";
+    WriteRwDiagnosticLine(armed.str());
+  }
+  g_rw_snapshot_f8_was_down = f8_down;
+  g_rw_snapshot_f9_was_down = f9_down;
+}
+
+static void RecordRwTextureCall(bool input_nonnull, bool has_texture) {
+  const size_t caller = FindGtaCallerOnStack(kRwSetTextureCallSites);
+  if (caller == kRwSetTextureCallSites.size()) {
+    ++g_rw_call_diagnostics.texture_unmatched;
+  } else if (has_texture) {
+    ++g_rw_call_diagnostics.texture_nonnull[caller];
+  } else {
+    ++g_rw_call_diagnostics.texture_null[caller];
+  }
+  if (caller < kRwSetTextureCallSites.size() && input_nonnull)
+    ++g_rw_call_diagnostics.texture_input_nonnull[caller];
+}
+
+static size_t RecordRwDrawCall(bool indexed) {
+  if (indexed) {
+    const size_t caller = FindGtaCallerOnStack(kRwIndexedDrawCallSites);
+    if (caller == kRwIndexedDrawCallSites.size())
+      ++g_rw_call_diagnostics.indexed_unmatched;
+    else
+      ++g_rw_call_diagnostics.indexed_draws[caller];
+    return caller;
+  } else {
+    const size_t caller = FindGtaCallerOnStack(kRwPrimitiveDrawCallSites);
+    if (caller == kRwPrimitiveDrawCallSites.size())
+      ++g_rw_call_diagnostics.primitive_unmatched;
+    else
+      ++g_rw_call_diagnostics.primitive_draws[caller];
+    return caller;
+  }
+}
+
+enum class RwIndexedEvent { Emitted, NoIndexBuffer, ZeroClamp, PartialClamp,
+                            PrepareFailed };
+
+static void RecordRwIndexedEvent(size_t caller, RwIndexedEvent event) {
+  RwCallDiagnostics &stats = g_rw_call_diagnostics;
+  std::array<uint32_t, kRwIndexedDrawCallSites.size()> *site_counts = nullptr;
+  uint32_t *total = nullptr;
+  switch (event) {
+    case RwIndexedEvent::Emitted:
+      site_counts = &stats.indexed_emitted;
+      total = &stats.indexed_emitted_total;
+      break;
+    case RwIndexedEvent::NoIndexBuffer:
+      site_counts = &stats.indexed_no_ib;
+      total = &stats.indexed_no_ib_total;
+      break;
+    case RwIndexedEvent::ZeroClamp:
+      site_counts = &stats.indexed_zero_clamp;
+      total = &stats.indexed_zero_clamp_total;
+      break;
+    case RwIndexedEvent::PartialClamp:
+      site_counts = &stats.indexed_partial_clamp;
+      total = &stats.indexed_partial_clamp_total;
+      break;
+    case RwIndexedEvent::PrepareFailed:
+      site_counts = &stats.indexed_prepare_failed;
+      total = &stats.indexed_prepare_failed_total;
+      break;
+  }
+  ++*total;
+  if (caller < kRwIndexedDrawCallSites.size()) ++(*site_counts)[caller];
+}
+
+template <size_t N>
+static void AppendRwSiteCounts(std::ostringstream &line,
+                               const std::array<uintptr_t, N> &sites,
+                               const std::array<uint32_t, N> &counts) {
+  bool any = false;
+  for (size_t i = 0; i < N; ++i) {
+    if (counts[i] == 0) continue;
+    line << (any ? "," : "") << "+0x" << std::hex
+         << (sites[i] - kGtaPreferredImageBase) << std::dec << "="
+         << counts[i];
+    any = true;
+  }
+}
+
+static void FlushRwCallDiagnostics(uint64_t frame) {
+  RwCallDiagnostics &stats = g_rw_call_diagnostics;
+  if (stats.presented_frames == 0) stats.first_frame = frame;
+  if (++stats.presented_frames < 30) return;
+
+  // GTA VC MatFX globals identified in Ghidra: 0x78A654 gates the final
+  // environment-map pass in the bump+env branch, while 0x78A648 selects a
+  // related bump path.  Read them from the game's module when available so a
+  // high-FPS repro can be correlated with the missing third draw.
+  uintptr_t image_base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+  auto read_gta_global = [image_base](uintptr_t preferred) -> uint32_t {
+    const auto *address = reinterpret_cast<const uint32_t *>(
+        image_base + (preferred - kGtaPreferredImageBase));
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) ||
+        (mbi.Protect & PAGE_GUARD))
+      return 0xFFFFFFFFu;
+    return *address;
+  };
+  {
+    std::ostringstream matfx;
+    matfx << "RWMATFX-GLOBAL frame=" << frame << " g78a648=0x" << std::hex
+          << read_gta_global(0x0078A648u) << " g78a654=0x"
+          << read_gta_global(0x0078A654u) << std::dec << "\n";
+    WriteRwDiagnosticLine(matfx.str());
+  }
+
+  std::ostringstream texture_line;
+  texture_line << "RWTEX-CALLS frames=" << stats.first_frame << "-" << frame
+               << " sites=[";
+  bool any = false;
+  for (size_t i = 0; i < kRwSetTextureCallSites.size(); ++i) {
+    if (stats.texture_nonnull[i] == 0 && stats.texture_null[i] == 0) continue;
+    texture_line << (any ? "," : "") << "+0x" << std::hex
+                 << (kRwSetTextureCallSites[i] - kGtaPreferredImageBase)
+                 << std::dec << ":tex=" << stats.texture_nonnull[i]
+                 << ":null=" << stats.texture_null[i]
+                 << ":input=" << stats.texture_input_nonnull[i];
+    any = true;
+  }
+  texture_line << "] unmatched=" << stats.texture_unmatched << "\n";
+  WriteRwDiagnosticLine(texture_line.str());
+
+  std::ostringstream draw_line;
+  draw_line << "RWDRAW-CALLS frames=" << stats.first_frame << "-" << frame
+            << " indexedAttempt=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites, stats.indexed_draws);
+  draw_line << "] indexedEmit=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites,
+                     stats.indexed_emitted);
+  draw_line << "] noIB=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites, stats.indexed_no_ib);
+  draw_line << "] zeroClamp=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites,
+                     stats.indexed_zero_clamp);
+  draw_line << "] partialClamp=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites,
+                     stats.indexed_partial_clamp);
+  draw_line << "] prepareFail=[";
+  AppendRwSiteCounts(draw_line, kRwIndexedDrawCallSites,
+                     stats.indexed_prepare_failed);
+  draw_line << "] primitiveAttempt=[";
+  AppendRwSiteCounts(draw_line, kRwPrimitiveDrawCallSites,
+                     stats.primitive_draws);
+  draw_line << "] outcomeTotals=emit:" << stats.indexed_emitted_total
+            << ":noIB:" << stats.indexed_no_ib_total
+            << ":zero:" << stats.indexed_zero_clamp_total
+            << ":partial:" << stats.indexed_partial_clamp_total
+            << ":prepareFail:" << stats.indexed_prepare_failed_total
+            << " unmatchedIndexed=" << stats.indexed_unmatched
+            << " unmatchedPrimitive=" << stats.primitive_unmatched << "\n";
+  WriteRwDiagnosticLine(draw_line.str());
+
+  stats = {};
+}
+
+}  // namespace
+#endif  // DX8TO12_ENABLE_MINDEBUG
+
+// Diagnostic sink other translation units can reach in release-mindebug
+// builds, where ordinary LOG(...) compiles to nothing (pch.h /
+// DX8TO12_DISABLE_LOGGING) and the F9 UI dump is permanently off. Deliberately
+// shares log.txt with the draw-outcome diagnostics above so a finding can be
+// correlated against them by frame number.
+void WriteMindebugDiagnosticLine(const std::string &line) {
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  WriteRwDiagnosticLine(line);
+#else
+  (void)line;
+#endif
+}
 
 // static_assert(sizeof(void *) == 4, "Does not support 64-bit.");
 
@@ -233,6 +973,14 @@ static void __stdcall DebugInfoQueueMessageCallback(
   }
   OutputDebugStringA(pDescription);
   LOG(log_severity) << pDescription << "\n";
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  if (severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+    std::ostringstream line;
+    line << "D3D12-MESSAGE severity=" << static_cast<int>(severity)
+         << " id=" << static_cast<int>(id) << " " << pDescription << "\n";
+    WriteRwDiagnosticLine(line.str());
+  }
+#endif
 #ifdef DX8TO12_ENABLE_VALIDATION
   // DIAGNOSTIC: a SET_DESCRIPTOR_TABLE_INVALID error has been showing up
   // every frame with a heap/handle that never matches anything either of
@@ -333,7 +1081,8 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
               << " primary=" << GetSystemMetrics(SM_CXSCREEN) << "x"
               << GetSystemMetrics(SM_CYSCREEN) << "\n";
   }
-#ifdef DX8TO12_ENABLE_VALIDATION
+#if defined(DX8TO12_ENABLE_VALIDATION) || \
+    defined(DX8TO12_ENABLE_D3D12_DEBUG_LAYER)
   ID3D12Debug *debug_iface = nullptr;
   ASSERT_HR(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_iface)));
   ASSERT_HR(
@@ -393,11 +1142,50 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
       return false;
     }
   }
+  {
+    DXGI_ADAPTER_DESC adapter_desc = {};
+    if (SUCCEEDED(adapter_->GetDesc(&adapter_desc))) {
+      char name[128] = {};
+      size_t converted = 0;
+      wcstombs_s(&converted, name, sizeof(name), adapter_desc.Description,
+                 _TRUNCATE);
+      LOG(INFO) << "D3D12 device created on adapter: " << name
+                << " (VRAM "
+                << (adapter_desc.DedicatedVideoMemory >> 20) << " MB, "
+                << "DXGI index " << adapter_index_ << ")\n";
+    }
+  }
+  {
+    // When an adapter reports an unexpected feature tier, distinguish a
+    // genuinely capable D3D12 runtime from a redirected/local replacement
+    // before drawing conclusions about the GPU or the compile-time SDK.
+    wchar_t runtime_path[MAX_PATH] = {};
+    HMODULE runtime_module = GetModuleHandleW(L"d3d12.dll");
+    if (runtime_module != nullptr) {
+      GetModuleFileNameW(runtime_module, runtime_path,
+                         MAX_PATH);
+    }
+    LARGE_INTEGER driver_version = {};
+    const HRESULT driver_hr = adapter_->CheckInterfaceSupport(
+        __uuidof(ID3D12Device), &driver_version);
+    ComPtr<ID3D12Device5> device5;
+    const HRESULT device5_hr = d3d12_device_->QueryInterface(
+        IID_PPV_ARGS(device5.GetForInit()));
+    char runtime_path_utf8[MAX_PATH * 3] = {};
+    size_t converted = 0;
+    wcstombs_s(&converted, runtime_path_utf8, sizeof(runtime_path_utf8),
+               runtime_path, _TRUNCATE);
+    LOG(INFO) << "D3D12 runtime=" << runtime_path_utf8
+              << " ID3D12Device5=" << std::hex << device5_hr
+              << " adapter-driver=" << driver_hr << ":0x"
+              << driver_version.QuadPart << std::dec << "\n";
+  }
   // TODO: Pass in adapter output.
   // ASSERT_HR(adapter_->EnumOutputs(0, adapter_output_.GetForInit()));
 
 // Create info queue.
-#ifdef DX8TO12_ENABLE_VALIDATION
+#if defined(DX8TO12_ENABLE_VALIDATION) || \
+    defined(DX8TO12_ENABLE_D3D12_DEBUG_LAYER)
   if (SUCCEEDED(d3d12_device_->QueryInterface(
           IID_PPV_ARGS(info_queue_.GetForInit()))))
     info_queue_->RegisterMessageCallback(DebugInfoQueueMessageCallback,
@@ -411,7 +1199,34 @@ bool Device::Create(HWND window, ComPtr<IDXGIFactory2> factory,
   //                                              sizeof(options12)));
   // ASSERT(options12.EnhancedBarriersSupported);
 
+  {
+    // Probed once here (not lazily) so raytracing_supported() is answerable
+    // immediately after device creation -- both LightingMode's config
+    // validation (config.cpp) and a mod's Dx8to12_GetRaytracingSupported call
+    // need a real answer before the first frame, not "unknown until the
+    // first raytracing pass tries to run".
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
+    const HRESULT options5_hr = d3d12_device_->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+    LOG(INFO) << "CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5) returned "
+              << std::hex << options5_hr << std::dec
+              << ", RaytracingTier=" << options5.RaytracingTier << "\n";
+    if (SUCCEEDED(options5_hr)) {
+      raytracing_supported_ =
+          options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
+    }
+    LOG(INFO) << "Raytracing tier: " << options5.RaytracingTier
+              << (raytracing_supported_ ? " (supported)\n"
+                                        : " (not supported)\n");
+  }
+
   ASSERT_HR(Init(presentParams));
+  // H1: an x64 companion can expose native NVIDIA DXR even though this x86
+  // process reports Tier 0. Start it only after Init: H2 needs this side's
+  // command queue/list to create and signal shared GPU resources.
+  if (!raytracing_supported_) {
+    rt_helper_client_ = std::make_unique<RtHelperClient>(this);
+  }
   g_current_device = this;
   LOG(INFO) << "Create: done, returning to Direct3D8::CreateDevice()\n";
   return true;
@@ -641,7 +1456,134 @@ DXGI_FORMAT Device::backbuffer_format() const {
   return back_buffers_.at(current_back_buffer_).get()->resource_desc().Format;
 }
 
+bool Device::raytracing_supported() const {
+  return raytracing_supported_ ||
+         (rt_helper_client_ && rt_helper_client_->ready());
+}
+
+void* Device::rt_shadow_output_resource() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_output_resource() : nullptr;
+}
+
+void* Device::rt_shadow_done_fence() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_done_fence() : nullptr;
+}
+
+uint64_t Device::rt_shadow_done_fence_value() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_done_fence_value() : 0;
+}
+
+uint32_t Device::rt_shadow_output_width() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_output_width() : 0;
+}
+
+uint32_t Device::rt_shadow_output_height() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_output_height() : 0;
+}
+
+uint32_t Device::rt_shadow_output_format() const {
+  return rt_helper_client_ ? rt_helper_client_->shadow_output_format() : DXGI_FORMAT_UNKNOWN;
+}
+
+bool Device::RequestDepthBufferAccess(bool enable) {
+  depth_buffer_access_requested_ = enable;
+  return true;
+}
+
+void* Device::depth_buffer_srv_resource() {
+  if (!depth_buffer_access_requested_ || !bound_depth_target_) return nullptr;
+  return bound_depth_target_->resource();
+}
+
+uint64_t Device::depth_buffer_srv_gpu_handle() {
+  if (!depth_buffer_access_requested_ || !bound_depth_target_) return 0;
+  return srv_heap_.GetGPUHandleFor(bound_depth_target_->srv_handle()).ptr;
+}
+
+uint32_t Device::depth_buffer_srv_format() {
+  if (!depth_buffer_access_requested_ || !bound_depth_target_) return DXGI_FORMAT_UNKNOWN;
+  return DepthSrvFormatFromTypeless(bound_depth_target_->resource_desc().Format);
+}
+
+bool Device::GetViewProjMatrix(float out_matrix[16]) const {
+  if (!out_matrix) return false;
+  static const DirectX::SimpleMath::Matrix kIdentity;
+  auto transform_or_identity = [this](D3DTRANSFORMSTATETYPE state) {
+    const auto it = transforms_.find(state);
+    DirectX::SimpleMath::Matrix result = kIdentity;
+    if (it != transforms_.end()) memcpy(&result, &it->second, sizeof(result));
+    return result;
+  };
+  const DirectX::SimpleMath::Matrix view_proj =
+      transform_or_identity(D3DTS_VIEW) * transform_or_identity(D3DTS_PROJECTION);
+  memcpy(out_matrix, &view_proj, sizeof(view_proj));
+  return true;
+}
+
+int Device::GetActiveLightCount() const {
+  return static_cast<int>(enabled_lights_.size());
+}
+
+bool Device::GetActiveLight(int index, Dx8to12_LightInfo* out) const {
+  if (!out || index < 0) return false;
+  // enabled_lights_ is an unordered_set -- snapshot into a stable, sorted
+  // order so a mod iterating 0..GetActiveLightCount()-1 doesn't see the
+  // order silently shuffle between calls within the same frame.
+  std::array<DWORD, kMaxActiveLights> sorted_indices;
+  int count = 0;
+  for (DWORD light_index : enabled_lights_) sorted_indices[count++] = light_index;
+  std::sort(sorted_indices.begin(), sorted_indices.begin() + count);
+  if (index >= count) return false;
+  const auto it = lights_.find(sorted_indices[index]);
+  if (it == lights_.end()) return false;
+  const D3DLIGHT8& light = it->second;
+  *out = Dx8to12_LightInfo{
+      .type = static_cast<int>(light.Type),
+      .diffuse = {light.Diffuse.r, light.Diffuse.g, light.Diffuse.b, light.Diffuse.a},
+      .specular = {light.Specular.r, light.Specular.g, light.Specular.b, light.Specular.a},
+      .ambient = {light.Ambient.r, light.Ambient.g, light.Ambient.b, light.Ambient.a},
+      .position = {light.Position.x, light.Position.y, light.Position.z},
+      .direction = {light.Direction.x, light.Direction.y, light.Direction.z},
+      .range = light.Range,
+      .falloff = light.Falloff,
+      .attenuation0 = light.Attenuation0,
+      .attenuation1 = light.Attenuation1,
+      .attenuation2 = light.Attenuation2,
+      .theta = light.Theta,
+      .phi = light.Phi,
+  };
+  return true;
+}
+
+bool Device::GetRtDirectionalLight(D3DVECTOR* direction) const {
+  if (!direction) return false;
+  for (const DWORD index : enabled_lights_) {
+    const auto it = lights_.find(index);
+    if (it != lights_.end() && it->second.Type == D3DLIGHT_DIRECTIONAL) {
+      *direction = it->second.Direction;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t Device::RtCurrentNormalByteOffset() {
+  const auto it = vertex_shaders_.find(bound_vertex_shader_);
+  if (it == vertex_shaders_.end()) return UINT_MAX;
+  const VertexShader* shader = it->second.Get();
+  if (!shader) return UINT_MAX;
+  for (const D3D12_INPUT_ELEMENT_DESC& element : shader->decl.input_elements) {
+    if (element.SemanticName && strcmp(element.SemanticName, "NORMAL") == 0 &&
+        element.InputSlot == 0 &&
+        element.Format == DXGI_FORMAT_R32G32B32_FLOAT) {
+      return element.AlignedByteOffset;
+    }
+  }
+  return UINT_MAX;
+}
+
 void Device::RegisterModRenderCallback(ModRenderCallback callback) {
+  std::lock_guard lock(mod_render_callbacks_mutex_);
   if (std::find(mod_render_callbacks_.begin(), mod_render_callbacks_.end(),
                 callback) != mod_render_callbacks_.end()) {
     return;
@@ -674,7 +1616,55 @@ void Device::RegisterModRenderCallback(ModRenderCallback callback) {
 }
 
 void Device::UnregisterModRenderCallback(ModRenderCallback callback) {
+  std::lock_guard lock(mod_render_callbacks_mutex_);
   std::erase(mod_render_callbacks_, callback);
+}
+
+bool Device::RegisterPixelShaderInjection(
+    Dx8to12_PixelShaderInjectionFn callback) {
+  if (!callback) return false;
+  std::lock_guard lock(pixel_shader_injection_mutex_);
+  if (pixel_shader_injection_callback_ &&
+      pixel_shader_injection_callback_ != callback) {
+    return false;
+  }
+  if (pixel_shader_injection_callback_ == callback) return true;
+  pixel_shader_injection_callback_ = callback;
+  ++pixel_shader_injection_generation_;
+  return true;
+}
+
+bool Device::UnregisterPixelShaderInjection(
+    Dx8to12_PixelShaderInjectionFn callback) {
+  std::lock_guard lock(pixel_shader_injection_mutex_);
+  if (!callback || pixel_shader_injection_callback_ != callback) return false;
+  pixel_shader_injection_callback_ = nullptr;
+  ++pixel_shader_injection_generation_;
+  return true;
+}
+
+bool Device::GetPixelShaderInjectionState(uint64_t* generation) const {
+  std::lock_guard lock(pixel_shader_injection_mutex_);
+  if (generation) *generation = pixel_shader_injection_generation_;
+  return pixel_shader_injection_callback_ != nullptr;
+}
+
+size_t Device::InvokePixelShaderInjection(
+    const Dx8to12_PixelShaderInjectionContext* context,
+    char* out_hlsl_snippet, size_t capacity) const {
+  // Keep the module callback registered (and therefore valid) for the whole
+  // invocation. Unregister on another thread waits here before its caller is
+  // allowed to unload the ASI containing the function pointer.
+  std::lock_guard lock(pixel_shader_injection_mutex_);
+  return pixel_shader_injection_callback_
+             ? pixel_shader_injection_callback_(context, out_hlsl_snippet,
+                                                capacity)
+             : 0;
+}
+
+void Device::InvalidatePixelShaderCache() {
+  std::lock_guard lock(pixel_shader_injection_mutex_);
+  ++pixel_shader_injection_generation_;
 }
 
 HRESULT STDMETHODCALLTYPE
@@ -809,8 +1799,13 @@ D3DCAPS8 Device::GetDefaultCaps(UINT adapter_index) {
       .DeviceType = D3DDEVTYPE_HAL,
       .AdapterOrdinal = adapter_index,
       .Caps = 0,  // D3DCAPS_READ_SCANLINE or D3DCAPS_OVERLAY.
-      .Caps2 = D3DCAPS2_CANRENDERWINDOWED | D3DCAPS2_CANMANAGERESOURCE |
-               D3DCAPS2_DYNAMICTEXTURES,
+      // Do not advertise managed-resource support.  The DX12 backend keeps
+      // managed textures as explicit GPU resources (kDisableManagedResources
+      // is true), so claiming CANMANAGERESOURCE makes RenderWare choose its
+      // driver-managed streaming path even though that contract is not
+      // implemented here.  The working D3D8->D3D11 port omits this bit and
+      // therefore uses the explicit SYSTEMMEM + UpdateTexture path.
+      .Caps2 = D3DCAPS2_CANRENDERWINDOWED | D3DCAPS2_DYNAMICTEXTURES,
       .Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD,
       .PresentationIntervals =
           D3DPRESENT_INTERVAL_IMMEDIATE | D3DPRESENT_INTERVAL_ONE |
@@ -932,10 +1927,14 @@ void Device::InitRootSignatures() {
           .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
       },
       {
-          // CBuffer 2: Lights cbuffer.
+          // CBuffer 2: Lights cbuffer. ALL (not just VERTEX) visibility --
+          // LightingMode == PerPixel's generated pixel shader
+          // (ff_pixel_shader.cpp) calls the same lighting.hlsl ComputeLighting
+          // this cbuffer feeds, from the pixel stage instead of (or as well
+          // as) the vertex stage.
           .ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV,
           .Descriptor = {.ShaderRegister = 2},
-          .ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX,
+          .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
       },
       {
           // CBuffer 3: Programmable vs constants.
@@ -1029,7 +2028,11 @@ UINT STDMETHODCALLTYPE Device::GetAvailableTextureMem() {
   // Real drivers report actual free VRAM; we don't track GPU memory usage,
   // so report a generously large fixed budget. Games generally treat this as
   // a rough quality/streaming heuristic, not an exact figure.
-  return 256 * 1024 * 1024;
+  // Match the D3D8->D3D11 port.  A small fixed budget makes Vice City's
+  // RenderWare streamer evict/reload mip levels aggressively; the shim does
+  // not actually manage a 256 MiB VRAM budget, so report the conventional
+  // unknown/very-large value instead.
+  return UINT_MAX;
 }
 
 HRESULT STDMETHODCALLTYPE Device::GetCreationParameters(
@@ -1291,7 +2294,14 @@ Device::CreateIndexBuffer(UINT Length, DWORD Usage, D3DFORMAT Format,
 
 void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
                                D3D12_RESOURCE_STATES state_after) {
-  if (texture->current_state() == state_after) return;
+  if (subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+    const uint32_t count = static_cast<uint32_t>(texture->resource_desc().MipLevels) *
+                           static_cast<uint32_t>(texture->resource_desc().DepthOrArraySize);
+    for (uint32_t i = 0; i < count; ++i)
+      TransitionTexture(texture, i, state_after);
+    return;
+  }
+  if (texture->current_state(subresource) == state_after) return;
 #ifdef DX8TO12_ENABLE_VALIDATION
   // AixLog's severity filtering happens per-sink at dispatch time, not at
   // this call site -- an unguarded LOG() here would pay full temporary-
@@ -1309,7 +2319,7 @@ void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
   // even though this specific line is TRACE-level and normally filtered out
   // before ever reaching a sink.
   LOG(TRACE) << "Transitioning " << std::hex << texture << "From "
-             << texture->current_state() << " to " << state_after << std::dec
+             << texture->current_state(subresource) << " to " << state_after << std::dec
              << "\n";
 #endif
 
@@ -1318,14 +2328,28 @@ void Device::TransitionTexture(GpuTexture *texture, uint32_t subresource,
       .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
       .Transition = {.pResource = texture->resource(),
                      .Subresource = subresource,
-                     .StateBefore = texture->current_state(),
+                     .StateBefore = texture->current_state(subresource),
                      .StateAfter = state_after}};
   cmd_list_->ResourceBarrier(1, &barrier);
-  texture->set_state(state_after);
+  texture->set_state(subresource, state_after);
   MarkResourceAsUsed(InternalPtr(texture));
 #ifdef DX8TO12_ENABLE_VALIDATION
   LogBarrierStats(/*is_texture=*/true);
 #endif
+}
+
+void Device::TransitionDynamicRingBuffer(D3D12_RESOURCE_STATES state_after) {
+  DynamicRingBuffer *ring = dynamic_ring_buffer_.get();
+  if (!ring || ring->current_state() == state_after) return;
+  D3D12_RESOURCE_BARRIER barrier{
+      .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+      .Transition = {.pResource = ring->GetBackingResource(),
+                     .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                     .StateBefore = ring->current_state(),
+                     .StateAfter = state_after}};
+  cmd_list_->ResourceBarrier(1, &barrier);
+  ring->set_state(state_after);
 }
 
 void Device::TransitionBuffer(Buffer *buffer,
@@ -1376,6 +2400,7 @@ void Device::CopyBufferToTexture(
     GpuTexture *dest, uint32_t dest_subresource, ID3D12Resource *src,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint, uint32_t dest_x,
     uint32_t dest_y) {
+  TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
   D3D12_TEXTURE_COPY_LOCATION dest_location{
       .pResource = dest->resource(),
       .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1466,7 +2491,8 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
     // format, which it does by construction.
     const bool needs_staging = src_desc.Format != dst_desc.Format;
 
-    const D3D12_RESOURCE_STATES src_prior_state = src_texture->current_state();
+    const D3D12_RESOURCE_STATES src_prior_state =
+        src_texture->current_state(src_subresource);
     TransitionTexture(src_texture, src_subresource,
                       D3D12_RESOURCE_STATE_COPY_SOURCE);
     TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
@@ -1796,9 +2822,20 @@ HRESULT STDMETHODCALLTYPE Device::GetClipStatus(D3DCLIPSTATUS8 *pClipStatus) {
 }
 
 HRESULT STDMETHODCALLTYPE Device::ValidateDevice(DWORD *pNumPasses) {
+#ifdef DX8TO12_VALIDATE_DEVICE_ALWAYS_FAIL
+  // Compatibility A/B for GTA: Vice City's RenderWare MatFX selector.  The
+  // working D3D8-to-D3D11 reference returns D3DERR_INVALIDCALL here, while our
+  // unconditional one-pass success makes RenderWare select optimized texture-
+  // stage combinations that this fixed-function translator has never actually
+  // validated.  The GTA binary calls this method from the MatFX setup paths
+  // (device vtable +0x100) and explicitly falls back when it fails.
+  if (pNumPasses) *pNumPasses = 0;
+  return D3DERR_INVALIDCALL;
+#else
   // We never need more than a single pass to render the current state.
   *pNumPasses = 1;
   return S_OK;
+#endif
 }
 
 HRESULT STDMETHODCALLTYPE Device::SetRenderState(D3DRENDERSTATETYPE State,
@@ -2336,40 +3373,14 @@ HRESULT STDMETHODCALLTYPE Device::SetTexture(DWORD Stage,
   // than Get().
   GpuTexture *const current_texture =
       bound_textures_[Stage] ? bound_textures_[Stage].Get() : nullptr;
-  if (current_texture == texture) return S_OK;
-  // DIAGNOSTIC: full call history for stage 0. A RenderDoc capture only ever
-  // shows the *final* committed D3D12 state -- confirmed a UI panel (static
-  // buffer, XYZRHW) is genuinely bound to the player's clothing/skin atlas
-  // at draw time, but not *why*: whether the game itself never issued a real
-  // SetTexture for this panel (relying on sticky binding but not getting
-  // what it expected), or something dropped a call that did happen. That
-  // needs the actual call sequence, which only live logging can give. Kept
-  // generous (this is stage 0 specifically, not all 8, and past sessions'
-  // similarly-capped CREATETEX diagnostic survived full sessions fine).
-#ifdef DX8TO12_ENABLE_VALIDATION
-  if (Stage == 0) {
-    static uint64_t settex0_seq = 0;
-    // Every cap tried here so far has turned out too small: 3000 only
-    // reached frame 2432 (a repro needed frame 15579); the next cap, raised
-    // to 200000, still only reached frame 3970 -- 13 seconds into a session
-    // whose actual repro wasn't captured until roughly a minute in. There's
-    // no way to size a cap in advance since a repro's length isn't known
-    // until the session that needs it is already over, so this is
-    // deliberately uncapped -- every stage-0 SetTexture for the whole
-    // session, whatever that costs in log size.
-    ++settex0_seq;
-    LOG(AixLog::Severity::error)
-        << "SETTEX0 seq=" << settex0_seq << " frame=" << CurrentFrame()
-        << " was=" << current_texture << " now=" << texture;
-    if (texture) {
-      const D3D12_RESOURCE_DESC &d = texture->resource_desc();
-      LOG(AixLog::Severity::error)
-          << " w=" << d.Width << " h=" << d.Height
-          << " fmt=" << static_cast<int>(d.Format);
-    }
-    LOG(AixLog::Severity::error) << "\n";
-  }
+  // Count the RenderWare material branch even for a redundant SetTexture.
+  // The game's own call is the evidence we need; whether this shim can skip
+  // re-applying an identical binding is a separate implementation detail.
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  if (Stage == 0)
+    RecordRwTextureCall(pTexture != nullptr, texture != nullptr);
 #endif
+  if (current_texture == texture) return S_OK;
   bound_textures_[Stage] = InternalPtr(texture);
   dirty_flags_ |= DIRTY_FLAG_PS_TEXTURES;
   dirty_texture_stage_mask_ |= (1u << Stage);
@@ -2591,6 +3602,55 @@ HRESULT STDMETHODCALLTYPE Device::SetVertexShader(DWORD handle) {
 HRESULT STDMETHODCALLTYPE Device::GetVertexShader(DWORD *pHandle) {
   *pHandle = bound_vertex_shader_;
   return S_OK;
+}
+
+void Device::OnLightingModeChanged() {
+  // Every already-compiled fixed-function vertex shader was built with the
+  // old mode's PER_PIXEL_LIGHTING define (or lack of it) baked in as a
+  // compile-time #if, not a runtime branch -- there's no way to fix one up in
+  // place, it has to be recompiled. Replaced rather than erased: CreatePSO
+  // does `vertex_shaders_.at(bound_vertex_shader_)` on every draw and
+  // SetVertexShader only recreates a handle it doesn't already have, so
+  // erasing entries here would leave a currently-bound low handle missing
+  // until the app happened to call SetVertexShader again -- crashing the very
+  // next draw in between. Regenerating in place keeps every existing handle
+  // valid throughout.
+  for (auto &[handle, shader] : vertex_shaders_) {
+    if (handle >= kFirstShaderHandle) continue;  // Programmable, not FF.
+    auto fresh = CreateFixedFunctionVertexShader(
+        viewport_, handle, VertexShaderDeclaration::CreateFromFVFDesc(handle));
+    // Field-by-field, not VertexShader's (implicit) assignment operator:
+    // VertexShader inherits RefCounted's live ref-count state, which must
+    // stay this object's own -- it's still the same InternalPtr slot every
+    // other draw call's bound_vertex_shader_ points at -- rather than being
+    // overwritten by `fresh`'s (a separate, freshly-constructed object).
+    VertexShader *existing = shader.Get();
+    existing->decl = std::move(fresh.decl);
+    existing->blob = std::move(fresh.blob);
+    existing->fvf_desc = fresh.fvf_desc;
+    existing->unique_id = fresh.unique_id;
+    // declaration_tokens/function_tokens: both empty for every
+    // fixed-function shader (see VertexShader::declaration_tokens' comment),
+    // so existing's (already empty) are already correct -- nothing to copy.
+  }
+  // Fixed-function pixel shaders, unlike the above, aren't looked up by a
+  // handle anything else holds onto between draws -- CreatePSO derives their
+  // cache key (PixelShaderState) fresh from render_state_ every draw, so it's
+  // safe to just drop every entry: the very next draw regenerates whichever
+  // one it needs, under the new mode, from CreatePixelShaderFromState (which
+  // also reads Config::lighting_mode fresh).
+  ps_cache_.clear();
+  // pso_cache_ is deliberately left alone: every entry's ps id is
+  // CachedPixelShader::id (or PixelShader::unique_id), a monotonic counter
+  // (NextShaderId(), vertex_shader.h) -- the freshly (re)compiled shaders
+  // above get new ids, so a stale pso_cache_ entry referencing an old id
+  // simply never matches a new draw's key again. Same reasoning the class
+  // comment on PSOState already documents for shader hot-reload; this cache
+  // has never evicted entries even for that case, so not evicting here either
+  // is consistent, not a new leak.
+  LOG(INFO) << "OnLightingModeChanged: regenerated "
+            << vertex_shaders_.size() << " vertex shader(s), cleared "
+            << "the fixed-function pixel shader cache.\n";
 }
 
 HRESULT STDMETHODCALLTYPE Device::GetVertexShaderDeclaration(
@@ -2816,14 +3876,19 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
     {
       static HMODULE self_module = [] {
         HMODULE m = nullptr;
-        // _ReturnAddress() here is CreatePSO's own call site inside
-        // PrepareDrawCall -- any address known to live inside d3d8.dll,
-        // used purely to identify "our own module" for the skip-filter
-        // below.
+        // An ordinary free function's address -- any address known to live
+        // inside d3d8.dll, used purely to identify "our own module" for the
+        // skip-filter below. Was _ReturnAddress(), which turned out
+        // unreliable inside a lazily-initialized static lambda (confirmed
+        // live in the SETTEX0-NULL-CALLER diagnostic below: it resolved to
+        // this module's own code as if it were the external caller, every
+        // single time) -- MSVC's magic-statics once-guard can route the
+        // "return address" through a compiler-generated init helper instead
+        // of the real call site.
         GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(_ReturnAddress()), &m);
+            reinterpret_cast<LPCSTR>(&DebugInfoQueueMessageCallback), &m);
         return m;
       }();
       void *frames[24] = {};
@@ -2847,10 +3912,18 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
           break;
         }
       }
+      // colorarg2/alpha_arg1/alpha_arg2 added to distinguish a *legitimately*
+      // still-disabled stage (SELECTARG2 with Arg2 also D3DTA_TEXTURE-but-
+      // missing -- correct per the arg-usage fix) from a case the arg-usage
+      // fix should have silenced but didn't.
       LOG(AixLog::Severity::error)
           << "PSO-WANTS-TEX0-BUT-NONE-BOUND frame=" << CurrentFrame()
           << " colorop=" << texture_stage_states_[0].color_op
           << " colorarg1=" << texture_stage_states_[0].color_arg1
+          << " colorarg2=" << texture_stage_states_[0].color_arg2
+          << " alphaop=" << texture_stage_states_[0].alpha_op
+          << " alphaarg1=" << texture_stage_states_[0].alpha_arg1
+          << " alphaarg2=" << texture_stage_states_[0].alpha_arg2
           << " caller=" << caller_path << "+0x" << std::hex << caller_offset
           << std::dec << "\n";
       static std::set<void *> seen_callers;
@@ -2887,15 +3960,30 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   ComPtr<ID3DBlob> pixel_shader;
   uint64_t pixel_shader_id;
   if (bound_pixel_shader_ == 0) {
+    const bool injection_has_normal =
+        vertex_shader->decl.has_inputs[D3DVSDE_NORMAL];
+    const bool injection_has_view_pos =
+        !HasFlag(vertex_shader->fvf_desc, D3DFVF_XYZRHW);
+    uint64_t injection_generation = 0;
+    const bool injection_enabled =
+        GetPixelShaderInjectionState(&injection_generation);
+    if (applied_pixel_shader_injection_generation_ != injection_generation) {
+      ps_cache_.clear();
+      applied_pixel_shader_injection_generation_ = injection_generation;
+    }
     // Try to find the fixed-function pixel shader in our cache.
     PixelShaderState key(render_state_, stage_has_texture.data(),
                          texture_stage_states_.data());
+    key.injection_has_normal = injection_has_normal;
+    key.injection_has_view_pos = injection_has_view_pos;
     auto iter = ps_cache_.find(key);
     if (iter != ps_cache_.end()) {
       pixel_shader = iter->second.blob;
       pixel_shader_id = iter->second.id;
     } else {
-      CachedPixelShader entry{.blob = CreatePixelShaderFromState(key)};
+      CachedPixelShader entry{.blob = CreatePixelShaderFromState(
+          key, injection_has_normal, injection_has_view_pos,
+          injection_enabled ? this : nullptr)};
       pixel_shader = entry.blob;
       pixel_shader_id = entry.id;
       if (!kDisablePixelShaderCache)
@@ -2928,7 +4016,8 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
       .ps = pixel_shader_id,
       .prim_type = d3d8_prim_type,
       .dsv_format = bound_depth_target_
-                        ? bound_depth_target_->resource_desc().Format
+                        ? DepthDsvFormatFromTypeless(
+                              bound_depth_target_->resource_desc().Format)
                         : DXGI_FORMAT_UNKNOWN,
       .rtv_format = current_rtv_format};
 
@@ -3101,11 +4190,17 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
               // it immediately (dev build) while a release build's driver
               // behavior for the same PSO is undefined rather than merely
               // "test always passes".
+              // bound_depth_target_'s resource_desc().Format is typeless (see
+              // DepthTypelessFromConcrete) -- compare against the typeless
+              // value a D24S8-family depth buffer actually has now, not the
+              // old concrete DXGI_FORMAT_D24_UNORM_S8_UINT (which this
+              // typeless resource's Format can never equal again, silently
+              // forcing StencilEnable false unconditionally).
               .StencilEnable =
                   render_state_.stencil_enable != 0 &&
                   bound_depth_target_ &&
                   bound_depth_target_->resource_desc().Format ==
-                      DXGI_FORMAT_D24_UNORM_S8_UINT,
+                      DXGI_FORMAT_R24G8_TYPELESS,
               .StencilReadMask =
                   static_cast<UINT8>(render_state_.stencil_mask),
               .StencilWriteMask =
@@ -3149,8 +4244,14 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
       .PrimitiveTopologyType = d3d12_prim_type,
       .NumRenderTargets = 1,
       .RTVFormats = {current_rtv_format},
+      // bound_depth_target_'s resource_desc().Format is typeless (see
+      // DepthTypelessFromConcrete/BaseTexture::Create) -- a PSO's DSVFormat
+      // must be the concrete DSV-compatible format instead, or D3D12
+      // rejects every draw with "the depth stencil format does not match
+      // that specified by the current pipeline state".
       .DSVFormat = bound_depth_target_
-                       ? bound_depth_target_->resource_desc().Format
+                       ? DepthDsvFormatFromTypeless(
+                             bound_depth_target_->resource_desc().Format)
                        : DXGI_FORMAT_UNKNOWN,
       .SampleDesc = {.Count = 1, .Quality = 0}};
   ComPtr<ID3D12PipelineState> pso;
@@ -3163,6 +4264,9 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
 
 HRESULT STDMETHODCALLTYPE Device::BeginScene() {
   TRACE_ENTRY();
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  KeepGtaTargetRoadLodVisible();
+#endif
   // Set viewports.
   cmd_list_->RSSetViewports(1, &viewport_);
   D3D12_RECT scissors = {.left = 0,
@@ -3253,6 +4357,10 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
 
 HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
                                 int start_vertex, int num_vertices) {
+  // The dynamic upload ring is shared by texture copies and draw buffers.
+  // Restore the draw-readable state before binding any of its VB/IB/CB views.
+  TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
   if (PrimitiveType > D3DPT_TRIANGLEFAN) {
     LOG_ERROR() << "Invalid primitive type " << PrimitiveType << "\n";
     return D3DERR_INVALIDCALL;
@@ -3545,6 +4653,15 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // every draw is fine.
   for (int i = 0; i < kMaxTexStages; ++i) {
     if (bound_textures_[i]) {
+      // D3D11 implicitly resolves this hazard when a resource is sampled.
+      // DX12 requires the explicit transition: a texture may have been left
+      // in COMMON (or a copy/render-target state) after streaming or an
+      // off-screen pass.  Without this barrier the SRV table can be valid yet
+      // sampling is undefined, which showed up in Vice City as the near mip
+      // disappearing while the distant LOD remained visible.
+      TransitionTexture(bound_textures_[i].Get(),
+                        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
       MarkResourceAsUsed(bound_textures_[i]);
     }
   }
@@ -3672,9 +4789,12 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
 }
 
 HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
-                                                UINT StartVertex,
-                                                UINT PrimitiveCount) {
+                                                 UINT StartVertex,
+                                                 UINT PrimitiveCount) {
   ++draw_calls_this_frame_;
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  const size_t rw_primitive_caller = RecordRwDrawCall(false);
+#endif
   // D3D12 has no fan topology. Emulate it with a generated index list (0,
   // i+1, i+2 for each triangle) drawn as a triangle list against the
   // already-bound vertex buffer, the same trick DrawPrimitiveUP already uses
@@ -3729,6 +4849,32 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
            PrimitiveType);
       break;
   }
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  if (RwSnapshotActive() && bound_index_buffer_) {
+    const auto world_it = transforms_.find(D3DTS_WORLD);
+    std::ostringstream line;
+    line << "RWPRIMSNAP label=" << g_rw_snapshot_label << " caller=";
+    if (rw_primitive_caller < kRwPrimitiveDrawCallSites.size()) {
+      line << "+0x" << std::hex
+           << (kRwPrimitiveDrawCallSites[rw_primitive_caller] -
+               kGtaPreferredImageBase)
+           << std::dec;
+    } else {
+      line << "unmatched";
+    }
+    line << " prim=" << PrimitiveType << " pc=" << PrimitiveCount
+         << " start=" << StartVertex << " vc=" << vertex_count
+         << " vb="
+         << (bound_vertex_streams_[0] ? bound_vertex_streams_[0].Get()
+                                      : nullptr);
+    if (world_it != transforms_.end()) {
+      line << " wt=(" << world_it->second._41 << "," << world_it->second._42
+           << "," << world_it->second._43 << ")";
+    }
+    line << "\n";
+    AppendRwSnapshotLine(line.str());
+  }
+#endif
   // Coverage only: the glitch hunt has so far instrumented only the indexed
   // path, on the strength of an earlier dump that showed the menu going
   // through it. If the offending draw actually comes through here, that dump
@@ -3889,6 +5035,9 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
     D3DPRIMITIVETYPE PrimitiveType, UINT minIndex, UINT NumVertices,
     UINT startIndex, UINT primCount) {
   ++draw_calls_this_frame_;
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  const size_t rw_indexed_caller = RecordRwDrawCall(true);
+#endif
   if (!bound_index_buffer_) {
     // DIAGNOSTIC: a ground-tile draw is silently missing from some frames --
     // no crash, no D3D12 trace (RenderDoc can't show a call that never
@@ -3909,6 +5058,10 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
           << " numVerts=" << NumVertices << " startIndex=" << startIndex
           << " primCount=" << primCount << "\n";
     }
+#endif
+#ifdef DX8TO12_ENABLE_MINDEBUG
+    RecordRwIndexedEvent(rw_indexed_caller,
+                         RwIndexedEvent::NoIndexBuffer);
 #endif
     return D3DERR_INVALIDCALL;
   }
@@ -4244,8 +5397,15 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   }
 #endif
 
-  HR_OR_RETURN(PrepareDrawCall(PrimitiveType, minIndex + bound_base_vertex_,
-                               NumVertices));
+  const HRESULT prepare_result = PrepareDrawCall(
+      PrimitiveType, minIndex + bound_base_vertex_, NumVertices);
+  if (!SUCCEEDED(prepare_result)) {
+#ifdef DX8TO12_ENABLE_MINDEBUG
+    RecordRwIndexedEvent(rw_indexed_caller,
+                         RwIndexedEvent::PrepareFailed);
+#endif
+    return prepare_result;
+  }
 
   TransitionBuffer(bound_index_buffer_.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER);
   // Whole buffer, for the same reason the vertex buffer view above uses it.
@@ -4257,7 +5417,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   MarkResourceAsUsed(bound_index_buffer_);
   cmd_list_->IASetIndexBuffer(&ib_view);
 
-  // Clamp to what the bound index buffer actually holds. The game
+  // Determine how much of the draw fits in the bound index buffer. The game
   // occasionally issues a draw whose (startIndex + index_count) reaches past
   // the buffer it bound -- confirmed live via the D3D12 debug layer
   // (COMMAND_LIST_DRAW_INDEX_BUFFER_TOO_SMALL, EXECUTION WARNING #213) on
@@ -4267,13 +5427,12 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   // harmless garbage, sometimes not, but never a rejected/dropped draw. D3D12
   // is stricter: reading past the bound view's declared size is undefined
   // behavior, and on this driver has been observed to make the whole draw
-  // (or the out-of-range tail of it) not rasterize at all -- a plausible
-  // mechanism for the missing-ground-tile family of bugs, since a strict
-  // "read nothing here" is a much better match for "no draw reaches this
-  // pixel" than "reads garbage and looks wrong" would be. Truncating the
-  // index count here is the closer-to-real-D3D8 behavior: draw as much of
-  // the primitive as the buffer actually holds instead of asking the GPU to
-  // read past it.
+  // (or the out-of-range tail of it) not rasterize at all. The original
+  // workaround truncated the count. A GTA VC capture now shows this happens
+  // on a stable 37 draws per frame exactly where a road material disappears,
+  // while the working D3D11 port submits the original count. Keep both paths
+  // available for a controlled compatibility A/B rather than silently
+  // changing the clean release before the result is known.
   const UINT index_size =
       bound_index_buffer_->index_buffer_fmt() == DXGI_FORMAT_R32_UINT ? 4 : 2;
   const UINT indices_in_buffer =
@@ -4284,6 +5443,27 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
     clamped_index_count = 0;
   } else if (startIndex + clamped_index_count > indices_in_buffer) {
     clamped_index_count = indices_in_buffer - startIndex;
+  }
+#ifdef DX8TO12_PASSTHROUGH_OOB_INDICES
+  const UINT submitted_index_count = static_cast<UINT>(index_count);
+#else
+  const UINT submitted_index_count = clamped_index_count;
+#endif
+  // Phase 2 RT bookkeeping deliberately observes only stable indexed triangle
+  // lists.  Dynamic buffers point at a changing ring allocation and are
+  // omitted until a later phase has a safe per-frame geometry upload path.
+  if (native_raytracing_supported() && GetConfig().lighting_mode >= 2 &&
+      PrimitiveType == D3DPT_TRIANGLELIST && submitted_index_count >= 3 &&
+      bound_vertex_streams_[0] && !bound_vertex_streams_[0]->IsDynamic() &&
+      !bound_index_buffer_->IsDynamic()) {
+    if (!raytracing_scene_) raytracing_scene_ = std::make_unique<RaytracingScene>(this);
+    const UINT material_srv_index =
+        bound_textures_[0] ? srv_heap_.GetIndexFor(bound_textures_[0]->srv_handle())
+                           : UINT_MAX;
+    raytracing_scene_->RecordIndexedTriangleList(
+        bound_vertex_streams_[0], bound_index_buffer_,
+        bound_vertex_stream_strides_[0], startIndex, submitted_index_count,
+        bound_base_vertex_, GetTransform(D3DTS_WORLD), material_srv_index);
   }
 #ifdef DX8TO12_ENABLE_VALIDATION
   if (clamped_index_count != static_cast<UINT>(index_count)) {
@@ -4297,8 +5477,311 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   }
 #endif
 
-  cmd_list_->DrawIndexedInstanced(clamped_index_count, 1, startIndex,
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  if (clamped_index_count == 0) {
+    RecordRwIndexedEvent(rw_indexed_caller, RwIndexedEvent::ZeroClamp);
+  } else {
+    if (clamped_index_count != static_cast<UINT>(index_count)) {
+      RecordRwIndexedEvent(rw_indexed_caller,
+                           RwIndexedEvent::PartialClamp);
+    }
+  }
+  if (submitted_index_count != 0)
+    RecordRwIndexedEvent(rw_indexed_caller, RwIndexedEvent::Emitted);
+
+  if (RwSnapshotActive()) {
+    auto texture_ptr = [&](int stage) -> GpuTexture * {
+      return bound_textures_[stage] ? bound_textures_[stage].Get() : nullptr;
+    };
+    auto append_texture = [&](std::ostringstream &line, int stage) {
+      GpuTexture *texture = texture_ptr(stage);
+      line << " t" << stage << "=" << texture;
+      if (texture) {
+        const D3D12_RESOURCE_DESC &desc = texture->resource_desc();
+        line << ":" << desc.Width << "x" << desc.Height << ":m"
+             << desc.MipLevels << ":f" << static_cast<int>(desc.Format);
+      }
+    };
+
+    uint64_t world_hash = 1469598103934665603ull;
+    auto world_it = transforms_.find(D3DTS_WORLD);
+    if (world_it != transforms_.end()) {
+      const auto *bytes = reinterpret_cast<const uint8_t *>(&world_it->second);
+      for (size_t i = 0; i < sizeof(world_it->second); ++i) {
+        world_hash ^= bytes[i];
+        world_hash *= 1099511628211ull;
+      }
+    }
+
+    const TextureStageState &s0 = texture_stage_states_[0];
+    const TextureStageState &s1 = texture_stage_states_[1];
+    const TextureStageState &s2 = texture_stage_states_[2];
+
+    // Locate this draw on screen from the indices and vertices actually bound
+    // to D3D12.  The earlier DRAWBBOX diagnostic used minIndex/NumVertices as
+    // a contiguous range.  That is legal metadata, but it can include many
+    // vertices this draw never references and makes unrelated road chunks
+    // appear to cover the same pixel.  Walking the submitted index span gives
+    // us a useful key for comparing the road under the crosshair before and
+    // after it disappears.
+    bool bbox_available = false;
+    bool bbox_covers_center = false;
+    bool triangle_covers_center = false;
+    float center_depth = FLT_MAX;
+    UINT center_triangle_count = 0;
+    float bbox_min_x = FLT_MAX;
+    float bbox_min_y = FLT_MAX;
+    float bbox_max_x = -FLT_MAX;
+    float bbox_max_y = -FLT_MAX;
+    float bbox_min_z = FLT_MAX;
+    float bbox_max_z = -FLT_MAX;
+    UINT bbox_vertices = 0;
+    Buffer *vb0 = bound_vertex_streams_[0]
+                      ? static_cast<Buffer *>(bound_vertex_streams_[0].Get())
+                      : nullptr;
+    Buffer *ib0 = bound_index_buffer_.Get();
+    const UINT stride0 = bound_vertex_stream_strides_[0];
+    const UINT snapshot_index_size =
+        ib0->index_buffer_fmt() == DXGI_FORMAT_R32_UINT ? 4u : 2u;
+    const uint64_t ib_byte_offset =
+        static_cast<uint64_t>(startIndex) * snapshot_index_size;
+    const uint64_t ib_byte_size =
+        static_cast<uint64_t>(submitted_index_count) * snapshot_index_size;
+    const char *indices = nullptr;
+    if (ib_byte_offset + ib_byte_size <= ib0->resource_desc().Width &&
+        ib_byte_offset <= INT_MAX && ib_byte_size <= INT_MAX) {
+      indices = ib0->DebugCpuPtr(static_cast<int>(ib_byte_offset),
+                                 static_cast<int>(ib_byte_size));
+    }
+    if (vb0 && indices && stride0 >= 12u && stride0 != 28u) {
+      using ::DirectX::SimpleMath::Matrix;
+      using ::DirectX::SimpleMath::Vector4;
+      struct ProjectedVertex {
+        float x = 0.f;
+        float y = 0.f;
+        float z = 0.f;
+        bool valid = false;
+      };
+      const Matrix wvp = MatrixFromD3D(GetTransform(D3DTS_WORLD)) *
+                         MatrixFromD3D(GetTransform(D3DTS_VIEW)) *
+                         MatrixFromD3D(GetTransform(D3DTS_PROJECTION));
+      // Keep indices consecutive because the center test below reconstructs
+      // actual triangles. GTA's streamed world meshes are comfortably below
+      // this cap; it exists only to keep a pathological call from changing
+      // the high-FPS timing we are trying to observe.
+      const UINT processed_indices =
+          std::min<UINT>(submitted_index_count, 16384u);
+      std::vector<ProjectedVertex> projected(processed_indices);
+      for (UINT position = 0; position < processed_indices; ++position) {
+        UINT index = 0;
+        if (snapshot_index_size == 4u) {
+          memcpy(&index, indices + static_cast<size_t>(position) * 4u,
+                 sizeof(index));
+        } else {
+          uint16_t short_index = 0;
+          memcpy(&short_index, indices + static_cast<size_t>(position) * 2u,
+                 sizeof(short_index));
+          index = short_index;
+        }
+        const uint64_t vertex =
+            static_cast<uint64_t>(bound_base_vertex_) + index;
+        const uint64_t vb_byte_offset = vertex * stride0;
+        if (vb_byte_offset + 12u > vb0->resource_desc().Width ||
+            vb_byte_offset > INT_MAX) {
+          continue;
+        }
+        const char *vertex_data =
+            vb0->DebugCpuPtr(static_cast<int>(vb_byte_offset), 12);
+        if (!vertex_data) continue;
+        float position_xyz[3];
+        memcpy(position_xyz, vertex_data, sizeof(position_xyz));
+        if (!std::isfinite(position_xyz[0]) ||
+            !std::isfinite(position_xyz[1]) ||
+            !std::isfinite(position_xyz[2])) {
+          continue;
+        }
+        const Vector4 clip = Vector4::Transform(
+            Vector4(position_xyz[0], position_xyz[1], position_xyz[2], 1.f),
+            wvp);
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) ||
+            !std::isfinite(clip.z) || !std::isfinite(clip.w) ||
+            clip.w <= 1e-4f) {
+          continue;
+        }
+        const float ndc_x = clip.x / clip.w;
+        const float ndc_y = clip.y / clip.w;
+        const float ndc_z = clip.z / clip.w;
+        const float screen_x = viewport_.TopLeftX +
+            (ndc_x * 0.5f + 0.5f) * viewport_.Width;
+        const float screen_y = viewport_.TopLeftY +
+            (1.f - (ndc_y * 0.5f + 0.5f)) * viewport_.Height;
+        bbox_min_x = std::min(bbox_min_x, screen_x);
+        bbox_max_x = std::max(bbox_max_x, screen_x);
+        bbox_min_y = std::min(bbox_min_y, screen_y);
+        bbox_max_y = std::max(bbox_max_y, screen_y);
+        bbox_min_z = std::min(bbox_min_z, ndc_z);
+        bbox_max_z = std::max(bbox_max_z, ndc_z);
+        projected[position] = {screen_x, screen_y, ndc_z, true};
+        ++bbox_vertices;
+      }
+      bbox_available = bbox_vertices != 0;
+      if (bbox_available) {
+        const float center_x = viewport_.TopLeftX + viewport_.Width * 0.5f;
+        const float center_y = viewport_.TopLeftY + viewport_.Height * 0.5f;
+        bbox_covers_center = bbox_min_x <= center_x && bbox_max_x >= center_x &&
+                             bbox_min_y <= center_y && bbox_max_y >= center_y;
+        auto test_triangle = [&](UINT ia, UINT ib, UINT ic) {
+          const ProjectedVertex &a = projected[ia];
+          const ProjectedVertex &b = projected[ib];
+          const ProjectedVertex &c = projected[ic];
+          if (!a.valid || !b.valid || !c.valid) return;
+          const float area = (b.x - a.x) * (c.y - a.y) -
+                             (b.y - a.y) * (c.x - a.x);
+          if (std::abs(area) < 1e-6f) return;
+          const float w0 = ((b.x - center_x) * (c.y - center_y) -
+                            (b.y - center_y) * (c.x - center_x)) /
+                           area;
+          const float w1 = ((c.x - center_x) * (a.y - center_y) -
+                            (c.y - center_y) * (a.x - center_x)) /
+                           area;
+          const float w2 = 1.f - w0 - w1;
+          constexpr float kEdgeTolerance = -1e-5f;
+          if (w0 < kEdgeTolerance || w1 < kEdgeTolerance ||
+              w2 < kEdgeTolerance) {
+            return;
+          }
+          triangle_covers_center = true;
+          ++center_triangle_count;
+          center_depth =
+              std::min(center_depth, w0 * a.z + w1 * b.z + w2 * c.z);
+        };
+        if (PrimitiveType == D3DPT_TRIANGLELIST) {
+          for (UINT i = 0; i + 2 < processed_indices; i += 3)
+            test_triangle(i, i + 1, i + 2);
+        } else if (PrimitiveType == D3DPT_TRIANGLESTRIP) {
+          for (UINT i = 0; i + 2 < processed_indices; ++i)
+            test_triangle(i, i + 1, i + 2);
+        }
+      }
+    }
+
+    std::ostringstream line;
+    line << "RWSNAP label=" << g_rw_snapshot_label
+         << " caller=";
+    if (rw_indexed_caller < kRwIndexedDrawCallSites.size()) {
+      line << "+0x" << std::hex
+           << (kRwIndexedDrawCallSites[rw_indexed_caller] -
+               kGtaPreferredImageBase)
+           << std::dec;
+    } else {
+      line << "unmatched";
+    }
+    line << " prim=" << PrimitiveType << " pc=" << primCount
+         << " min=" << minIndex << " nv=" << NumVertices
+         << " si=" << startIndex << " ic=" << submitted_index_count
+         << " base=" << bound_base_vertex_
+         << " vb="
+         << (bound_vertex_streams_[0] ? bound_vertex_streams_[0].Get()
+                                      : nullptr)
+         << " stride=" << bound_vertex_stream_strides_[0]
+         << " ib=" << bound_index_buffer_.Get();
+    if (vb0) line << " vbState={" << vb0->DebugState() << "}";
+    if (ib0) line << " ibState={" << ib0->DebugState() << "}";
+    if (bbox_available) {
+      line << " bbox=(" << bbox_min_x << "," << bbox_min_y << ")-("
+           << bbox_max_x << "," << bbox_max_y << ")"
+           << " bz=" << bbox_min_z << ":" << bbox_max_z
+           << " bboxCenter=" << bbox_covers_center
+           << " center=" << triangle_covers_center
+           << " hz=" << (triangle_covers_center ? center_depth : -1.f)
+           << " ht=" << center_triangle_count << " bvn=" << bbox_vertices;
+    } else {
+      line << " bbox=unavailable bboxCenter=0 center=0 hz=-1 ht=0 bvn=0";
+    }
+    append_texture(line, 0);
+    append_texture(line, 1);
+    append_texture(line, 2);
+    line << " vs=" << bound_vertex_shader_ << " ps=" << bound_pixel_shader_
+         << " wh=0x" << std::hex << world_hash << std::dec;
+    if (world_it != transforms_.end()) {
+      line << " wt=(" << world_it->second._41 << "," << world_it->second._42
+           << "," << world_it->second._43 << ")";
+    } else {
+      line << " wt=(0,0,0)";
+    }
+    line
+         << " rs=z" << static_cast<int>(render_state_.zbuffer_type)
+         << ":zw" << render_state_.zwrite_enable
+         << ":zf" << static_cast<int>(render_state_.z_func)
+         << ":c" << static_cast<int>(render_state_.cull_mode)
+         << ":at" << render_state_.alpha_test_enable
+         << ":af" << static_cast<int>(render_state_.alpha_func)
+         << ":ar" << render_state_.alpha_ref
+         << ":ab" << render_state_.alpha_blend_enable
+         << ":sb" << static_cast<int>(render_state_.src_blend)
+         << ":db" << static_cast<int>(render_state_.dest_blend)
+         << ":cw0x" << std::hex << render_state_.color_write_enable << std::dec
+         << " s0=" << static_cast<int>(s0.color_op) << "/"
+         << s0.color_arg1 << "/" << s0.color_arg2 << "/"
+         << static_cast<int>(s0.alpha_op) << "/" << s0.alpha_arg1 << "/"
+         << s0.alpha_arg2 << "/tc" << s0.texcoord_index
+         << " s1=" << static_cast<int>(s1.color_op) << "/"
+         << s1.color_arg1 << "/" << s1.color_arg2 << "/"
+         << static_cast<int>(s1.alpha_op) << "/" << s1.alpha_arg1 << "/"
+         << s1.alpha_arg2 << "/tc" << s1.texcoord_index
+         << " s2=" << static_cast<int>(s2.color_op) << "/"
+         << s2.color_arg1 << "/" << s2.color_arg2 << "/"
+         << static_cast<int>(s2.alpha_op) << "/" << s2.alpha_arg1 << "/"
+         << s2.alpha_arg2 << "/tc" << s2.texcoord_index << "\n";
+    AppendRwSnapshotLine(line.str());
+    if (triangle_covers_center && world_it != transforms_.end()) {
+      AppendRwSnapshotLine(DescribeGtaCenterDrawEntities(
+          world_it->second._41, world_it->second._42, world_it->second._43));
+    }
+  }
+#endif
+
+  cmd_list_->DrawIndexedInstanced(submitted_index_count, 1, startIndex,
                                   bound_base_vertex_, 0);
+  if (rt_helper_client_ && rt_helper_client_->ready()) {
+    rt_helper_client_->ObserveIndexedDraw(
+        PrimitiveType,
+        bound_vertex_streams_[0] ? bound_vertex_streams_[0].Get() : nullptr,
+        bound_index_buffer_ ? bound_index_buffer_.Get() : nullptr);
+  }
+  // H3 capture copies CPU-visible geometry into a bounded file mapping. It
+  // never adds a resource barrier/copy to the game's D3D12 command list.
+  if (kEnableExperimentalHelperSceneSubmission &&
+      GetConfig().lighting_mode >= 2 && rt_helper_client_ &&
+      rt_helper_client_->ready() &&
+      PrimitiveType == D3DPT_TRIANGLELIST && bound_vertex_streams_[0] &&
+      bound_index_buffer_ &&
+      !bound_vertex_streams_[0]->IsDynamic() && !bound_index_buffer_->IsDynamic()) {
+    rt_helper_client_->RecordStaticTriangle(
+        bound_vertex_streams_[0].Get(), bound_index_buffer_.Get(),
+        bound_vertex_stream_strides_[0], startIndex, submitted_index_count,
+        bound_base_vertex_, minIndex, NumVertices, GetTransform(D3DTS_WORLD),
+        bound_textures_[0] ? srv_heap_.GetIndexFor(bound_textures_[0]->srv_handle())
+                           : UINT_MAX,
+        static_cast<UINT>(bound_index_buffer_->index_buffer_fmt()),
+        RtCurrentNormalByteOffset());
+  }
+  if (kEnableExperimentalHelperSceneSubmission &&
+      GetConfig().lighting_mode >= 2 && rt_helper_client_ &&
+      rt_helper_client_->ready() &&
+      PrimitiveType == D3DPT_TRIANGLELIST && bound_vertex_streams_[0] &&
+      bound_index_buffer_ &&
+      bound_vertex_streams_[0]->IsDynamic() && bound_index_buffer_->IsDynamic() &&
+      (CurrentFrame() & 3u) == 0) {
+    rt_helper_client_->RecordDynamicTriangle(
+        static_cast<DynamicBuffer*>(bound_vertex_streams_[0].Get()),
+        static_cast<DynamicBuffer*>(bound_index_buffer_.Get()),
+        bound_vertex_stream_strides_[0], startIndex, submitted_index_count,
+        bound_base_vertex_, minIndex, NumVertices, GetTransform(D3DTS_WORLD),
+        bound_textures_[0] ? srv_heap_.GetIndexFor(bound_textures_[0]->srv_handle()) : UINT_MAX,
+        static_cast<UINT>(bound_index_buffer_->index_buffer_fmt()),
+        RtCurrentNormalByteOffset());
+  }
   return S_OK;
 }
 
@@ -4445,6 +5928,9 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
 }
 
 void Device::PollUiDumpHotkey() {
+#ifdef DX8TO12_ENABLE_MINDEBUG
+  PollRwSnapshotHotkeys(CurrentFrame());
+#endif
 #ifdef DX8TO12_ENABLE_VALIDATION
   // Edge-triggered so holding the key doesn't toggle every frame. Uses
   // GetAsyncKeyState rather than the app's input: this has to work while the
@@ -4485,6 +5971,10 @@ HRESULT STDMETHODCALLTYPE Device::Present(CONST RECT *pSourceRect,
 
 // Only used during reset. Does not clean up fence state.
 void Device::SubmitAndWait(bool should_present) {
+  if (should_present && rt_helper_client_ && !rt_helper_client_->ready() &&
+      CurrentFrame() >= 300) {
+    rt_helper_client_->Start();
+  }
   // TEMP DIAGNOSTIC: see perf_wait_ticks_accum_ comment in device.h.
   LARGE_INTEGER perf_now;
   QueryPerformanceCounter(&perf_now);
@@ -4544,8 +6034,71 @@ void Device::SubmitAndWait(bool should_present) {
     if (dirty_flags_ & DIRTY_FLAG_OM) {
       BeginScene();
     }
-    for (ModRenderCallback callback : mod_render_callbacks_) {
+    if (rt_helper_client_ && rt_helper_client_->ready()) {
+      rt_helper_client_->PollSmokeTest();
+    }
+    // Build after every game draw has been collected but before any mod
+    // callback can consume the TLAS.  This phase records no DispatchRays and
+    // therefore cannot change the visible frame.
+    if (raytracing_scene_ && GetConfig().lighting_mode >= 2) {
+      raytracing_scene_->BuildForFrame();
+    } else if (raytracing_scene_) {
+      // A mode switch can happen between draws and Present.  Do not carry
+      // geometry observed under the old mode into a later RT frame.
+      raytracing_scene_->DiscardFrame();
+    }
+    // Do not invoke arbitrary mod code while holding the mutex: a callback
+    // may legitimately unregister itself.  The snapshot makes registration
+    // from another thread safe without extending the lock over foreign code.
+    std::vector<ModRenderCallback> callbacks;
+    {
+      std::lock_guard lock(mod_render_callbacks_mutex_);
+      callbacks = mod_render_callbacks_;
+    }
+    // Level 1 mod-API scene metadata: only pay for the extra barrier pair
+    // when a mod has actually asked to read the depth buffer (see
+    // RequestDepthBufferAccess) -- bound_depth_target_ otherwise sits in
+    // DEPTH_WRITE for the whole frame with nothing else ever transitioning
+    // it away from that state (Clear()/BeginScene's OMSetRenderTargets both
+    // assume it), so this pair must be symmetric and go through
+    // TransitionTexture to keep GpuTexture::current_state_ authoritative for
+    // next frame.
+    const bool depth_readable_for_callbacks =
+        depth_buffer_access_requested_ && bound_depth_target_;
+    if (depth_readable_for_callbacks) {
+      // The normal DSV is writable. It cannot remain bound while the same
+      // resource is transitioned to an SRV state. Mod callbacks render to
+      // the color target only, so detach the DSV for this callback section;
+      // merely changing the resource state while leaving the writable DSV
+      // in OM is invalid D3D12 and can remove the device on release drivers.
+      GpuTexture* render_target =
+          bound_render_target_ ? bound_render_target_.Get()
+                               : back_buffers_.at(current_back_buffer_).Get();
+      const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = render_target->rtv_handle();
+      cmd_list_->OMSetRenderTargets(1, &rtv_handle, TRUE, nullptr);
+      TransitionTexture(bound_depth_target_.Get(), 0,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    for (ModRenderCallback callback : callbacks) {
+      // Rebind Dx8to12's own heaps before each callback -- an earlier
+      // callback in this same list may have bound its own descriptor heap
+      // (e.g. to build an SRV for a borrowed resource like the H4 shadow
+      // mask, see MODDING.md's H4 section: "the mod must create its
+      // SRV/PSO resources itself") and left it bound afterward. Without
+      // this, a later mod that only defensively rebinds against Dx8to12's
+      // own prior state (the documented contract) -- not against whatever
+      // a *different* mod's callback did moments earlier -- would silently
+      // inherit the wrong heap: the same SET_DESCRIPTOR_TABLE_INVALID/
+      // garbage-render class of bug MODDING.md already documents, just
+      // triggered mod-to-mod instead of by Dx8to12's own state.
+      ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
+      cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
       callback(cmd_list_.Get());
+    }
+    if (depth_readable_for_callbacks) {
+      TransitionTexture(bound_depth_target_.Get(), 0,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
   }
 
@@ -4567,12 +6120,18 @@ void Device::SubmitAndWait(bool should_present) {
   dirty_flags_ |= DIRTY_FLAG_CMD_LIST_CLOSED;
   ID3D12CommandList *cmd_list = cmd_list_.Get();
   cmd_queue_->ExecuteCommandLists(1, &cmd_list);
+  if (rt_helper_client_ && rt_helper_client_->ready()) {
+    rt_helper_client_->OnX86Submission();
+  }
   // Present!
   if (should_present) {
     ASSERT_HR(swap_chain_->Present(
         sync_interval_, sync_interval_ == 0 && tearing_supported_
                              ? DXGI_PRESENT_ALLOW_TEARING
                              : 0));
+#ifdef DX8TO12_ENABLE_MINDEBUG
+    FlushRwCallDiagnostics(next_fence_);
+#endif
   }
 
   // DIAGNOSTIC: see draw_calls_this_frame_ comment in device.h. Logged
@@ -4590,11 +6149,22 @@ void Device::SubmitAndWait(bool should_present) {
 
   // Grab a new fence value, set it at the end of the command queue execution.
   fence_values_.at(current_back_buffer_) = next_fence_++;
+#ifdef DX8TO12_FORCE_GPU_IDLE
+  const uint64_t submitted_fence = fence_values_[current_back_buffer_];
+#endif
   ASSERT_HR(cmd_queue_->Signal(cmd_list_done_fence_.get(),
                                fence_values_[current_back_buffer_]));
 
   // Update our back buffer index.
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
+
+#ifdef DX8TO12_FORCE_GPU_IDLE
+  // Diagnostic A/B: remove every possible CPU/GPU lifetime overlap. If the
+  // disappearing mesh survives this, it cannot be caused by a descriptor,
+  // texture, upload-ring allocation, or dynamic buffer being reused while
+  // the GPU still consumes the previous frame.
+  WaitForFrame(submitted_fence);
+#endif
 
   // Wait for it.
   WaitForFrame(fence_values_[current_back_buffer_]);

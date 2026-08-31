@@ -1,8 +1,11 @@
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <sstream>
+#include <vector>
 
 #include "aixlog.hpp"
+#include "config.h"
 #include "device.h"
 #include "render_state.h"
 #include "utils/dx_utils.h"
@@ -12,6 +15,7 @@ using ::std::endl;
 
 constexpr char kPixelHeader[] = R"(
 #include "ps_common.hlsl"
+#include "lighting.hlsl"
 )";
 
 static void GenerateArgValue(int stage_index, const TextureStageState &ts,
@@ -203,14 +207,93 @@ static void ApplyOperation(const PixelShaderState &s, const char *components,
   ss << ")." << components << ";\n}\n";
 }
 
-ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
+// Mod-API pixel shader injection (Dx8to12_PixelShaderInjectionFn, device.h):
+// runs the callback (if any) once for this (re)compile and returns whatever
+// HLSL it produced, clamped defensively to the buffer actually handed to it
+// so a misbehaving mod can't make this read past its own stack buffer.
+static std::string GetInjectedSnippet(const PixelShaderState &s,
+                                      bool has_normal, bool has_view_pos,
+                                      const Device* injection_device) {
+  if (!injection_device) return {};
+  int active_stage_count = 0;
+  for (int i = 0; i < kMaxTexStages; ++i) {
+    if (s.ts[i].color_op != D3DTOP_DISABLE) ++active_stage_count;
+  }
+  const Dx8to12_PixelShaderInjectionContext context{
+      .has_normal = has_normal ? 1 : 0,
+      .has_view_pos = has_view_pos ? 1 : 0,
+      .texture_stage_count = active_stage_count};
+  // Generous but bounded -- this only ever runs once per distinct shader
+  // permutation (not per frame/draw), so there's no cost pressure to size
+  // it tighter.
+  std::vector<char> buffer(16384);
+  const size_t written = injection_device->InvokePixelShaderInjection(
+      &context, buffer.data(), buffer.size());
+  // This is the public ABI contract documented in device.h/MODDING.md. A
+  // value larger than the supplied buffer is not a truncated snippet (which
+  // could turn valid HLSL into a different, invalid program); it means the
+  // callback did not produce a usable result.
+  if (written == 0 || written > buffer.size()) return {};
+  return std::string(buffer.data(), written);
+}
+
+ComPtr<ID3DBlob> CreatePixelShaderFromState(
+    const PixelShaderState &s, bool has_normal, bool has_view_pos,
+    const Device* injection_device) {
   using ::std::endl;
+  const std::string injected_snippet =
+      GetInjectedSnippet(s, has_normal, has_view_pos, injection_device);
   std::stringstream ss;
   ss << std::dec;
   ss << kPixelHeader;
   ss << "float4 PSMain(FFVertexOutput IN) : SV_Target {\n";
   ss << "float4 diffuse_color = IN.oD0;" << endl;
   ss << "float4 specular_color = IN.oD1;" << endl;
+  // LightingMode == PerPixel (1): ff_vertex_shader.hlsl left oD0/oD1 as the
+  // raw, un-lit vertex/material color instead of vertex-lighting them (see
+  // its PER_PIXEL_LIGHTING branches) -- do that lighting here instead, once
+  // per pixel, using the interpolated (and here, renormalized) view-space
+  // position/normal. oPerPixelLightingEligible is 0 for pretransformed
+  // (XYZRHW/2D UI) vertices, which real D3D8 never lights regardless of
+  // D3DRS_LIGHTING -- the vertex shader can tell those apart via its
+  // HAS_TRANSFORM permutation define, this generated shader can't, hence the
+  // interpolant. Re-reads Dx8to12::GetConfig() at generation time, same as
+  // vertex_shader.cpp's PER_PIXEL_LIGHTING define -- both are only ever
+  // (re)compiled after Device::OnLightingModeChanged clears the caches that
+  // would otherwise serve a stale-mode shader.
+  if (Dx8to12::GetConfig().lighting_mode >= 1) {
+    ss << "if (IN.oPerPixelLightingEligible > 0.5f && lighting_enabled) {"
+       << endl;
+    // A per-vertex normal interpolated across a triangle is not unit length
+    // even when each vertex's was -- renormalizing here (impossible to do at
+    // the vertex stage, since there's nothing to renormalize yet) is what
+    // actually makes per-pixel lighting look smoother than per-vertex rather
+    // than just being the same math run more often. Guarded against a zero
+    // vector (the no-normal-stream case, where oViewNormal is left at its
+    // zero-initialized default) to avoid an rsqrt(0) NaN -- ComputeLighting
+    // treats a zero normal as "no diffuse/specular, ambient only", same as
+    // the vertex-lit path's own zero-normal case.
+    ss << "  float3 pp_n = IN.oViewNormal;" << endl;
+    ss << "  float pp_len_sq = dot(pp_n, pp_n);" << endl;
+    ss << "  pp_n = pp_len_sq > 1e-8f ? pp_n * rsqrt(pp_len_sq) : pp_n;"
+       << endl;
+    ss << "  float4 pp_specular;" << endl;
+    ss << "  diffuse_color = ComputeLighting(IN.oViewPos, pp_n, IN.oD0, "
+          "IN.oD1, pp_specular);"
+       << endl;
+    ss << "  specular_color = pp_specular;" << endl;
+    ss << "}" << endl;
+  }
+
+  // Mod-API injection point: sees the final diffuse_color/specular_color
+  // (post per-pixel-lighting, if enabled) and IN (FFVertexOutput), plus
+  // everything lighting.hlsl/ps_common.hlsl already #include (kPixelHeader).
+  // Runs before any texture stage, i.e. before result_color/temp_color exist
+  // -- it may only read/write diffuse_color/specular_color, not result_color.
+  if (!injected_snippet.empty()) {
+    ss << "// --- Dx8to12_PixelShaderInjectionFn begin ---\n"
+       << injected_snippet << "\n// --- Dx8to12_PixelShaderInjectionFn end ---\n";
+  }
 
   ss << "float4 result_color = diffuse_color;" << endl;
   // D3DTSS_RESULTARG: a stage can redirect its output to this side register
@@ -314,6 +397,23 @@ ComPtr<ID3DBlob> CreatePixelShaderFromState(const PixelShaderState &s) {
                           D3DCOMPILE_DEBUG | D3DCOMPILE_ENABLE_STRICTNESS |
                               D3DCOMPILE_WARNINGS_ARE_ERRORS,
                           0, result_blob.GetForInit(), &errorBlob);
+  if (hr != S_OK && !injected_snippet.empty()) {
+    // The mod's injected fragment doesn't compile -- that's the mod's own
+    // bug, not Dx8to12's: log it and recompile without the injection so the
+    // rest of the game keeps rendering normally (see MODDING.md's "Pixel
+    // shader injection" section). Bounded to one retry: the recursive call
+    // passes a null injection_callback, so injected_snippet is empty there
+    // and this branch can't fire again.
+    LOG_ERROR() << "Dx8to12_PixelShaderInjectionFn produced HLSL that failed "
+                  "to compile -- disabling the injection for this shader "
+                  "permutation and falling back to the un-injected version:"
+                << endl
+                << code << endl
+                << (errorBlob ? (const char *)errorBlob->GetBufferPointer()
+                              : "<no error text>")
+                << "\n";
+    return CreatePixelShaderFromState(s, has_normal, has_view_pos, nullptr);
+  }
   if (hr != S_OK) {
     ASSERT(errorBlob);
     ASSERT(reinterpret_cast<const char *>(

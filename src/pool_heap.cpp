@@ -85,4 +85,14 @@ D3D12_GPU_DESCRIPTOR_HANDLE DescriptorPoolHeap::GetGPUHandleFor(
   return {.ptr = gpu_start_.ptr + index * increment_};
 };
 
+UINT DescriptorPoolHeap::GetIndexFor(
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle) const {
+  const ptrdiff_t diff = static_cast<ptrdiff_t>(cpu_handle.ptr) -
+                         static_cast<ptrdiff_t>(cpu_start_.ptr);
+  ASSERT(diff >= 0 && (diff % increment_) == 0);
+  const ptrdiff_t index = diff / increment_;
+  ASSERT(index >= 0 && index < num_descriptors_);
+  return static_cast<UINT>(index);
+}
+
 }  // namespace Dx8to12

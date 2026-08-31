@@ -107,6 +107,18 @@ D3DFORMAT DXGIToD3DFormat(DXGI_FORMAT dxgi_format) {
       return D3DFMT_D16;
     case DXGI_FORMAT_D24_UNORM_S8_UINT:
       return D3DFMT_D24S8;
+    // Depth-stencil resources are created typeless (see
+    // DepthTypelessFromConcrete/BaseTexture::Create) -- the only textures
+    // that ever carry these formats are depth-stencil ones, so report back
+    // the concrete D3D8 depth format they represent. Covers call sites like
+    // BaseTexture::GetSurfaceDesc that read resource_desc_.Format generically
+    // without knowing it came from a depth-stencil resource.
+    case DXGI_FORMAT_R32_TYPELESS:
+      return D3DFMT_D32;
+    case DXGI_FORMAT_R16_TYPELESS:
+      return D3DFMT_D16;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+      return D3DFMT_D24S8;
     case DXGI_FORMAT_A8_UNORM:
       return D3DFMT_A8;
     case DXGI_FORMAT_R16_UINT:
@@ -229,6 +241,45 @@ DXGI_FORMAT DXGIFromD3DFormat(D3DFORMAT d3d_format) {
   }
 }
 
+DXGI_FORMAT DepthTypelessFromConcrete(DXGI_FORMAT concrete_depth) {
+  switch (concrete_depth) {
+    case DXGI_FORMAT_D32_FLOAT:
+      return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:
+      return DXGI_FORMAT_R16_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return DXGI_FORMAT_R24G8_TYPELESS;
+    default:
+      FAIL("Unhandled concrete depth DXGI_FORMAT %d\n", concrete_depth);
+  }
+}
+
+DXGI_FORMAT DepthDsvFormatFromTypeless(DXGI_FORMAT typeless) {
+  switch (typeless) {
+    case DXGI_FORMAT_R32_TYPELESS:
+      return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS:
+      return DXGI_FORMAT_D16_UNORM;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+      return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    default:
+      FAIL("Unhandled typeless depth DXGI_FORMAT %d\n", typeless);
+  }
+}
+
+DXGI_FORMAT DepthSrvFormatFromTypeless(DXGI_FORMAT typeless) {
+  switch (typeless) {
+    case DXGI_FORMAT_R32_TYPELESS:
+      return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS:
+      return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+      return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    default:
+      FAIL("Unhandled typeless depth DXGI_FORMAT %d\n", typeless);
+  }
+}
+
 int DXGIFormatSize(DXGI_FORMAT format) {
   switch (format) {
     case DXGI_FORMAT_R32_SINT:
@@ -244,6 +295,15 @@ int DXGIFormatSize(DXGI_FORMAT format) {
     case DXGI_FORMAT_B5G6R5_UNORM:
     case DXGI_FORMAT_B5G5R5A1_UNORM:
       return 2;
+    // Typeless depth-stencil resource formats (see DepthTypelessFromConcrete)
+    // -- byte size per texel is identical to their concrete counterpart
+    // regardless of which view (DSV/SRV) is used to interpret it.
+    case DXGI_FORMAT_R32_TYPELESS:
+      return 4;  // matches DXGI_FORMAT_D32_FLOAT
+    case DXGI_FORMAT_R24G8_TYPELESS:
+      return 4;  // matches DXGI_FORMAT_D24_UNORM_S8_UINT
+    case DXGI_FORMAT_R16_TYPELESS:
+      return 2;  // matches DXGI_FORMAT_D16_UNORM
     case DXGI_FORMAT_B8G8R8X8_UNORM:
       // This is tricky. We need to make sure DX8 can never lock R8G8B8
       // textures.
