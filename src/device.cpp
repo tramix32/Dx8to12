@@ -6642,7 +6642,10 @@ void Device::SubmitAndWait(bool should_present) {
       perf_frame_ticks_accum_ += perf_now.QuadPart - perf_last_frame_ticks_;
       perf_wait_ticks_accum_ += perf_wait_ticks_this_frame_;
       ++perf_frame_sample_count_;
-#ifdef DX8TO12_ENABLE_VALIDATION
+// Also in a DX8TO12_PERF_LOG build. Measuring a feature's cost on a dev build
+// measures the debug layer instead -- that alone roughly halves the frame
+// rate, which is far more than anything being measured here.
+#if defined(DX8TO12_ENABLE_VALIDATION) || defined(DX8TO12_PERF_LOG)
       if (perf_frame_sample_count_ >= 120) {
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);

@@ -29,6 +29,11 @@ option(DX8TO12_TEMPORAL_JITTER "Compile in the per-frame sub-pixel Halton projec
 option(DX8TO12_SCENE_TARGET "Compile in the offscreen scene colour target and its copy to the backbuffer (runtime switch: TemporalAA / MotionVectorDebug)" ON)
 option(DX8TO12_MOTION_VECTORS "Compile in camera motion vector reconstruction from depth (runtime switch: MotionVectors)" ON)
 option(DX8TO12_MOTION_VECTORS_DEBUG "Compile in the false-colour motion vector overlay (runtime switch: MotionVectorDebug)" ON)
+# Release speed with one line of numbers per ~120 frames. Exists because the
+# only build that reported frame times was the dev build, whose debug layer
+# roughly halves the frame rate -- so it could measure the debug layer but not
+# the cost of anything else.
+option(DX8TO12_PERF_LOG "Log average frame time to log.txt without the debug layer or TRACE_ENTRY (measurement build)" OFF)
 
 if(DX8TO12_MOTION_VECTORS_DEBUG AND NOT DX8TO12_MOTION_VECTORS)
   message(STATUS "DX8TO12_MOTION_VECTORS_DEBUG implies DX8TO12_MOTION_VECTORS; enabling it")
@@ -113,8 +118,11 @@ endif()
 # profiles compile ordinary LOG(...) statements away completely: the clean
 # release has no file logging at all, while release-mindebug writes only its
 # explicitly selected compact diagnostics through a dedicated path.
-if(NOT DX8TO12_ENABLE_VALIDATION)
+if(NOT DX8TO12_ENABLE_VALIDATION AND NOT DX8TO12_PERF_LOG)
   target_compile_definitions(d3d8 PRIVATE DX8TO12_DISABLE_LOGGING)
+endif()
+if(DX8TO12_PERF_LOG)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_PERF_LOG)
 endif()
 
 # target_compile_options(d3d8 PRIVATE "$<$<CONFIG:Debug>:/Ox>")

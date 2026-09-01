@@ -206,23 +206,32 @@ int RunDlaaHelper(const wchar_t* map_name) {
   HANDLE ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   uint64_t processed = 0;
   while (shared->shutdown_requested == 0) {
-    const uint64_t wanted = shared->frame_index;
+    // Block on the fence itself; never poll the shared struct.
+    //
+    // This loop used to check shared->frame_index and Sleep(1) when there was
+    // nothing new. At Windows' default timer granularity Sleep(1) actually
+    // sleeps a full ~15.6 ms tick, so every frame waited a tick for the helper
+    // to *notice* it -- measured: the game ran at 64 fps (15.55 ms/frame) with
+    // the GPU completely idle, against 249 fps with the feature off. The cost
+    // was entirely this sleep, not the copies.
+    //
+    // There is also nothing to poll for: fence values are frame indices, so
+    // waiting for the fence to reach the next one is the same question, asked
+    // in a way the scheduler can answer immediately.
+    uint64_t wanted = ready_fence->GetCompletedValue();
     if (wanted <= processed) {
-      // Nothing new yet. A short sleep rather than a spin: this process has no
-      // other work, and busy-waiting a core would come straight out of the
-      // game's frame budget on the same machine.
-      Sleep(1);
-      continue;
+      if (FAILED(ready_fence->SetEventOnCompletion(processed + 1, ready_event)))
+        break;
+      // Bounded rather than infinite, so shutdown_requested is still noticed
+      // while the game is paused or alt-tabbed and submitting nothing.
+      if (WaitForSingleObject(ready_event, 100) != WAIT_OBJECT_0) continue;
+      wanted = ready_fence->GetCompletedValue();
+      if (wanted <= processed) continue;
     }
-    // Wait for the game's copies into color_in to have actually executed.
-    if (ready_fence->GetCompletedValue() < wanted) {
-      if (FAILED(ready_fence->SetEventOnCompletion(wanted, ready_event))) break;
-      if (WaitForSingleObject(ready_event, 1000) != WAIT_OBJECT_0) {
-        // The game may simply have stopped submitting (paused, alt-tabbed).
-        // Not fatal -- go back to watching for the next frame.
-        continue;
-      }
-    }
+    // Take the newest frame the game has signalled, not processed + 1: if the
+    // helper ever falls behind, working through the backlog one frame at a
+    // time would keep it behind forever. Signalling the newer value satisfies
+    // any older wait too, since x86 waits for "at least" its frame index.
 
     allocator->Reset();
     cmd_list->Reset(allocator.Get(), nullptr);
