@@ -1,5 +1,7 @@
 #include "device.h"
 
+#include <cmrc/cmrc.hpp>
+#include <d3dcompiler.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
@@ -7,6 +9,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <fstream>
 #include <intrin.h>
 #include <set>
@@ -38,6 +41,8 @@
   }()
 
 #define SCOPED_MARKER(annotation) ScopedGpuMarker(cmd_list_.Get(), annotation)
+
+CMRC_DECLARE(Dx8to12_shaders);
 
 namespace Dx8to12 {
 
@@ -1554,6 +1559,302 @@ void Device::FlushScenePassForBackbufferRead() {
 #endif
 }
 
+#ifdef DX8TO12_MOTION_VECTORS
+void Device::InitMotionVectorPass() {
+  // A dedicated root signature: one CBV for the matrices, one SRV table for
+  // the depth buffer. No sampler -- the shader Load()s the depth texel
+  // directly, which is what you want anyway (filtering across a depth
+  // discontinuity would blend two unrelated surfaces into one bogus depth).
+  D3D12_DESCRIPTOR_RANGE depth_range{
+      .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+      .NumDescriptors = 1,
+      .BaseShaderRegister = 0,
+      .RegisterSpace = 0,
+      .OffsetInDescriptorsFromTableStart = 0};
+  D3D12_ROOT_PARAMETER params[2] = {
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV,
+       .Descriptor = {.ShaderRegister = 0},
+       .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL},
+      {.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+       .DescriptorTable = {.NumDescriptorRanges = 1,
+                           .pDescriptorRanges = &depth_range},
+       .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
+  };
+  D3D12_ROOT_SIGNATURE_DESC sig_desc{
+      .NumParameters = 2,
+      .pParameters = params,
+      .NumStaticSamplers = 0,
+      .pStaticSamplers = nullptr,
+      // No ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT: the fullscreen triangle is
+      // generated from SV_VertexID, so there is no vertex buffer at all.
+      .Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ComPtr<ID3DBlob> sig_blob, sig_error;
+  HRESULT hr = D3D12SerializeRootSignature(
+      &sig_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, sig_blob.GetForInit(),
+      sig_error.GetForInit());
+  if (FAILED(hr)) {
+    FAIL("Motion vector root signature failed:\r\n%s",
+         sig_error ? static_cast<const char *>(sig_error->GetBufferPointer())
+                   : "(no message)");
+  }
+  ASSERT_HR(d3d12_device_->CreateRootSignature(
+      0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+      IID_PPV_ARGS(mvec_root_sig_.GetForInit())));
+
+  cmrc::embedded_filesystem fs = cmrc::Dx8to12_shaders::get_filesystem();
+  cmrc::file source = fs.open("motion_vectors.hlsl");
+  const std::string code(source.begin(), source.end());
+  auto compile = [&code](const char *entry, const char *target) {
+    ComPtr<ID3DBlob> blob, errors;
+    const HRESULT chr = D3DCompile(
+        code.data(), code.size(), "motion_vectors.hlsl", nullptr, nullptr,
+        entry, target,
+        D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS, 0,
+        blob.GetForInit(), errors.GetForInit());
+    if (FAILED(chr)) {
+      FAIL("motion_vectors.hlsl (%s) failed to compile:\r\n%s", entry,
+           errors ? static_cast<const char *>(errors->GetBufferPointer())
+                  : "(no message)");
+    }
+    return blob;
+  };
+  ComPtr<ID3DBlob> vs_blob = compile("VSMain", "vs_5_0");
+  ComPtr<ID3DBlob> ps_blob = compile("PSMain", "ps_5_0");
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{
+      .pRootSignature = mvec_root_sig_.get(),
+      .VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()},
+      .PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()},
+      .BlendState = {.RenderTarget = {{.RenderTargetWriteMask =
+                                           D3D12_COLOR_WRITE_ENABLE_ALL}}},
+      .SampleMask = UINT_MAX,
+      .RasterizerState = {.FillMode = D3D12_FILL_MODE_SOLID,
+                          .CullMode = D3D12_CULL_MODE_NONE,
+                          // The fullscreen triangle deliberately extends past
+                          // the near plane's corners; clipping it would cut
+                          // the covered area.
+                          .DepthClipEnable = FALSE},
+      .DepthStencilState = {.DepthEnable = FALSE, .StencilEnable = FALSE},
+      .InputLayout = {nullptr, 0},
+      .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+      .NumRenderTargets = 1,
+      .RTVFormats = {DXGI_FORMAT_R16G16_FLOAT},
+      .DSVFormat = DXGI_FORMAT_UNKNOWN,
+      .SampleDesc = {.Count = 1, .Quality = 0}};
+  ASSERT_HR(d3d12_device_->CreateGraphicsPipelineState(
+      &pso_desc, IID_PPV_ARGS(mvec_pso_.GetForInit())));
+
+#ifdef DX8TO12_MOTION_VECTORS_DEBUG
+  // Identical inputs, drawn onto the scene target instead. A second PSO
+  // rather than a second pass over the motion buffer: the debug shader
+  // recomputes the vector from the same depth and matrices, so it verifies
+  // exactly the math PSMain runs rather than a copy of its output.
+  ComPtr<ID3DBlob> debug_ps_blob = compile("PSDebug", "ps_5_0");
+  pso_desc.PS = {debug_ps_blob->GetBufferPointer(),
+                 debug_ps_blob->GetBufferSize()};
+  // The scene target is what the debug view draws onto, so take the format
+  // from it rather than recomputing the swap chain's -- this is also why
+  // InitMotionVectorPass runs from Reset, after the target exists.
+  ASSERT(scene_color_tex_);
+  pso_desc.RTVFormats[0] = scene_color_tex_->resource_desc().Format;
+  ASSERT_HR(d3d12_device_->CreateGraphicsPipelineState(
+      &pso_desc, IID_PPV_ARGS(mvec_debug_pso_.GetForInit())));
+#endif
+  LOG(INFO) << "InitMotionVectorPass: done\n";
+}
+
+void Device::CaptureFrameCamera() {
+  // First draw of the frame wins. Vice City renders the world first and the
+  // HUD last, so reading transforms_ at Present time would hand the motion
+  // vector pass whatever matrix the HUD left behind instead of the camera.
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // "First draw of the frame is the world camera" is an assumption, and a
+  // static camera producing non-zero motion says it is wrong. Track the last
+  // draw's matrix too: if first and last differ, the frame contains more than
+  // one camera and picking either end of it is arbitrary. Validation-only --
+  // GetViewProjMatrix does two hash lookups, which has no business running on
+  // every draw of a release build.
+  {
+    float last[16];
+    if (GetViewProjMatrix(last)) {
+      memcpy(&frame_view_proj_last_, last, sizeof(frame_view_proj_last_));
+      ++draws_seen_this_frame_;
+    }
+  }
+#endif
+  if (frame_view_proj_captured_) return;
+  float matrix[16];
+  if (!GetViewProjMatrix(matrix)) return;
+  memcpy(&frame_view_proj_, matrix, sizeof(frame_view_proj_));
+  frame_view_proj_captured_ = true;
+}
+
+namespace {
+// Largest absolute element-wise difference between two matrices -- one number
+// that says "these are the same camera" or "these are not".
+float MaxMatrixDelta(const DirectX::SimpleMath::Matrix &a,
+                     const DirectX::SimpleMath::Matrix &b) {
+  const float *pa = reinterpret_cast<const float *>(&a);
+  const float *pb = reinterpret_cast<const float *>(&b);
+  float worst = 0.f;
+  for (int i = 0; i < 16; ++i) worst = std::max(worst, std::abs(pa[i] - pb[i]));
+  return worst;
+}
+}  // namespace
+
+void Device::RecordMotionVectorPass() {
+  if (!motion_vector_tex_ || !mvec_pso_ || !bound_depth_target_ ||
+      !frame_view_proj_captured_) {
+    return;
+  }
+  // Nothing to compare against on the first frame after startup or a Reset.
+  DirectX::SimpleMath::Matrix inv_view_proj;
+  frame_view_proj_.Invert(inv_view_proj);
+  // SimpleMath's Invert reports nothing: on a singular matrix XMMatrixInverse
+  // fills the result with infinities. Inspecting the output is the only
+  // signal available, and it catches a NaN camera at the same time.
+  bool invertible = true;
+  for (int i = 0; i < 16; ++i) {
+    if (!std::isfinite(reinterpret_cast<const float *>(&inv_view_proj)[i])) {
+      invertible = false;
+      break;
+    }
+  }
+  if (!has_prev_view_proj_ || !invertible) {
+    prev_view_proj_ = frame_view_proj_;
+    has_prev_view_proj_ = invertible;
+    return;
+  }
+
+  const uint32_t width =
+      static_cast<uint32_t>(motion_vector_tex_->resource_desc().Width);
+  const uint32_t height = motion_vector_tex_->resource_desc().Height;
+
+  struct MotionVectorCBuffer {
+    float inv_view_proj[16];
+    float prev_view_proj[16];
+    float render_size[2];
+    float debug_scale;
+    float pad;
+  };
+  // The upload ring is shared with texture copies, which leave it in a copy
+  // state; a CBV read needs it back in the draw-readable one.
+  TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
+  DynamicRingBuffer::Allocation alloc =
+      dynamic_ring_buffer_->Allocate(sizeof(MotionVectorCBuffer));
+  MotionVectorCBuffer *cbuffer = reinterpret_cast<MotionVectorCBuffer *>(
+      dynamic_ring_buffer_->GetCpuPtrFor(alloc));
+  memcpy(cbuffer->inv_view_proj, &inv_view_proj,
+         sizeof(cbuffer->inv_view_proj));
+  memcpy(cbuffer->prev_view_proj, &prev_view_proj_,
+         sizeof(cbuffer->prev_view_proj));
+  cbuffer->render_size[0] = static_cast<float>(width);
+  cbuffer->render_size[1] = static_cast<float>(height);
+  // Motion of this many pixels saturates the debug colour. 16 turned out to
+  // saturate over the whole screen on any real camera movement, which hides
+  // the shape of the field and, worse, hides its sign -- the one property
+  // that is invisible here but breaks DLAA later.
+  cbuffer->debug_scale = 64.f;
+  cbuffer->pad = 0.f;
+
+  // Detach the writable DSV *before* the depth resource becomes an SRV.
+  // Transitioning a resource that is still bound in OM as a writable depth
+  // target is invalid D3D12 and removes the device on release drivers -- the
+  // same hazard already documented at the mod-callback site below.
+  TransitionTexture(motion_vector_tex_.Get(), 0,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+  const D3D12_CPU_DESCRIPTOR_HANDLE mvec_rtv = motion_vector_tex_->rtv_handle();
+  cmd_list_->OMSetRenderTargets(1, &mvec_rtv, TRUE, nullptr);
+  TransitionTexture(bound_depth_target_.Get(), 0,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+  const D3D12_VIEWPORT viewport{.TopLeftX = 0.f,
+                                .TopLeftY = 0.f,
+                                .Width = static_cast<float>(width),
+                                .Height = static_cast<float>(height),
+                                .MinDepth = 0.f,
+                                .MaxDepth = 1.f};
+  const D3D12_RECT scissor{.left = 0,
+                           .top = 0,
+                           .right = static_cast<LONG>(width),
+                           .bottom = static_cast<LONG>(height)};
+  cmd_list_->RSSetViewports(1, &viewport);
+  cmd_list_->RSSetScissorRects(1, &scissor);
+  cmd_list_->SetGraphicsRootSignature(mvec_root_sig_.get());
+  cmd_list_->SetPipelineState(mvec_pso_.get());
+  cmd_list_->SetGraphicsRootConstantBufferView(
+      0, dynamic_ring_buffer_->GetGpuPtrFor(alloc));
+  cmd_list_->SetGraphicsRootDescriptorTable(
+      1, srv_heap_.GetGPUHandleFor(bound_depth_target_->srv_handle()));
+  cmd_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  cmd_list_->DrawInstanced(3, 1, 0, 0);
+
+#ifdef DX8TO12_MOTION_VECTORS_DEBUG
+  if (scene_color_tex_ && mvec_debug_pso_) {
+    TransitionTexture(scene_color_tex_.Get(), 0,
+                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv = scene_color_tex_->rtv_handle();
+    cmd_list_->OMSetRenderTargets(1, &scene_rtv, TRUE, nullptr);
+    cmd_list_->SetPipelineState(mvec_debug_pso_.get());
+    // Right half only. Covering the whole screen makes the menu unusable --
+    // there is nothing left to click on -- and a split view is the better
+    // diagnostic anyway: the scene and its motion field are visible at the
+    // same time, so a wrong vector can be matched against what it belongs to.
+    const D3D12_RECT debug_scissor{.left = static_cast<LONG>(width / 2),
+                                   .top = 0,
+                                   .right = static_cast<LONG>(width),
+                                   .bottom = static_cast<LONG>(height)};
+    cmd_list_->RSSetScissorRects(1, &debug_scissor);
+    cmd_list_->DrawInstanced(3, 1, 0, 0);
+    // BeginScene restores the game's own scissor, but do not rely on a call
+    // that only happens because something else set DIRTY_FLAG_OM.
+    cmd_list_->RSSetScissorRects(1, &scissor);
+  }
+#endif
+
+  TransitionTexture(bound_depth_target_.Get(), 0,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  MarkResourceAsUsed(InternalPtr(motion_vector_tex_.Get()));
+
+  // This pass bound its own root signature, PSO, topology and render target.
+  // Every cache the normal draw path keeps about those is now stale.
+  root_sig_bound_ = false;
+  last_set_pso_ = nullptr;
+  last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  dirty_texture_stage_mask_ = 0xFF;
+  dirty_sampler_stage_mask_ = 0xFF;
+  dirty_flags_ |= DIRTY_FLAG_OM;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
+
+#ifdef DX8TO12_ENABLE_VALIDATION
+  {
+    static int mvec_log_frames = 0;
+    if ((mvec_log_frames++ % 30) == 0) {
+      const float *cur = reinterpret_cast<const float *>(&frame_view_proj_);
+      LOG(AixLog::Severity::error)
+          << "MVEC frame=" << next_fence_ << " draws=" << draws_seen_this_frame_
+          // How much this frame's camera moved since the last one. A still
+          // camera must make this ~0; anything else is the bug.
+          << " deltaPrev=" << MaxMatrixDelta(frame_view_proj_, prev_view_proj_)
+          // How much the camera changed *within* this frame, first draw to
+          // last. Non-zero means the frame has several cameras and "first
+          // draw wins" is picking one arbitrarily.
+          << " deltaInFrame="
+          << MaxMatrixDelta(frame_view_proj_, frame_view_proj_last_)
+          << " vp=[" << cur[0] << "," << cur[5] << "," << cur[10] << ","
+          << cur[12] << "," << cur[13] << "," << cur[14] << "]\n";
+    }
+  }
+  draws_seen_this_frame_ = 0;
+#endif
+
+  prev_view_proj_ = frame_view_proj_;
+  has_prev_view_proj_ = true;
+}
+#endif  // DX8TO12_MOTION_VECTORS
+
 GpuTexture *Device::CurrentColorTarget() {
   // A game-set render target always wins: that is the game explicitly drawing
   // somewhere other than its backbuffer (radar map, mirror, menu blur), and
@@ -1890,6 +2191,45 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // Reset() ends a frame's worth of state; the next frame starts with the
   // scene pass open again.
   scene_pass_active_ = true;
+#endif
+
+#ifdef DX8TO12_MOTION_VECTORS
+  motion_vector_tex_.Reset();
+  {
+    // R16G16_FLOAT has no D3DFORMAT this codebase maps, and inventing one
+    // would put a format the game can never ask for into the conversion
+    // tables. Create the resource directly and wrap it the same way the back
+    // buffers are wrapped -- InitFromResource gives it an RTV and an SRV.
+    const D3D12_HEAP_PROPERTIES heap_props{.Type = D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC desc{
+        .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+        .Width = pPresentationParameters->BackBufferWidth,
+        .Height = pPresentationParameters->BackBufferHeight,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_R16G16_FLOAT,
+        .SampleDesc = {.Count = 1, .Quality = 0},
+        .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    ComPtr<ID3D12Resource> mvec_resource;
+    // No optimized clear value: the fullscreen triangle writes every pixel,
+    // so this target is never cleared.
+    ASSERT_HR(d3d12_device_->CreateCommittedResource(
+        &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(mvec_resource.GetForInit())));
+    motion_vector_tex_ =
+        ComOwn(GpuTexture::InitFromResource(this, mvec_resource));
+    motion_vector_tex_->SetName("motion_vector_tex");
+  }
+  // The camera of the frame before a Reset says nothing about the frame
+  // after it -- a resolution change or device loss is a discontinuity.
+  has_prev_view_proj_ = false;
+  frame_view_proj_captured_ = false;
+  // Rebuilt here rather than once at Init: the debug PSO's render target
+  // format comes from the scene target, which Reset just recreated.
+  InitMotionVectorPass();
 #endif
 
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
@@ -4521,6 +4861,9 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // Restore the draw-readable state before binding any of its VB/IB/CB views.
   TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
                               D3D12_RESOURCE_STATE_INDEX_BUFFER);
+#ifdef DX8TO12_MOTION_VECTORS
+  CaptureFrameCamera();
+#endif
   if (PrimitiveType > D3DPT_TRIANGLEFAN) {
     LOG_ERROR() << "Invalid primitive type " << PrimitiveType << "\n";
     return D3DERR_INVALIDCALL;
@@ -6208,6 +6551,12 @@ void Device::SubmitAndWait(bool should_present) {
   // actually holds on every presented frame, not just ones the game itself
   // drew into.
   if (should_present) {
+#ifdef DX8TO12_MOTION_VECTORS
+    // Before the scene resolve: this reads the depth buffer as the game's
+    // own draws left it, and the debug view writes onto the scene target
+    // while it is still the thing that gets copied to the backbuffer.
+    RecordMotionVectorPass();
+#endif
 #ifdef DX8TO12_SCENE_TARGET
     // Everything from here on -- mod callbacks, HUD overlays, the PRESENT
     // transition -- must see the real backbuffer, exactly as it did before
@@ -6367,6 +6716,12 @@ void Device::SubmitAndWait(bool should_present) {
     dirty_flags_ |= DIRTY_FLAG_OM;
     dirty_flags_ |= DIRTY_FLAG_PSO;
   }
+#endif
+
+#ifdef DX8TO12_MOTION_VECTORS
+  // Re-arm the "first draw of the frame wins" capture. Only on a presented
+  // frame: a mid-frame flush has not changed the camera.
+  if (should_present) frame_view_proj_captured_ = false;
 #endif
 
 #ifdef DX8TO12_FORCE_GPU_IDLE

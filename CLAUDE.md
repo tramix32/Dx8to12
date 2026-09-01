@@ -75,6 +75,10 @@ Use `build-x86/dist/` while actively working on this codebase (a real bug is muc
 | `DX8TO12_ENABLE_MINDEBUG` | OFF | Compact GTA VC-specific diagnostics through `WriteMindebugDiagnosticLine` instead of AixLog. Requires `ENABLE_VALIDATION=OFF`. |
 | `DX8TO12_PAD_BUFFERS` | **ON** | Over-allocates every vertex/index buffer and hides the pad from `GetDesc`. Fixes the "disappearing road/building" bug -- GTA VC writes past the end of its own static index buffers and the draw count was then clamped, dropping the trailing triangles. Turn OFF only to reproduce that bug. See `MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md`. |
 | `DX8TO12_DRAW_STATE_CACHE` | OFF | Skips re-recording PSO/root/vertex-buffer bindings when nothing changed. Faster, but the only optimisation that skips *recording* commands -- read `kCacheDrawStateBindings` in `device_limits.h` first. |
+| `DX8TO12_TEMPORAL_JITTER` | OFF | Sub-pixel Halton offset on the projection. A temporal upscaler needs it; on its own it only makes the image shimmer. |
+| `DX8TO12_SCENE_TARGET` | OFF | Renders the scene into an offscreen colour target and copies it to the backbuffer before mod callbacks. Correct means **invisible**: any difference from a build without it is a bug. |
+| `DX8TO12_MOTION_VECTORS` | OFF | Camera-only motion vectors reconstructed from depth into an offscreen `R16G16_FLOAT` target. Requires `SCENE_TARGET`. Nothing samples it yet. |
+| `DX8TO12_MOTION_VECTORS_DEBUG` | OFF | Draws those vectors as false colour over the **right half** of the screen (left half stays playable). Implies `MOTION_VECTORS`. |
 | `DX8TO12_BUFFER_SHADOW` | OFF | Diagnostic: gives every buffer a full CPU shadow with a guard page, so writes past a buffer's end are caught instead of corrupting the heap. This is what identified the bug `PAD_BUFFERS` fixes. |
 | `DX8TO12_KEEP_TARGET_LOD` | OFF | Pins one VC road model in its fading state so its LOD is never culled. Writes to game memory every frame; pollutes any baseline measurement. |
 | `DX8TO12_FORCE_GPU_IDLE` | OFF | Waits for the just-submitted frame. Note it waits *after* submission, so it does not remove aliasing within one unsubmitted command list. |

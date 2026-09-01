@@ -20,6 +20,19 @@ option(DX8TO12_PAD_BUFFERS "Over-allocate vertex/index buffers so the game's wri
 option(DX8TO12_DRAW_STATE_CACHE "Skip re-recording PSO/root/vertex-buffer bindings when nothing they depend on changed (faster; see kCacheDrawStateBindings in device_limits.h before enabling)" OFF)
 option(DX8TO12_TEMPORAL_JITTER "Offset the projection by a per-frame sub-pixel Halton sequence (prerequisite for DLAA/DLSS; on its own it only makes the image shimmer)" OFF)
 option(DX8TO12_SCENE_TARGET "Render the game's scene into an offscreen colour target and copy it to the backbuffer before mod callbacks (prerequisite for DLAA/DLSS; on its own the image must look identical)" OFF)
+option(DX8TO12_MOTION_VECTORS "Reconstruct camera motion vectors from the depth buffer into an offscreen R16G16_FLOAT target (prerequisite for DLAA/DLSS; on its own nothing samples it -- pair with the debug view to see anything)" OFF)
+option(DX8TO12_MOTION_VECTORS_DEBUG "Draw the reconstructed motion vectors over the scene as false colour. Implies DX8TO12_MOTION_VECTORS; makes the game unplayable but is the only way to verify the vectors by eye" OFF)
+
+if(DX8TO12_MOTION_VECTORS_DEBUG AND NOT DX8TO12_MOTION_VECTORS)
+  message(STATUS "DX8TO12_MOTION_VECTORS_DEBUG implies DX8TO12_MOTION_VECTORS; enabling it")
+  set(DX8TO12_MOTION_VECTORS ON)
+endif()
+if(DX8TO12_MOTION_VECTORS AND NOT DX8TO12_SCENE_TARGET)
+  # The pass reads the scene's depth buffer and the debug view draws onto the
+  # scene colour target. Both are the scene target's, not the backbuffer's.
+  message(FATAL_ERROR
+          "DX8TO12_MOTION_VECTORS requires DX8TO12_SCENE_TARGET=ON")
+endif()
 
 if(DX8TO12_ENABLE_VALIDATION AND DX8TO12_ENABLE_MINDEBUG)
   message(FATAL_ERROR
@@ -81,6 +94,12 @@ if(DX8TO12_TEMPORAL_JITTER)
 endif()
 if(DX8TO12_SCENE_TARGET)
   target_compile_definitions(d3d8 PRIVATE DX8TO12_SCENE_TARGET)
+endif()
+if(DX8TO12_MOTION_VECTORS)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_MOTION_VECTORS)
+endif()
+if(DX8TO12_MOTION_VECTORS_DEBUG)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_MOTION_VECTORS_DEBUG)
 endif()
 
 # Dev builds retain the normal AixLog sink and crash diagnostics. Both release

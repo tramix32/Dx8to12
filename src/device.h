@@ -796,6 +796,42 @@ class Device : public IDirect3DDevice8, RefCounted {
   void FlushScenePassForBackbufferRead();
 
  private:
+#ifdef DX8TO12_MOTION_VECTORS
+  // Where the same pixel sat in the previous frame, in pixels, R16G16_FLOAT
+  // at scene resolution. Nothing samples it until DLAA is wired up; the
+  // debug view is what makes it verifiable in the meantime.
+  ComPtr<GpuTexture> motion_vector_tex_;
+  // A dedicated root signature and PSO, deliberately not the game's: the
+  // main root signature is shaped around fixed-function stages (8 texture
+  // tables, 8 sampler tables, five cbuffers) and this pass needs one CBV and
+  // one SRV. Reusing it would mean binding state the game then has to have
+  // restored underneath it.
+  ComPtr<ID3D12RootSignature> mvec_root_sig_;
+  ComPtr<ID3D12PipelineState> mvec_pso_;
+#ifdef DX8TO12_MOTION_VECTORS_DEBUG
+  // Same shader, same inputs, different output: false colour onto the scene
+  // target, whose format differs from the motion buffer's, hence a second PSO.
+  ComPtr<ID3D12PipelineState> mvec_debug_pso_;
+#endif
+  // The world camera of the frame being ended, and of the one before it.
+  // Captured at the frame's first draw rather than read at Present time:
+  // whatever transform happens to be set when the game presents is usually
+  // the HUD's, not the camera's.
+  DirectX::SimpleMath::Matrix frame_view_proj_ = {};
+  DirectX::SimpleMath::Matrix prev_view_proj_ = {};
+  bool frame_view_proj_captured_ = false;
+  bool has_prev_view_proj_ = false;
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // Diagnostics for the "first draw of the frame is the world camera"
+  // assumption -- see CaptureFrameCamera.
+  DirectX::SimpleMath::Matrix frame_view_proj_last_ = {};
+  int draws_seen_this_frame_ = 0;
+#endif
+  void InitMotionVectorPass();
+  void CaptureFrameCamera();
+  void RecordMotionVectorPass();
+#endif
+
 
   // The colour target draws should go to right now. Every site that binds or
   // clears a render target must use this rather than repeating the choice,
