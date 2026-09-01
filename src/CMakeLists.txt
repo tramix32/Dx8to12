@@ -33,6 +33,8 @@ target_sources(
           raytracing.cpp
           rt_helper_client.h
           rt_helper_client.cpp
+          dlss_client.h
+          dlss_client.cpp
           dx8to12_api.cpp)
 
 add_subdirectory(utils)

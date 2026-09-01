@@ -4,6 +4,9 @@
 #include <dxgi1_6.h>
 #include <dxcapi.h>
 #include <DirectXMath.h>
+// The DLAA helper mode below is the only user; the rest of this file predates
+// it and manages lifetimes by hand.
+#include <wrl/client.h>
 
 #include <cstdlib>
 #include <algorithm>
@@ -15,6 +18,7 @@
 #include <vector>
 #include <string_view>
 
+#include "dlss_ipc_protocol.h"
 #include "rt_ipc_protocol.h"
 
 #ifdef DX8TO12_HAVE_STREAMLINE
@@ -40,7 +44,208 @@ HRESULT ReadbackShadowMask(ID3D12Device* device, ID3D12CommandQueue* queue,
                            Dx8to12::RtIpc::Handshake* response);
 
 void PrintUsage() {
-  std::wcerr << L"Usage: dx8to12_rt_helper --self-test | --dlss-probe\n";
+  std::wcerr << L"Usage: dx8to12_rt_helper --self-test | --dlss-probe"
+                L" | --dlaa <shared-memory-name>\n";
+}
+
+// --------------------------------------------------------------------------
+// DLAA/DLSS helper (stage D).
+//
+// Stage D1 is deliberately a loopback: the frame is copied input -> output and
+// nothing else. That makes the first in-game test a clean question -- if the
+// image is not pixel-identical, the fault is in the cross-process transport,
+// not in Streamline. Streamline goes in only once that answer is yes.
+// --------------------------------------------------------------------------
+
+// Finds the adapter the game is running on. Sharing resources across two
+// different physical adapters silently produces garbage rather than an error,
+// so this matches on LUID rather than taking whatever is first.
+HRESULT FindAdapterByLuid(LUID luid, IDXGIAdapter1** adapter_out) {
+  Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+  HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) return hr;
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND;
+       ++i) {
+    DXGI_ADAPTER_DESC1 desc = {};
+    if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+        desc.AdapterLuid.LowPart == luid.LowPart &&
+        desc.AdapterLuid.HighPart == luid.HighPart) {
+      *adapter_out = adapter.Detach();
+      return S_OK;
+    }
+  }
+  return DXGI_ERROR_NOT_FOUND;
+}
+
+int RunDlaaHelper(const wchar_t* map_name) {
+  HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, map_name);
+  if (!mapping) {
+    std::wcerr << L"--dlaa: could not open shared memory.\n";
+    return 1;
+  }
+  auto* shared = static_cast<Dx8to12::DlssIpc::Handshake*>(MapViewOfFile(
+      mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+      sizeof(Dx8to12::DlssIpc::Handshake)));
+  if (!shared) {
+    CloseHandle(mapping);
+    return 1;
+  }
+
+  auto fail = [&](Dx8to12::DlssIpc::HelperStatus status, HRESULT hr) {
+    shared->hresult = hr;
+    shared->status = static_cast<uint32_t>(status);
+    UnmapViewOfFile(shared);
+    CloseHandle(mapping);
+    return 1;
+  };
+
+  if (shared->magic != Dx8to12::DlssIpc::kMagic ||
+      shared->version != Dx8to12::DlssIpc::kVersion) {
+    return fail(Dx8to12::DlssIpc::HelperStatus::kProtocolMismatch, E_FAIL);
+  }
+  shared->helper_process_id = GetCurrentProcessId();
+
+  LUID luid = {};
+  luid.LowPart = shared->adapter_luid_low;
+  luid.HighPart = shared->adapter_luid_high;
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+  HRESULT hr = FindAdapterByLuid(luid, &adapter);
+  if (FAILED(hr)) {
+    return fail(Dx8to12::DlssIpc::HelperStatus::kAdapterNotFound, hr);
+  }
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                         IID_PPV_ARGS(&device));
+  if (FAILED(hr)) {
+    return fail(Dx8to12::DlssIpc::HelperStatus::kDeviceCreateFailed, hr);
+  }
+
+  // Open everything x86 created. The helper never creates a resource the game
+  // has to import -- that direction is what caused this project's repeated
+  // device removals.
+  Microsoft::WRL::ComPtr<ID3D12Resource> color_in, color_out;
+  Microsoft::WRL::ComPtr<ID3D12Fence> ready_fence, done_fence;
+  auto open_shared = [&](const wchar_t* name, REFIID iid, void** out) {
+    HANDLE handle = nullptr;
+    HRESULT open_hr =
+        device->OpenSharedHandleByName(name, GENERIC_ALL, &handle);
+    if (FAILED(open_hr)) return open_hr;
+    open_hr = device->OpenSharedHandle(handle, iid, out);
+    CloseHandle(handle);
+    return open_hr;
+  };
+  hr = open_shared(shared->color_in_name, __uuidof(ID3D12Resource),
+                   reinterpret_cast<void**>(color_in.GetAddressOf()));
+  if (SUCCEEDED(hr)) {
+    hr = open_shared(shared->color_out_name, __uuidof(ID3D12Resource),
+                     reinterpret_cast<void**>(color_out.GetAddressOf()));
+  }
+  if (SUCCEEDED(hr)) {
+    hr = open_shared(shared->ready_fence_name, __uuidof(ID3D12Fence),
+                     reinterpret_cast<void**>(ready_fence.GetAddressOf()));
+  }
+  if (SUCCEEDED(hr)) {
+    hr = open_shared(shared->done_fence_name, __uuidof(ID3D12Fence),
+                     reinterpret_cast<void**>(done_fence.GetAddressOf()));
+  }
+  if (FAILED(hr)) {
+    return fail(Dx8to12::DlssIpc::HelperStatus::kSharedOpenFailed, hr);
+  }
+
+  const D3D12_COMMAND_QUEUE_DESC queue_desc = {
+      .Type = D3D12_COMMAND_LIST_TYPE_DIRECT};
+  Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list;
+  hr = device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue));
+  if (SUCCEEDED(hr)) {
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                        IID_PPV_ARGS(&allocator));
+  }
+  if (SUCCEEDED(hr)) {
+    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                   allocator.Get(), nullptr,
+                                   IID_PPV_ARGS(&cmd_list));
+  }
+  if (FAILED(hr)) {
+    return fail(Dx8to12::DlssIpc::HelperStatus::kDeviceCreateFailed, hr);
+  }
+  cmd_list->Close();
+
+  shared->status = static_cast<uint32_t>(Dx8to12::DlssIpc::HelperStatus::kReady);
+
+  HANDLE ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  uint64_t processed = 0;
+  while (shared->shutdown_requested == 0) {
+    const uint64_t wanted = shared->frame_index;
+    if (wanted <= processed) {
+      // Nothing new yet. A short sleep rather than a spin: this process has no
+      // other work, and busy-waiting a core would come straight out of the
+      // game's frame budget on the same machine.
+      Sleep(1);
+      continue;
+    }
+    // Wait for the game's copies into color_in to have actually executed.
+    if (ready_fence->GetCompletedValue() < wanted) {
+      if (FAILED(ready_fence->SetEventOnCompletion(wanted, ready_event))) break;
+      if (WaitForSingleObject(ready_event, 1000) != WAIT_OBJECT_0) {
+        // The game may simply have stopped submitting (paused, alt-tabbed).
+        // Not fatal -- go back to watching for the next frame.
+        continue;
+      }
+    }
+
+    allocator->Reset();
+    cmd_list->Reset(allocator.Get(), nullptr);
+    D3D12_RESOURCE_BARRIER to_copy[2] = {};
+    to_copy[0].Transition = {.pResource = color_in.Get(),
+                             .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                             .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                             .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE};
+    to_copy[1].Transition = {.pResource = color_out.Get(),
+                             .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                             .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                             .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST};
+    cmd_list->ResourceBarrier(2, to_copy);
+    cmd_list->CopyResource(color_out.Get(), color_in.Get());
+    // Handed back in COMMON. The game's own state tracking believes these
+    // resources sit in COMMON between frames, and it is authoritative -- the
+    // helper leaving them in a copy state would desynchronise it silently.
+    D3D12_RESOURCE_BARRIER to_common[2] = {to_copy[0], to_copy[1]};
+    for (D3D12_RESOURCE_BARRIER& barrier : to_common) {
+      std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    }
+    cmd_list->ResourceBarrier(2, to_common);
+    hr = cmd_list->Close();
+    if (SUCCEEDED(hr)) {
+      ID3D12CommandList* lists[] = {cmd_list.Get()};
+      queue->ExecuteCommandLists(1, lists);
+      hr = queue->Signal(done_fence.Get(), wanted);
+    }
+    if (FAILED(hr)) {
+      shared->last_hresult = hr;
+      ++shared->failed_frames;
+      break;
+    }
+    processed = wanted;
+    shared->completed_frame_index = wanted;
+  }
+
+  // Do not tear down while the GPU still owns the shared resources.
+  Microsoft::WRL::ComPtr<ID3D12Fence> drain;
+  if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                    IID_PPV_ARGS(&drain)))) {
+    queue->Signal(drain.Get(), 1);
+    if (drain->GetCompletedValue() < 1) {
+      drain->SetEventOnCompletion(1, ready_event);
+      WaitForSingleObject(ready_event, 2000);
+    }
+  }
+  CloseHandle(ready_event);
+  UnmapViewOfFile(shared);
+  CloseHandle(mapping);
+  return 0;
 }
 
 int RunSelfTest() {
@@ -1649,6 +1854,9 @@ int wmain(int argc, wchar_t** argv) {
   }
   if (argc == 2 && std::wstring_view(argv[1]) == L"--dlss-probe") {
     return RunDlssProbe();
+  }
+  if (argc == 3 && std::wstring_view(argv[1]) == L"--dlaa") {
+    return RunDlaaHelper(argv[2]);
   }
   if (argc == 2 && std::wstring_view(argv[1]) == L"--self-test") {
     return RunSelfTest();
