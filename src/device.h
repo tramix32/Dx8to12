@@ -767,6 +767,26 @@ class Device : public IDirect3DDevice8, RefCounted {
   // when no mod has asked to read the depth buffer.
   bool depth_buffer_access_requested_ = false;
 
+#ifdef DX8TO12_TEMPORAL_JITTER
+  // Sub-pixel camera offset for the current frame, in pixels, each component
+  // in [-0.5, 0.5]. A temporal upscaler needs the camera to sample a
+  // different point inside each pixel every frame; this is where that offset
+  // lives. Kept in pixel units rather than NDC because that is the form
+  // Streamline's sl::Constants::jitterOffset wants, and the NDC conversion
+  // needs the viewport anyway.
+  //
+  // Applied to the projection on the CPU (see PrepareDrawCall) rather than
+  // passed to the shaders: that costs no shader changes at all, and it
+  // automatically leaves pretransformed D3DFVF_XYZRHW geometry alone, since
+  // ff_vertex_shader.hlsl's HAS_TRANSFORM branch never touches
+  // world_view_proj. HUD, radar and text therefore cannot be jittered by
+  // construction rather than by remembering to exclude them.
+  DirectX::SimpleMath::Vector2 jitter_pixels_ = {};
+  // Advanced once per presented frame.
+  uint32_t jitter_index_ = 0;
+  void AdvanceTemporalJitter();
+#endif
+
   // Viewport.
   D3D12_VIEWPORT viewport_ = {.MaxDepth = 1.f};
   // Present()'s SyncInterval, derived from the app's requested

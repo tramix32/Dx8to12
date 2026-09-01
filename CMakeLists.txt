@@ -18,6 +18,7 @@ option(DX8TO12_KEEP_TARGET_LOD "Keep the diagnosed near-road model permanently f
 # an A/B. See MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md.
 option(DX8TO12_PAD_BUFFERS "Over-allocate vertex/index buffers so the game's writes and draws past their declared end stay in valid memory instead of being clamped away" ON)
 option(DX8TO12_DRAW_STATE_CACHE "Skip re-recording PSO/root/vertex-buffer bindings when nothing they depend on changed (faster; see kCacheDrawStateBindings in device_limits.h before enabling)" OFF)
+option(DX8TO12_TEMPORAL_JITTER "Offset the projection by a per-frame sub-pixel Halton sequence (prerequisite for DLAA/DLSS; on its own it only makes the image shimmer)" OFF)
 
 if(DX8TO12_ENABLE_VALIDATION AND DX8TO12_ENABLE_MINDEBUG)
   message(FATAL_ERROR
@@ -73,6 +74,9 @@ if(DX8TO12_PAD_BUFFERS)
 endif()
 if(DX8TO12_DRAW_STATE_CACHE)
   target_compile_definitions(d3d8 PRIVATE DX8TO12_DRAW_STATE_CACHE)
+endif()
+if(DX8TO12_TEMPORAL_JITTER)
+  target_compile_definitions(d3d8 PRIVATE DX8TO12_TEMPORAL_JITTER)
 endif()
 
 # Dev builds retain the normal AixLog sink and crash diagnostics. Both release

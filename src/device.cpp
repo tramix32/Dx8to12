@@ -1485,6 +1485,42 @@ uint32_t Device::rt_shadow_output_format() const {
   return rt_helper_client_ ? rt_helper_client_->shadow_output_format() : DXGI_FORMAT_UNKNOWN;
 }
 
+#ifdef DX8TO12_TEMPORAL_JITTER
+namespace {
+// Radical inverse in `base` -- the Halton sequence. Low-discrepancy rather
+// than random: a temporal upscaler wants the samples inside a pixel to cover
+// it evenly over a short window, which random offsets only do on average and
+// often clump in practice.
+float HaltonSample(uint32_t index, uint32_t base) {
+  float result = 0.f;
+  float fraction = 1.f;
+  while (index > 0) {
+    fraction /= static_cast<float>(base);
+    result += fraction * static_cast<float>(index % base);
+    index /= base;
+  }
+  return result;
+}
+}  // namespace
+
+// Amplitude of the offset in pixels. 1.0 (i.e. +-0.5 px) is the correct value
+// for an upscaler. Temporarily raise this to something absurd like 16 to make
+// the jitter unmistakable on screen -- the only way to tell "applied but too
+// subtle to notice" apart from "not applied at all", which is not otherwise
+// observable from inside the game.
+static constexpr float kJitterPixelScale = 1.0f;
+
+void Device::AdvanceTemporalJitter() {
+  // Halton(2,3), the sequence Streamline's own samples use. Index is 1-based:
+  // Halton(0) is 0 for every base, i.e. a wasted frame with no offset.
+  // The 16-entry loop is the usual phase count for DLSS-class upscalers.
+  ++jitter_index_;
+  const uint32_t index = (jitter_index_ % 16u) + 1u;
+  jitter_pixels_.x = (HaltonSample(index, 2) - 0.5f) * kJitterPixelScale;
+  jitter_pixels_.y = (HaltonSample(index, 3) - 0.5f) * kJitterPixelScale;
+}
+#endif  // DX8TO12_TEMPORAL_JITTER
+
 bool Device::RequestDepthBufferAccess(bool enable) {
   depth_buffer_access_requested_ = enable;
   return true;
@@ -4516,6 +4552,23 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
                                 D3DLOCK_DISCARD));
     Matrix proj = MatrixFromD3D(GetTransform(D3DTS_PROJECTION));
     Matrix world = MatrixFromD3D(GetTransform(D3DTS_WORLD));
+#ifdef DX8TO12_TEMPORAL_JITTER
+    // Nudge the camera by a sub-pixel amount, in clip space. D3D8 is
+    // row-vector (clip = pos * P), so a term added to row 2 of the projection
+    // is scaled by view-space z -- which for a standard perspective matrix is
+    // exactly clip.w. The result is clip.xy += jitter_ndc * clip.w, i.e. a
+    // constant shift in NDC after the perspective divide, at every depth.
+    //
+    // Only world_view_proj is jittered. world_view feeds lighting, and
+    // transforms_ itself is left untouched so Device::GetViewProjMatrix (and
+    // therefore mods reconstructing world position from depth) keeps seeing
+    // the true, unjittered camera.
+    if (viewport_.Width > 0.f && viewport_.Height > 0.f) {
+      proj.m[2][0] += 2.f * jitter_pixels_.x / viewport_.Width;
+      // NDC y runs opposite to pixel y.
+      proj.m[2][1] += -2.f * jitter_pixels_.y / viewport_.Height;
+    }
+#endif
     cbuffer->world_view_proj = world * view * proj;
     cbuffer->world_view = world * view;
     cbuffer->camera_position = DirectX::SimpleMath::Vector3(0, 0, 0);
@@ -6146,6 +6199,14 @@ void Device::SubmitAndWait(bool should_present) {
       << " draws=" << draw_calls_this_frame_ << "\n";
 #endif
   draw_calls_this_frame_ = 0;
+
+#ifdef DX8TO12_TEMPORAL_JITTER
+  // One new sub-pixel offset per *presented* frame. Deliberately not on a
+  // mid-frame flush: those are still the same frame as far as the camera is
+  // concerned, and moving the camera inside a frame would tear the image
+  // between the draws before and after the flush.
+  if (should_present) AdvanceTemporalJitter();
+#endif
 
   // Grab a new fence value, set it at the end of the command queue execution.
   fence_values_.at(current_back_buffer_) = next_fence_++;
