@@ -28,11 +28,21 @@ void MessageBoxFmt(unsigned int flags, const char* fmt, ...);
 
 #define ASSERT_TODO(expr, msg) ASSERT(expr)
 
-#define ASSERT_HR(expr)     \
-  do {                      \
-    HRESULT _hr = expr;     \
-    (void)_hr;              \
-    ASSERT(SUCCEEDED(_hr)); \
+// Reports the actual HRESULT, not just "SUCCEEDED(_hr) failed". A bare
+// SUCCEEDED assertion tells you which line failed but nothing about why,
+// which is the whole question for calls like ResizeBuffers/CreateCommittedResource
+// where DXGI_ERROR_INVALID_CALL, E_OUTOFMEMORY and DXGI_ERROR_DEVICE_REMOVED
+// mean completely different bugs.
+#define ASSERT_HR(expr)                                                   \
+  do {                                                                    \
+    HRESULT _hr = expr;                                                   \
+    if (!SUCCEEDED(_hr)) {                                                \
+      ::Dx8to12::MessageBoxFmt(MB_ABORTRETRYIGNORE,                       \
+                               "Assertion %s:%d failed:\n%s\nHRESULT = "  \
+                               "0x%08lX",                                 \
+                               __FILE__, __LINE__, #expr,                 \
+                               static_cast<unsigned long>(_hr));          \
+    }                                                                     \
   } while (0)
 
 // Checks the result of expr. If it is not S_OK, its value is returned.

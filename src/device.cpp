@@ -1521,6 +1521,50 @@ void Device::AdvanceTemporalJitter() {
 }
 #endif  // DX8TO12_TEMPORAL_JITTER
 
+#ifdef DX8TO12_SCENE_TARGET
+void Device::ResolveScenePass() {
+  // Idempotent: the scene pass ends exactly once per frame, at whichever
+  // point first needs the backbuffer to actually hold the frame.
+  if (!scene_pass_active_) return;
+  scene_pass_active_ = false;
+  if (!scene_color_tex_) return;
+
+  GpuTexture *backbuffer = back_buffers_.at(current_back_buffer_).Get();
+  TransitionTexture(scene_color_tex_.Get(), 0,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+  // Same format, same dimensions, one mip, no MSAA -- CopyResource is exact,
+  // so at 1:1 this stage needs no shader and no fullscreen pass.
+  cmd_list_->CopyResource(backbuffer->resource(), scene_color_tex_->resource());
+  // The backbuffer is now in COPY_DEST with no RTV bound, and
+  // CurrentColorTarget() has just changed what it returns. Force the next
+  // BeginScene to rebind and re-transition.
+  dirty_flags_ |= DIRTY_FLAG_OM;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
+}
+#endif
+
+void Device::FlushScenePassForBackbufferRead() {
+#ifdef DX8TO12_SCENE_TARGET
+  // A game reading the backbuffer mid-frame (lock, or CopyRects from it)
+  // expects it to contain everything drawn so far. Ending the scene pass
+  // early costs this frame its offscreen scene -- correctness over the
+  // upscaler, which can simply skip a frame the game chose to read back.
+  ResolveScenePass();
+#endif
+}
+
+GpuTexture *Device::CurrentColorTarget() {
+  // A game-set render target always wins: that is the game explicitly drawing
+  // somewhere other than its backbuffer (radar map, mirror, menu blur), and
+  // it must keep working exactly as before.
+  if (bound_render_target_) return bound_render_target_.Get();
+#ifdef DX8TO12_SCENE_TARGET
+  if (scene_pass_active_ && scene_color_tex_) return scene_color_tex_.Get();
+#endif
+  return back_buffers_.at(current_back_buffer_).Get();
+}
+
 bool Device::RequestDepthBufferAccess(bool enable) {
   depth_buffer_access_requested_ = enable;
   return true;
@@ -1758,12 +1802,33 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // the swap chain match the window's existing size -- we're not the one
   // deciding the window should move or resize.
   LOG(INFO) << "Reset: swap_chain_->ResizeBuffers()\n";
-  ASSERT_HR(swap_chain_->ResizeBuffers(
-      kNumBackBuffers, pPresentationParameters->BackBufferWidth,
-      pPresentationParameters->BackBufferHeight, new_format,
-      tearing_supported_
-          ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
-          : 0u));
+  {
+    const HRESULT resize_hr = swap_chain_->ResizeBuffers(
+        kNumBackBuffers, pPresentationParameters->BackBufferWidth,
+        pPresentationParameters->BackBufferHeight, new_format,
+        tearing_supported_
+            ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+            : 0u);
+    if (FAILED(resize_hr)) {
+      // The two realistic causes need completely different fixes and a bare
+      // "SUCCEEDED(_hr) failed" box distinguishes neither: DXGI_ERROR_INVALID_CALL
+      // (0x887A0001) means something still holds a reference to a back
+      // buffer, while DXGI_ERROR_DEVICE_REMOVED (0x887A0005) means the device
+      // died *earlier* -- a bad barrier or a GPU fault -- and Reset is merely
+      // the first call to notice. In the latter case the device's own removal
+      // reason is the code that actually identifies the fault.
+      const HRESULT removed_hr = d3d12_device_->GetDeviceRemovedReason();
+      LOG_ERROR() << "Reset: ResizeBuffers failed hr=" << std::hex << resize_hr
+                  << " removedReason=" << removed_hr << std::dec << "\n";
+      FAIL("ResizeBuffers(%ux%u fmt=%d) failed.\nhr = 0x%08lX\n"
+           "GetDeviceRemovedReason = 0x%08lX",
+           pPresentationParameters->BackBufferWidth,
+           pPresentationParameters->BackBufferHeight,
+           static_cast<int>(new_format),
+           static_cast<unsigned long>(resize_hr),
+           static_cast<unsigned long>(removed_hr));
+    }
+  }
   LOG(INFO) << "Reset: swap_chain_->ResizeBuffers() done\n";
 
   DXGI_SWAP_CHAIN_DESC swap_chain_desc;
@@ -1800,6 +1865,32 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     back_buffers_.push_back(ComOwn(back_buffer));
   }
   LOG(INFO) << "Reset: back buffers re-acquired\n";
+
+#ifdef DX8TO12_SCENE_TARGET
+  // Created here, not in Init(), for the same reason the depth-stencil is:
+  // this is the one place that knows the backbuffer's final size and format,
+  // and it runs again on every Reset (resolution change / device lost).
+  scene_color_tex_.Reset();
+  {
+    const D3DFORMAT scene_format = DXGIToD3DFormat(new_format);
+    scene_color_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
+        this, TextureKind::Texture2d, pPresentationParameters->BackBufferWidth,
+        pPresentationParameters->BackBufferHeight, 1, 1, D3DUSAGE_RENDERTARGET,
+        scene_format, D3DPOOL_DEFAULT)));
+    scene_color_tex_->SetName("scene_color_tex");
+    // The PSO cache keys on the bound render target's DXGI format and never
+    // evicts (see CreatePSO). If the D3DFORMAT round-trip above ever landed
+    // on a different DXGI format than the swap chain's, every PSO would be
+    // built twice and -- worse -- the RTV format a PSO declares would not
+    // match the resource actually bound. Fail loudly here instead.
+    ASSERT(scene_color_tex_->resource_desc().Format == new_format);
+    ASSERT(back_buffers_.at(0)->resource_desc().Format ==
+           new_format);
+  }
+  // Reset() ends a frame's worth of state; the next frame starts with the
+  // scene pass open again.
+  scene_pass_active_ = true;
+#endif
 
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
 
@@ -2486,6 +2577,9 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
       src_texture = src_gpu_surface->texture();
       src_subresource = src_gpu_surface->subresource();
     } else {
+      // Copying *out of* the backbuffer: it has to contain the frame first.
+      // No-op unless the scene target is compiled in and still open.
+      FlushScenePassForBackbufferRead();
       src_texture =
           static_cast<BackbufferSurface *>(pSourceSurface)->texture();
       src_subresource = 0;
@@ -2529,6 +2623,27 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
 
     const D3D12_RESOURCE_STATES src_prior_state =
         src_texture->current_state(src_subresource);
+    const D3D12_RESOURCE_STATES ring_prior_state =
+        dynamic_ring_buffer_->current_state();
+#ifdef DX8TO12_ENABLE_VALIDATION
+    // TRACE_ENTRY logs at TRACE severity, which the file sink filters out, so
+    // "no debug-layer errors from the staging path" is indistinguishable from
+    // "the staging path never ran". This says which. Rate-limited because the
+    // path fired ~10k times in 46 seconds when it was broken.
+    if (needs_staging) {
+      static int staging_copies = 0;
+      ++staging_copies;
+      if (staging_copies <= 5 || staging_copies % 500 == 0) {
+        LOG(AixLog::Severity::error)
+            << "COPYRECTS-STAGING n=" << staging_copies
+            << " srcFmt=" << src_desc.Format << " dstFmt=" << dst_desc.Format
+            << " fromBackbuffer="
+            << (source_kind == SurfaceKind::Backbuffer ? 1 : 0)
+            << " ringPriorState=" << std::hex << ring_prior_state << std::dec
+            << "\n";
+      }
+    }
+#endif
     TransitionTexture(src_texture, src_subresource,
                       D3D12_RESOURCE_STATE_COPY_SOURCE);
     TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
@@ -2590,14 +2705,30 @@ HRESULT STDMETHODCALLTYPE Device::CopyRects(
                         .right = static_cast<UINT>(rect.right),
                         .bottom = static_cast<UINT>(rect.bottom),
                         .back = 1};
+      // The ring buffer is a copy *destination* here -- the only place in the
+      // codebase where that's true. Every other use (CopyBufferToTexture,
+      // Buffer's dynamic upload, the RT helper) transitions it to
+      // COPY_SOURCE; without the matching COPY_DEST transition the resource
+      // is still in VERTEX_AND_CONSTANT_BUFFER|INDEX_BUFFER when the copy
+      // lands on it. Measured: 10434 debug-layer errors in a 46-second
+      // session ("invalid for use as a destination resource"), i.e. this
+      // fires constantly, not in some rare corner. It's a CUSTOM/L0 heap, so
+      // it is legally transitionable -- the barriers were simply missing.
+      TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
       cmd_list_->CopyTextureRegion(&staging_location, 0, 0, 0, &src_location,
                                    &src_box);
       D3D12_TEXTURE_COPY_LOCATION staging_src_location = staging_location;
       staging_src_location.PlacedFootprint.Footprint.Format = dst_desc.Format;
+      TransitionDynamicRingBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
       cmd_list_->CopyTextureRegion(&dst_location,
                                    safe_cast<uint32_t>(dest_point.x),
                                    safe_cast<uint32_t>(dest_point.y), 0,
                                    &staging_src_location, nullptr);
+    }
+    if (needs_staging) {
+      // Leave the ring buffer as the rest of the frame expects to find it;
+      // PrepareDrawCall only transitions it back on its own next call.
+      TransitionDynamicRingBuffer(ring_prior_state);
     }
     TransitionTexture(src_texture, src_subresource, src_prior_state);
     TransitionTexture(dest_surface->texture(), dest_surface->subresource(),
@@ -4040,10 +4171,7 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   // whichever target is actually bound rather than assuming it's always the
   // backbuffer's format.
   const DXGI_FORMAT current_rtv_format =
-      (bound_render_target_ ? bound_render_target_.Get()
-                            : back_buffers_.at(current_back_buffer_).Get())
-          ->resource_desc()
-          .Format;
+      CurrentColorTarget()->resource_desc().Format;
 
   // Now that we know our pixel shader, try to look into the PSO cache.
   PSOState pso_key{
@@ -4314,9 +4442,7 @@ HRESULT STDMETHODCALLTYPE Device::BeginScene() {
   ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
   cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
 
-  GpuTexture *render_target =
-      bound_render_target_ ? bound_render_target_.Get()
-                           : back_buffers_.at(current_back_buffer_).Get();
+  GpuTexture *render_target = CurrentColorTarget();
 
   // Transition the back buffer from present (or common) to render target.
   TransitionTexture(render_target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4363,9 +4489,7 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
   if (Flags & D3DCLEAR_TARGET) {
     // Clear can be called before BeginScene - so make sure to transition the
     // render taret.
-    GpuTexture *render_target = bound_render_target_
-                                    ? bound_render_target_.Get()
-                                    : back_buffers_[current_back_buffer_].Get();
+    GpuTexture *render_target = CurrentColorTarget();
     TransitionTexture(render_target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
     float color[4] = {((Color >> 16) & 0xFF) / 255.f,
                       ((Color >> 8) & 0xFF) / 255.f, (Color & 0xFF) / 255.f,
@@ -6084,6 +6208,20 @@ void Device::SubmitAndWait(bool should_present) {
   // actually holds on every presented frame, not just ones the game itself
   // drew into.
   if (should_present) {
+#ifdef DX8TO12_SCENE_TARGET
+    // Everything from here on -- mod callbacks, HUD overlays, the PRESENT
+    // transition -- must see the real backbuffer, exactly as it did before
+    // the scene target existed. MODDING.md promises mods the backbuffer, in
+    // its format, at output resolution, and they only rebuild their PSOs when
+    // GetSwapChainGeneration changes; handing them anything else here would
+    // invalidate their pipeline state with no signal at all.
+    //
+    // Before the BeginScene below, not after: the copy leaves the backbuffer
+    // in COPY_DEST with no RTV bound, and ResolveScenePass sets
+    // DIRTY_FLAG_OM so that BeginScene unconditionally rebinds it as a
+    // render target.
+    ResolveScenePass();
+#endif
     if (dirty_flags_ & DIRTY_FLAG_OM) {
       BeginScene();
     }
@@ -6124,9 +6262,7 @@ void Device::SubmitAndWait(bool should_present) {
       // the color target only, so detach the DSV for this callback section;
       // merely changing the resource state while leaving the writable DSV
       // in OM is invalid D3D12 and can remove the device on release drivers.
-      GpuTexture* render_target =
-          bound_render_target_ ? bound_render_target_.Get()
-                               : back_buffers_.at(current_back_buffer_).Get();
+      GpuTexture* render_target = CurrentColorTarget();
       const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = render_target->rtv_handle();
       cmd_list_->OMSetRenderTargets(1, &rtv_handle, TRUE, nullptr);
       TransitionTexture(bound_depth_target_.Get(), 0,
@@ -6218,6 +6354,20 @@ void Device::SubmitAndWait(bool should_present) {
 
   // Update our back buffer index.
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
+
+#ifdef DX8TO12_SCENE_TARGET
+  // A new frame begins: the game's draws go offscreen again. Only after a
+  // real Present -- a mid-frame flush is still the same frame, and the scene
+  // pass there was either already resolved (a backbuffer read) or must stay
+  // open.
+  if (should_present) {
+    scene_pass_active_ = true;
+    // CurrentColorTarget() changes answer here, and the freshly-reset
+    // command list has no RTV bound anyway.
+    dirty_flags_ |= DIRTY_FLAG_OM;
+    dirty_flags_ |= DIRTY_FLAG_PSO;
+  }
+#endif
 
 #ifdef DX8TO12_FORCE_GPU_IDLE
   // Diagnostic A/B: remove every possible CPU/GPU lifetime overlap. If the

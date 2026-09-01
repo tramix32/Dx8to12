@@ -197,6 +197,10 @@ BackbufferSurface::BackbufferSurface(Device* device, int index,
 
 HRESULT STDMETHODCALLTYPE BackbufferSurface::LockRect(
     D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect, DWORD Flags) {
+  // The game wants to read the frame as drawn so far. If the scene is
+  // currently being rendered offscreen (DX8TO12_SCENE_TARGET), end that pass
+  // now so the copy below sees it; otherwise this is a no-op.
+  device_->FlushScenePassForBackbufferRead();
   return LockGpuReadback(texture_.get(), 0, pLockedRect, pRect, Flags);
 }
 

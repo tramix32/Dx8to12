@@ -767,6 +767,41 @@ class Device : public IDirect3DDevice8, RefCounted {
   // when no mod has asked to read the depth buffer.
   bool depth_buffer_access_requested_ = false;
 
+#ifdef DX8TO12_SCENE_TARGET
+  // The game's scene is rendered here instead of straight into the backbuffer,
+  // so that a later pass (DLAA/DLSS) has something to read that does not yet
+  // contain the HUD. Same size and, importantly, the same format as the
+  // backbuffer: PSOState keys on rtv_format and pso_cache_ never evicts, so a
+  // different format would silently fork the whole PSO cache.
+  //
+  // Deliberately NOT expressed by pointing bound_render_target_ at it.
+  // bound_render_target_ == nullptr is the game's own way of saying "the
+  // backbuffer", round-tripped through Get/SetRenderTarget with stable COM
+  // identity; hijacking it would change what the game observes. The
+  // substitution happens only where a target is actually bound, in
+  // CurrentColorTarget().
+  ComPtr<GpuTexture> scene_color_tex_;
+  // False once the scene has been copied out for the frame, so the mod
+  // callbacks and anything else after that point go to the real backbuffer.
+  bool scene_pass_active_ = false;
+  // Ends the scene pass: copies scene_color_tex_ into the current backbuffer
+  // and marks the OM dirty so the next BeginScene rebinds it. Idempotent.
+  void ResolveScenePass();
+#endif
+
+ public:
+  // Called from paths that read the backbuffer's contents mid-frame (a
+  // backbuffer surface lock, CopyRects from the backbuffer). No-op unless
+  // the scene target is compiled in and the pass is still open.
+  void FlushScenePassForBackbufferRead();
+
+ private:
+
+  // The colour target draws should go to right now. Every site that binds or
+  // clears a render target must use this rather than repeating the choice,
+  // otherwise the scene pass and the PSO's declared format drift apart.
+  GpuTexture *CurrentColorTarget();
+
 #ifdef DX8TO12_TEMPORAL_JITTER
   // Sub-pixel camera offset for the current frame, in pixels, each component
   // in [-0.5, 0.5]. A temporal upscaler needs the camera to sample a
