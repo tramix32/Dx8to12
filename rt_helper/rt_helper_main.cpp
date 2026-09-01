@@ -1428,7 +1428,7 @@ int RunDlssProbe() {
   // Identifies this integration to Streamline. Not an NVIDIA-issued
   // applicationId -- the SDK accepts engine+projectId instead, which is the
   // correct path for a project that has not been through NVIDIA onboarding.
-  prefs.projectId = "b7f1c0de-9f5a-4a3e-9a1a-dx8to12rthelper";
+  prefs.projectId = "7c9f1e2a-4b3d-4f8a-9c15-2e6d8b0a41f3";
   prefs.logLevel = sl::LogLevel::eOff;
   prefs.pathToLogsAndData = nullptr;
 
