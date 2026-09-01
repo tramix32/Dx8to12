@@ -66,6 +66,8 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   const std::wstring map_name = UniqueName(L"map");
   const std::wstring color_in_name = UniqueName(L"colorin");
   const std::wstring color_out_name = UniqueName(L"colorout");
+  const std::wstring depth_in_name = UniqueName(L"depthin");
+  const std::wstring mvec_in_name = UniqueName(L"mvecin");
   const std::wstring ready_name = UniqueName(L"ready");
   const std::wstring done_name = UniqueName(L"done");
 
@@ -110,11 +112,17 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
 
   auto create_shared = [&](ComPtr<GpuTexture> *out_texture, HANDLE *out_handle,
-                           const std::wstring &name) {
+                           const std::wstring &name,
+                           DXGI_FORMAT override_format = DXGI_FORMAT_UNKNOWN) {
+    D3D12_RESOURCE_DESC this_desc = desc;
+    if (override_format != DXGI_FORMAT_UNKNOWN) {
+      this_desc.Format = override_format;
+    }
     ComPtr<ID3D12Resource> resource;
     if (FAILED(device_->device()->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
-            nullptr, IID_PPV_ARGS(resource.GetForInit())))) {
+            &heap, D3D12_HEAP_FLAG_SHARED, &this_desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(resource.GetForInit())))) {
       return false;
     }
     if (FAILED(device_->device()->CreateSharedHandle(
@@ -125,13 +133,19 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
     return true;
   };
   if (!create_shared(&color_in_, &color_in_handle_, color_in_name) ||
-      !create_shared(&color_out_, &color_out_handle_, color_out_name)) {
+      !create_shared(&color_out_, &color_out_handle_, color_out_name) ||
+      !create_shared(&depth_in_, &depth_in_handle_, depth_in_name,
+                     DXGI_FORMAT_R32_FLOAT) ||
+      !create_shared(&mvec_in_, &mvec_in_handle_, mvec_in_name,
+                     DXGI_FORMAT_R16G16_FLOAT)) {
     LOG(AixLog::Severity::error) << "DLSS: shared texture creation failed.\n";
     Stop();
     return false;
   }
   color_in_->SetName("dlss_color_in");
   color_out_->SetName("dlss_color_out");
+  depth_in_->SetName("dlss_depth_in");
+  mvec_in_->SetName("dlss_mvec_in");
 
   if (FAILED(device_->device()->CreateFence(
           0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(ready_fence_.GetForInit()))) ||
@@ -164,6 +178,8 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   shared_->mode = static_cast<uint32_t>(mode);
   wcsncpy_s(shared_->color_in_name, color_in_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->color_out_name, color_out_name.c_str(), _TRUNCATE);
+  wcsncpy_s(shared_->depth_in_name, depth_in_name.c_str(), _TRUNCATE);
+  wcsncpy_s(shared_->mvec_in_name, mvec_in_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->ready_fence_name, ready_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->done_fence_name, done_name.c_str(), _TRUNCATE);
 
@@ -206,6 +222,8 @@ void DlssClient::CloseSharedObjects() {
   };
   close(&color_in_handle_);
   close(&color_out_handle_);
+  close(&depth_in_handle_);
+  close(&mvec_in_handle_);
   close(&ready_fence_handle_);
   close(&done_fence_handle_);
   close(&done_event_);
@@ -231,6 +249,8 @@ void DlssClient::Stop() {
   CloseSharedObjects();
   color_in_.Reset();
   color_out_.Reset();
+  depth_in_.Reset();
+  mvec_in_.Reset();
   ready_fence_.Reset();
   done_fence_.Reset();
   if (shared_) {
@@ -252,7 +272,33 @@ bool DlssClient::PollReady() {
   const auto status = static_cast<DlssIpc::HelperStatus>(shared_->status);
   if (status == DlssIpc::HelperStatus::kReady) {
     ready_ = true;
-    LOG(AixLog::Severity::info) << "DLSS: helper reported ready.\n";
+    // Checked, not assumed: a shared handle that opens but resolves to a
+    // resource of the wrong size or format corrupts silently rather than
+    // failing, so compare what the helper sees against what was created.
+    const bool matches =
+        shared_->seen_color_in_width == width_ &&
+        shared_->seen_color_in_height == height_ &&
+        shared_->seen_depth_in_width == width_ &&
+        shared_->seen_mvec_in_width == width_ &&
+        shared_->seen_depth_in_format ==
+            static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT) &&
+        shared_->seen_mvec_in_format ==
+            static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT);
+    LOG(AixLog::Severity::info)
+        << "DLSS: helper reported ready. Sees color " << shared_->seen_color_in_width
+        << "x" << shared_->seen_color_in_height << " fmt "
+        << shared_->seen_color_in_format << ", depth "
+        << shared_->seen_depth_in_width << " fmt " << shared_->seen_depth_in_format
+        << ", mvec " << shared_->seen_mvec_in_width << " fmt "
+        << shared_->seen_mvec_in_format << " -- "
+        << (matches ? "matches what we created" : "MISMATCH") << ".\n";
+    if (!matches) {
+      LOG(AixLog::Severity::error)
+          << "DLSS: shared resources did not resolve to what was created; "
+             "disabling rather than feeding the upscaler the wrong data.\n";
+      healthy_ = false;
+      return false;
+    }
     return true;
   }
   if (status != DlssIpc::HelperStatus::kStarting) {

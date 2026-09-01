@@ -312,11 +312,15 @@ int DXGIFormatSize(DXGI_FORMAT format) {
       return 1;
     case DXGI_FORMAT_R8G8_UNORM:
       return 2;
-    // The motion vector target (DX8TO12_MOTION_VECTORS). No D3D8 game can ask
-    // for this format -- it is deliberately absent from DXGIToD3DFormat and
-    // DXGIFromD3DFormat -- but every BaseTexture, internal ones included,
-    // sizes its footprints through here.
+    // Formats used only by this shim's own internal targets: the motion
+    // vector buffer and the depth copy handed to the upscaler. No D3D8 game
+    // can ask for either -- both are deliberately absent from
+    // DXGIToD3DFormat/DXGIFromD3DFormat -- but every BaseTexture sizes its
+    // footprints through here, internal ones included. Adding an internal
+    // render target means adding its format here too.
     case DXGI_FORMAT_R16G16_FLOAT:
+      return 4;
+    case DXGI_FORMAT_R32_FLOAT:
       return 4;
     default:
       FAIL("Unexpected format %d", format);

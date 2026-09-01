@@ -1657,8 +1657,11 @@ void Device::InitMotionVectorPass() {
       .DepthStencilState = {.DepthEnable = FALSE, .StencilEnable = FALSE},
       .InputLayout = {nullptr, 0},
       .PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-      .NumRenderTargets = 1,
-      .RTVFormats = {DXGI_FORMAT_R16G16_FLOAT},
+      // Two targets: motion vectors, and the depth converted to a plain
+      // colour format for the cross-process upscaler (see the comment on
+      // MotionVectorTargets in motion_vectors.hlsl).
+      .NumRenderTargets = 2,
+      .RTVFormats = {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT},
       .DSVFormat = DXGI_FORMAT_UNKNOWN,
       .SampleDesc = {.Count = 1, .Quality = 0}};
   ASSERT_HR(d3d12_device_->CreateGraphicsPipelineState(
@@ -1672,6 +1675,9 @@ void Device::InitMotionVectorPass() {
   ComPtr<ID3DBlob> debug_ps_blob = compile("PSDebug", "ps_5_0");
   pso_desc.PS = {debug_ps_blob->GetBufferPointer(),
                  debug_ps_blob->GetBufferSize()};
+  // PSDebug writes colour only, unlike PSMain's two targets.
+  pso_desc.NumRenderTargets = 1;
+  pso_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
   // The scene target is what the debug view draws onto, so take the format
   // from it rather than recomputing the swap chain's -- this is also why
   // InitMotionVectorPass runs from Reset, after the target exists.
@@ -1724,8 +1730,8 @@ float MaxMatrixDelta(const DirectX::SimpleMath::Matrix &a,
 
 void Device::RecordMotionVectorPass() {
   if (!GetConfig().motion_vectors) return;
-  if (!motion_vector_tex_ || !mvec_pso_ || !bound_depth_target_ ||
-      !frame_view_proj_captured_) {
+  if (!motion_vector_tex_ || !depth_copy_tex_ || !mvec_pso_ ||
+      !bound_depth_target_ || !frame_view_proj_captured_) {
     return;
   }
   // Nothing to compare against on the first frame after startup or a Reset.
@@ -1785,8 +1791,13 @@ void Device::RecordMotionVectorPass() {
   // same hazard already documented at the mod-callback site below.
   TransitionTexture(motion_vector_tex_.Get(), 0,
                     D3D12_RESOURCE_STATE_RENDER_TARGET);
-  const D3D12_CPU_DESCRIPTOR_HANDLE mvec_rtv = motion_vector_tex_->rtv_handle();
-  cmd_list_->OMSetRenderTargets(1, &mvec_rtv, TRUE, nullptr);
+  TransitionTexture(depth_copy_tex_.Get(), 0,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+  // FALSE, not TRUE: the two RTVs come from separate allocations in the heap
+  // and are not a contiguous range.
+  const D3D12_CPU_DESCRIPTOR_HANDLE mvec_rtvs[2] = {
+      motion_vector_tex_->rtv_handle(), depth_copy_tex_->rtv_handle()};
+  cmd_list_->OMSetRenderTargets(2, mvec_rtvs, FALSE, nullptr);
   TransitionTexture(bound_depth_target_.Get(), 0,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1838,6 +1849,7 @@ void Device::RecordMotionVectorPass() {
   TransitionTexture(bound_depth_target_.Get(), 0,
                     D3D12_RESOURCE_STATE_DEPTH_WRITE);
   MarkResourceAsUsed(InternalPtr(motion_vector_tex_.Get()));
+  MarkResourceAsUsed(InternalPtr(depth_copy_tex_.Get()));
 
   // This pass bound its own root signature, PSO, topology and render target.
   // Every cache the normal draw path keeps about those is now stale.
@@ -1912,14 +1924,26 @@ void Device::RunDlaaExchange() {
     return;
   }
 
-  // Hand the scene over exactly as rendered.
-  TransitionTexture(scene_color_tex_.Get(), 0,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-  TransitionTexture(color_in, 0, D3D12_RESOURCE_STATE_COPY_DEST);
-  cmd_list_->CopyResource(color_in->resource(), scene_color_tex_->resource());
-  // Back to COMMON before the helper touches it: the helper's own barriers
-  // assume COMMON, and cross-process state has no shared tracker to consult.
-  TransitionTexture(color_in, 0, D3D12_RESOURCE_STATE_COMMON);
+  // Hand the three inputs over exactly as rendered. Copies rather than
+  // rendering straight into the shared textures: those are created by the
+  // DlssClient when TemporalAA is switched on, while the scene target and the
+  // motion vector pass exist independently of it and must keep working when
+  // it is off.
+  auto hand_over = [this](GpuTexture *source, GpuTexture *shared) {
+    if (!source || !shared) return;
+    TransitionTexture(source, 0, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    TransitionTexture(shared, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd_list_->CopyResource(shared->resource(), source->resource());
+    // Back to COMMON before the helper touches it. Cross-process state has no
+    // shared tracker to consult, so both sides agree on COMMON as the state a
+    // resource is in whenever it is not being used by one of them.
+    TransitionTexture(shared, 0, D3D12_RESOURCE_STATE_COMMON);
+  };
+  hand_over(scene_color_tex_.Get(), color_in);
+#ifdef DX8TO12_MOTION_VECTORS
+  hand_over(depth_copy_tex_.Get(), dlss_client_->depth_in());
+  hand_over(motion_vector_tex_.Get(), dlss_client_->mvec_in());
+#endif
 
   // The copy has to have executed before the helper is told the frame is
   // ready, so submit here rather than at the end of the frame.
@@ -2299,6 +2323,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
 
 #ifdef DX8TO12_MOTION_VECTORS
   motion_vector_tex_.Reset();
+  depth_copy_tex_.Reset();
   {
     // R16G16_FLOAT has no D3DFORMAT this codebase maps, and inventing one
     // would put a format the game can never ask for into the conversion
@@ -2326,6 +2351,16 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     motion_vector_tex_ =
         ComOwn(GpuTexture::InitFromResource(this, mvec_resource));
     motion_vector_tex_->SetName("motion_vector_tex");
+
+    D3D12_RESOURCE_DESC depth_desc = desc;
+    depth_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    ComPtr<ID3D12Resource> depth_resource;
+    ASSERT_HR(d3d12_device_->CreateCommittedResource(
+        &heap_props, D3D12_HEAP_FLAG_NONE, &depth_desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(depth_resource.GetForInit())));
+    depth_copy_tex_ = ComOwn(GpuTexture::InitFromResource(this, depth_resource));
+    depth_copy_tex_->SetName("depth_copy_tex");
   }
   // The camera of the frame before a Reset says nothing about the frame
   // after it -- a resolution change or device loss is a discontinuity.

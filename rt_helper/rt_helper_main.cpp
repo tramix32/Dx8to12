@@ -141,6 +141,15 @@ int RunDlaaHelper(const wchar_t* map_name) {
     hr = open_shared(shared->color_out_name, __uuidof(ID3D12Resource),
                      reinterpret_cast<void**>(color_out.GetAddressOf()));
   }
+  Microsoft::WRL::ComPtr<ID3D12Resource> depth_in, mvec_in;
+  if (SUCCEEDED(hr) && shared->depth_in_name[0]) {
+    hr = open_shared(shared->depth_in_name, __uuidof(ID3D12Resource),
+                     reinterpret_cast<void**>(depth_in.GetAddressOf()));
+  }
+  if (SUCCEEDED(hr) && shared->mvec_in_name[0]) {
+    hr = open_shared(shared->mvec_in_name, __uuidof(ID3D12Resource),
+                     reinterpret_cast<void**>(mvec_in.GetAddressOf()));
+  }
   if (SUCCEEDED(hr)) {
     hr = open_shared(shared->ready_fence_name, __uuidof(ID3D12Fence),
                      reinterpret_cast<void**>(ready_fence.GetAddressOf()));
@@ -172,6 +181,25 @@ int RunDlaaHelper(const wchar_t* map_name) {
     return fail(Dx8to12::DlssIpc::HelperStatus::kDeviceCreateFailed, hr);
   }
   cmd_list->Close();
+
+  // Report what actually came through the shared handles. The loopback stage
+  // proves the transport only if this matches what x86 created -- a handle
+  // resolving to the wrong resource, or to the right one with a different
+  // format, is silent corruption rather than a failure.
+  const D3D12_RESOURCE_DESC color_in_desc = color_in->GetDesc();
+  shared->seen_color_in_width = static_cast<uint32_t>(color_in_desc.Width);
+  shared->seen_color_in_height = color_in_desc.Height;
+  shared->seen_color_in_format = static_cast<uint32_t>(color_in_desc.Format);
+  if (depth_in) {
+    const D3D12_RESOURCE_DESC depth_desc = depth_in->GetDesc();
+    shared->seen_depth_in_width = static_cast<uint32_t>(depth_desc.Width);
+    shared->seen_depth_in_format = static_cast<uint32_t>(depth_desc.Format);
+  }
+  if (mvec_in) {
+    const D3D12_RESOURCE_DESC mvec_desc = mvec_in->GetDesc();
+    shared->seen_mvec_in_width = static_cast<uint32_t>(mvec_desc.Width);
+    shared->seen_mvec_in_format = static_cast<uint32_t>(mvec_desc.Format);
+  }
 
   shared->status = static_cast<uint32_t>(Dx8to12::DlssIpc::HelperStatus::kReady);
 

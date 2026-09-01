@@ -60,6 +60,8 @@ class DlssClient {
   // result comes back in. Both are x86-owned.
   GpuTexture *color_in() const { return color_in_.Get(); }
   GpuTexture *color_out() const { return color_out_.Get(); }
+  GpuTexture *depth_in() const { return depth_in_.Get(); }
+  GpuTexture *mvec_in() const { return mvec_in_.Get(); }
 
   // Records nothing itself. Call after the frame's copies into color_in have
   // been recorded and the command list submitted: signals the helper, waits
@@ -85,8 +87,12 @@ class DlssClient {
 
   ComPtr<GpuTexture> color_in_;
   ComPtr<GpuTexture> color_out_;
+  ComPtr<GpuTexture> depth_in_;
+  ComPtr<GpuTexture> mvec_in_;
   HANDLE color_in_handle_ = nullptr;
   HANDLE color_out_handle_ = nullptr;
+  HANDLE depth_in_handle_ = nullptr;
+  HANDLE mvec_in_handle_ = nullptr;
 
   ComPtr<ID3D12Fence> ready_fence_;
   ComPtr<ID3D12Fence> done_fence_;

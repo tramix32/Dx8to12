@@ -74,8 +74,24 @@ float2 ComputeMotion(float2 pixel_xy) {
   return (prev_uv - uv) * render_size;
 }
 
-float2 PSMain(VSOut input) : SV_Target {
-  return ComputeMotion(input.pos.xy);
+// Two targets, not one. The upscaler needs the depth buffer as well as the
+// motion vectors, but it lives in another process and cannot open a
+// depth-stencil resource as a plain readable texture -- and CopyResource
+// cannot convert D24_UNORM_S8 into anything it could. Emitting depth here as
+// a second render target converts it for free: the value is already being
+// read for the motion vector, so this costs one extra write and no extra pass.
+struct MotionVectorTargets {
+  float2 motion : SV_Target0;
+  float depth : SV_Target1;
+};
+
+MotionVectorTargets PSMain(VSOut input) {
+  MotionVectorTargets output;
+  output.motion = ComputeMotion(input.pos.xy);
+  // Raw device depth, not linearised: that is what DLSS expects, and
+  // linearising here would throw away precision it relies on.
+  output.depth = depth_tex.Load(int3((int2)input.pos.xy, 0));
+  return output;
 }
 
 // Debug visualisation, drawn over the scene instead of the motion buffer.

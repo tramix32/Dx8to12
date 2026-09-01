@@ -96,6 +96,19 @@ struct Handshake {
   int32_t last_hresult = 0;
   uint32_t failed_frames = 0;
   uint32_t shutdown_requested = 0;
+
+  // What the helper actually sees after opening each shared texture. Reported
+  // back so the loopback stage can prove the sharing worked rather than only
+  // that nothing crashed: a handle that opened but resolved to the wrong
+  // resource shows up here as the wrong size or format, and a mismatched
+  // format is silent corruption rather than an error.
+  uint32_t seen_color_in_width = 0;
+  uint32_t seen_color_in_height = 0;
+  uint32_t seen_color_in_format = 0;
+  uint32_t seen_depth_in_width = 0;
+  uint32_t seen_depth_in_format = 0;
+  uint32_t seen_mvec_in_width = 0;
+  uint32_t seen_mvec_in_format = 0;
 };
 
 }  // namespace Dx8to12::DlssIpc

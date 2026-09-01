@@ -802,6 +802,11 @@ class Device : public IDirect3DDevice8, RefCounted {
   // at scene resolution. Nothing samples it until DLAA is wired up; the
   // debug view is what makes it verifiable in the meantime.
   ComPtr<GpuTexture> motion_vector_tex_;
+  // Raw device depth, converted to a plain colour format by the same pass.
+  // The upscaler runs in another process, which cannot open the game's
+  // depth-stencil resource as a readable texture, and CopyResource cannot
+  // convert D24_UNORM_S8 into anything that would help.
+  ComPtr<GpuTexture> depth_copy_tex_;
   // A dedicated root signature and PSO, deliberately not the game's: the
   // main root signature is shaped around fixed-function stages (8 texture
   // tables, 8 sampler tables, five cbuffers) and this pass needs one CBV and
