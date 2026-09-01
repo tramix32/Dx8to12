@@ -88,7 +88,14 @@ default rather than `Release` so crashes stay symbolicatable.
 
 ## Tested Games
 
-Battlefield 1942™ and Age of Mythology™.
+Battlefield 1942™, Age of Mythology™ and Grand Theft Auto: Vice City™.
+
+Vice City is this fork's main test subject and the game DLAA was brought up
+against. Getting it running needed one non-obvious fix: it writes more index
+data than fits in its own static index buffers and then draws those indices,
+which the shim was clamping away — taking the trailing triangles of a material
+with it, so roads and buildings vanished in patches. `DX8TO12_PAD_BUFFERS`
+(on by default) is the fix.
 
 ## Why?
 

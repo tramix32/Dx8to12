@@ -14,7 +14,7 @@ documentation lives in `README.md` and `MODDING.md`; keep it that way.
 
 Dx8to12 implements the Direct3D 8 API (`d3d8.dll`) as a shim on top of Direct3D 12. It's a drop-in replacement DLL: a DX8 game loads `d3d8.dll`, calls `Direct3DCreate8` (the sole export, see `src/d3d8.def`), and every DX8 call gets translated into D3D12 command lists/resources under the hood.
 
-Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below. Also currently being tested against Grand Theft Auto: Vice City (not yet working — see plan/ROADMAP.md's real-game-feedback log).
+Games verified to run: Battlefield 1942, Age of Mythology, and Grand Theft Auto: Vice City. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below. Vice City is the game most of the recent work has been driven by (see plan/ROADMAP.md's real-game-feedback log) and the one DLAA was brought up against.
 
 ## Build
 
