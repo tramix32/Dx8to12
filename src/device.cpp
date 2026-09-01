@@ -5677,7 +5677,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitiveUP(
 
   // Allocate some ring buffer memory.
   // DIAGNOSTIC for the "whole font atlas stretched across the screen" glitch
-  // (see ROADMAP.md): 2D UI is drawn through this path as small
+  // (see plan/ROADMAP.md): 2D UI is drawn through this path as small
   // D3DFVF_XYZRHW quads whose vertices are already in screen coordinates, so
   // a text glyph should cover a few dozen pixels. When the glitch happens the
   // same draw covers the entire screen, which means its vertex data is wrong
@@ -5822,7 +5822,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitive(
   // nor DrawIndexedPrimitiveUP logged anything for the menu, so it draws from
   // a real vertex buffer through here. Records which texture each small quad
   // gets: the glitch under investigation shows the font atlas where another
-  // texture belongs (see ROADMAP.md), so comparing a clean dump against a
+  // texture belongs (see plan/ROADMAP.md), so comparing a clean dump against a
   // glitched one should show the same draw with a different texture bound.
   // No primCount filter: RenderWare batches many 2D sprites (whole strings of
   // text) into a single draw, so filtering for small quads excluded exactly
@@ -6572,7 +6572,7 @@ HRESULT STDMETHODCALLTYPE Device::DrawIndexedPrimitiveUP(
   // Same diagnostic as DrawPrimitiveUP, on the path RenderWare's 2D drawing
   // actually takes (RwIm2DRenderIndexedPrimitive lands here, not on the
   // non-indexed one). Reports the vertex data exactly as the game supplied
-  // it, before it's copied anywhere. See ROADMAP.md for the glitch this is
+  // it, before it's copied anywhere. See plan/ROADMAP.md for the glitch this is
   // chasing.
   if (VertexStreamZeroStride >= 2 * sizeof(float) && NumVertexIndices <= 64) {
     float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;

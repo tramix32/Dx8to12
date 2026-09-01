@@ -70,3 +70,6 @@ readings.txt
 *.app
 
 plan/
+# Internal planning, roadmaps and cross-agent handoff notes. Local only:
+# working documents, not something a reader of this repo needs.
+plan/

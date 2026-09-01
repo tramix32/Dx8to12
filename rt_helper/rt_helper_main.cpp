@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -1373,7 +1373,7 @@ int RunHandshake(const wchar_t* map_name, const wchar_t* ready_event_name,
 
 }  // namespace
 
-// D0 from DLSS_X64_HELPER_HANDOFF.md: report which NVIDIA features this
+// D0 from plan/DLSS_X64_HELPER_HANDOFF.md: report which NVIDIA features this
 // machine actually offers, and never let their absence stop the game.
 //
 // Deliberately a standalone mode rather than something wired into

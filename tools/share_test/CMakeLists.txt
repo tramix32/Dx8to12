@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.21)
 #
 # The question this answers -- can this machine sustain a full-resolution
 # Texture2D shared between an x86 and an x64 D3D12 device -- is the one that
-# decides whether the DLSS architecture in DLSS_X64_HELPER_HANDOFF.md is
+# decides whether the DLSS architecture in plan/DLSS_X64_HELPER_HANDOFF.md is
 # possible here at all. Earlier attempts at cross-process GPU resource sharing
 # in this project caused repeated NVIDIA device removals and a system hang
 # (see MODDING.md), so it is tested in isolation: no game, no d3d8.dll, no

@@ -2,11 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Planning documents are local-only
+
+`plan/` holds the roadmap and the cross-agent handoff notes. It is gitignored:
+those are working documents, not something a reader of this repo needs. Code
+comments and this file point at `plan/ROADMAP.md` and similar, so those
+references resolve in a working copy but not in a fresh clone. Public-facing
+documentation lives in `README.md` and `MODDING.md`; keep it that way.
+
 ## What this is
 
 Dx8to12 implements the Direct3D 8 API (`d3d8.dll`) as a shim on top of Direct3D 12. It's a drop-in replacement DLL: a DX8 game loads `d3d8.dll`, calls `Direct3DCreate8` (the sole export, see `src/d3d8.def`), and every DX8 call gets translated into D3D12 command lists/resources under the hood.
 
-Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below. Also currently being tested against Grand Theft Auto: Vice City (not yet working — see ROADMAP.md's real-game-feedback log).
+Games verified to run: Battlefield 1942 and Age of Mythology. The implementation targets "whatever these games actually call" rather than the full DX8 spec — see "Known gaps" below. Also currently being tested against Grand Theft Auto: Vice City (not yet working — see plan/ROADMAP.md's real-game-feedback log).
 
 ## Build
 
@@ -73,7 +81,7 @@ Use `build-x86/dist/` while actively working on this codebase (a real bug is muc
 |---|---|---|
 | `DX8TO12_ENABLE_VALIDATION` | ON | D3D12 debug layer + `TRACE_ENTRY` + full AixLog. Roughly halves FPS; turn off for anything but development. |
 | `DX8TO12_ENABLE_MINDEBUG` | OFF | Compact GTA VC-specific diagnostics through `WriteMindebugDiagnosticLine` instead of AixLog. Requires `ENABLE_VALIDATION=OFF`. |
-| `DX8TO12_PAD_BUFFERS` | **ON** | Over-allocates every vertex/index buffer and hides the pad from `GetDesc`. Fixes the "disappearing road/building" bug -- GTA VC writes past the end of its own static index buffers and the draw count was then clamped, dropping the trailing triangles. Turn OFF only to reproduce that bug. See `MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md`. |
+| `DX8TO12_PAD_BUFFERS` | **ON** | Over-allocates every vertex/index buffer and hides the pad from `GetDesc`. Fixes the "disappearing road/building" bug -- GTA VC writes past the end of its own static index buffers and the draw count was then clamped, dropping the trailing triangles. Turn OFF only to reproduce that bug. See `plan/MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md`. |
 | `DX8TO12_DRAW_STATE_CACHE` | OFF | Skips re-recording PSO/root/vertex-buffer bindings when nothing changed. Faster, but the only optimisation that skips *recording* commands -- read `kCacheDrawStateBindings` in `device_limits.h` first. |
 | `DX8TO12_TEMPORAL_JITTER` | OFF | Sub-pixel Halton offset on the projection. A temporal upscaler needs it; on its own it only makes the image shimmer. |
 | `DX8TO12_SCENE_TARGET` | OFF | Renders the scene into an offscreen colour target and copies it to the backbuffer before mod callbacks. Correct means **invisible**: any difference from a build without it is a bug. |
@@ -143,7 +151,7 @@ Every unimplemented DX8 method is marked with the `PURE`/`VIRT_NOT_IMPLEMENTED` 
 
 In `device.h`, `#define PURE VIRT_NOT_IMPLEMENTED` is active for the whole `IDirect3DDevice8` method block, then `#undef`'d and redefined to `= 0` afterward for the class's own abstract-ish private helpers. `NOT_IMPLEMENTED()` shows a message box and `abort()`s at runtime — it's a loud, file/line/function-tagged crash, not a silent no-op. When implementing a previously-stubbed method, change its trailing `PURE` to `override` and give it a body in the corresponding `.cpp`. This pattern is also used in `surface.h`, `texture.h`, and `buffer.h` for their respective interfaces.
 
-Known gap areas (see `ROADMAP.md` for the prioritized plan, and its running log of real-game-driven bugfixes): 7 of `IDirect3DDevice8`'s 100 methods remain unimplemented stubs (`ProcessVertices`, RT-patch methods, `CreateVolumeTexture`, `CreateAdditionalSwapChain`, `GetFrontBuffer` — see Phase 6). `SetClipPlane`/`GetClipPlane` and `SetPixelShaderConstant`/`GetPixelShaderConstant` are implemented as bookkeeping only: they store/return values correctly but don't affect rendering (no GPU-side clip planes; pixel shader constants aren't wired into the constant buffer `programmable_ps.hlsl` actually reads from — see the Phase 5 entry in ROADMAP.md for exactly what real wiring would require).
+Known gap areas (see `plan/ROADMAP.md` for the prioritized plan, and its running log of real-game-driven bugfixes): 7 of `IDirect3DDevice8`'s 100 methods remain unimplemented stubs (`ProcessVertices`, RT-patch methods, `CreateVolumeTexture`, `CreateAdditionalSwapChain`, `GetFrontBuffer` — see Phase 6). `SetClipPlane`/`GetClipPlane` and `SetPixelShaderConstant`/`GetPixelShaderConstant` are implemented as bookkeeping only: they store/return values correctly but don't affect rendering (no GPU-side clip planes; pixel shader constants aren't wired into the constant buffer `programmable_ps.hlsl` actually reads from — see the Phase 5 entry in plan/ROADMAP.md for exactly what real wiring would require).
 
 `IDirect3DSurface8::LockRect`/`UnlockRect` now work on all three surface kinds (`GpuSurface`, `CpuSurface`, `BackbufferSurface`). `GpuSurface` on a `D3DPOOL_MANAGED` texture delegates to the texture's own `LockRect`; on `D3DPOOL_DEFAULT` (lockable render targets) and on `BackbufferSurface`, `BaseSurface::LockGpuReadback`/`UnlockGpuReadback` (`surface.cpp`) do a real GPU→CPU readback: create a `D3D12_HEAP_TYPE_READBACK` buffer sized from `BaseTexture::GetFootprint`, `CopyTextureRegion` into it, then call `Device::SubmitAndWait(false)` to flush and block until the GPU copy is done before mapping — this is the same "flush mid-frame and keep going" pattern `Device::WaitForFrame` already relies on, not new fence machinery.
 

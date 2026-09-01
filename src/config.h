@@ -21,7 +21,7 @@ struct Config {
 
   // MSAA sample count for the backbuffer/render targets. 1 = disabled.
   // Valid: 1, 2, 4, 8. NOT YET IMPLEMENTED -- CreatePSO/swap chain creation
-  // don't consume this yet (see ROADMAP.md); reserved so the INI/API surface
+  // don't consume this yet (see plan/ROADMAP.md); reserved so the INI/API surface
   // is stable once it is.
   int msaa_samples = 1;
 
@@ -30,7 +30,7 @@ struct Config {
   float sharpen_strength = 0.0f;
 
   // NOT YET IMPLEMENTED -- reserved for a future higher-precision
-  // depth-stencil format switch (see the D3DRS_ZBIAS gap in ROADMAP.md).
+  // depth-stencil format switch (see the D3DRS_ZBIAS gap in plan/ROADMAP.md).
   bool high_precision_depth = false;
 
   // Lowers the log file's sink severity threshold from Severity::info to

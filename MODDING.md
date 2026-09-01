@@ -292,7 +292,7 @@ this over a third-party FPS overlay: overlays that work by hooking
 `Present`/`ExecuteCommandLists` (RivaTuner/MSI Afterburner, and similar) do
 not reliably interoperate with this shim's hand-rolled D3D12 usage, and have
 been observed both misreporting the framerate and rendering corrupted
-overlay elements on top of the game (see ROADMAP.md). Reading the number
+overlay elements on top of the game. Reading the number
 here and drawing it from your own render callback avoids that entirely.
 
 **Render callback contract**: once registered, your callback is invoked once

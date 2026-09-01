@@ -15,7 +15,7 @@ option(DX8TO12_KEEP_TARGET_LOD "Keep the diagnosed near-road model permanently f
 # session) and then draws those indices; without the pad, DrawIndexedPrimitive
 # clamps the count and silently drops the trailing triangles of a material --
 # the "disappearing road/building" bug. Turn OFF only to reproduce that bug for
-# an A/B. See MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md.
+# an A/B.
 option(DX8TO12_PAD_BUFFERS "Over-allocate vertex/index buffers so the game's writes and draws past their declared end stay in valid memory instead of being clamped away" ON)
 option(DX8TO12_DRAW_STATE_CACHE "Skip re-recording PSO/root/vertex-buffer bindings when nothing they depend on changed (faster; see kCacheDrawStateBindings in device_limits.h before enabling)" OFF)
 # The four below are ON by default, unlike every other option here, because

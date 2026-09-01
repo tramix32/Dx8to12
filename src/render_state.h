@@ -89,7 +89,7 @@ struct RenderState {
   D3DBLENDOP blend_op = D3DBLENDOP_ADD;
 
   // The rest of these have no effect on rendering (bookkeeping only, to
-  // avoid aborting on Set/GetRenderState) -- see ROADMAP.md.
+  // avoid aborting on Set/GetRenderState) -- see plan/ROADMAP.md.
   BOOL clipping = TRUE;
   DWORD clip_plane_enable = 0;
   BOOL last_pixel = TRUE;

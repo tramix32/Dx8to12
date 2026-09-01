@@ -239,7 +239,7 @@ __declspec(dllexport) int __cdecl Dx8to12_GetNumBackBuffers() {
 //
 // Provided because third-party overlays that hook Present/ExecuteCommandLists
 // don't reliably interoperate with this shim's hand-rolled D3D12 usage (see
-// ROADMAP.md), so a mod wanting a trustworthy framerate should read it from
+// plan/ROADMAP.md), so a mod wanting a trustworthy framerate should read it from
 // here rather than from such an overlay. Divide 1000 by this for FPS.
 __declspec(dllexport) double __cdecl Dx8to12_GetLastFrameMs() {
   ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();

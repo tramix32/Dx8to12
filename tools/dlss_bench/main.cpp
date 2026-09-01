@@ -1,7 +1,7 @@
 // What does a DLSS evaluate cost at 2560x1440 on this GPU?
 //
 // That is the one number missing from the DLSS feasibility budget in
-// DLSS_X64_HELPER_HANDOFF.md. The cross-process transport was already
+// plan/DLSS_X64_HELPER_HANDOFF.md. The cross-process transport was already
 // measured (tools/share_test), so this deliberately leaves IPC out and runs
 // DLSS against locally created textures.
 //

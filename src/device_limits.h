@@ -91,7 +91,7 @@ static constexpr bool kPersistentBufferMapping = true;
 // Was disabled to isolate the Vice City near-field texture disappearance.
 // That investigation is now closed and the cause was unrelated -- the game
 // writes past its own static index buffers and the draw's index count was
-// being clamped (see MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md and
+// being clamped (see plan/MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md and
 // DX8TO12_PAD_BUFFERS) -- so nothing about that bug argues for keeping the
 // per-draw rebinds. Re-enabling is still opt-in rather than flipped outright:
 // it is the one optimisation that skips *recording* commands, so a mistake

@@ -164,7 +164,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   // natively through the real D3D12 device/command queue/command list this
   // API also exposes, rather than needing a D3D9 (or other) compatibility
   // shim underneath -- see the GrinchTrainerVC.asi investigation in
-  // ROADMAP.md for why that alternative is a much larger undertaking.
+  // plan/ROADMAP.md for why that alternative is a much larger undertaking.
   using ModRenderCallback = void(__cdecl *)(void *command_list);
   void RegisterModRenderCallback(ModRenderCallback callback);
   void UnregisterModRenderCallback(ModRenderCallback callback);
