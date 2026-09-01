@@ -22,6 +22,10 @@ constexpr DWORD kFrameWaitTimeoutMs = 40;
 // of frame time, so a helper that is merely gone would otherwise cap the game
 // at 25 fps forever.
 constexpr uint32_t kMaxConsecutiveTimeouts = 8;
+// How long the helper gets to open its shared resources and say so. Creating
+// a D3D12 device and opening four shared handles is fast; this is generous
+// enough to survive a first-run driver shader-cache stall.
+constexpr ULONGLONG kStartupTimeoutMs = 10000;
 
 std::wstring UniqueName(const wchar_t *suffix) {
   return std::wstring(L"Local\\Dx8to12_dlss_") + std::to_wstring(GetCurrentProcessId()) +
@@ -186,6 +190,7 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   pending_history_reset_ = true;
   frame_index_ = 0;
   consecutive_timeouts_ = 0;
+  start_tick_ = GetTickCount64();
   LOG(AixLog::Severity::info)
       << "DLSS: helper launched for " << width << "x" << height << ", mode "
       << static_cast<uint32_t>(mode) << ".\n";
@@ -240,27 +245,52 @@ void DlssClient::Stop() {
   healthy_ = false;
 }
 
-bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
-                                    bool reset_history) {
+bool DlssClient::PollReady() {
   if (!shared_ || !healthy_) return false;
+  if (ready_) return true;
 
-  // The helper reports itself ready once it has opened everything; until then
-  // there is nothing to hand a frame to.
-  if (!ready_) {
-    const auto status = static_cast<DlssIpc::HelperStatus>(shared_->status);
-    if (status == DlssIpc::HelperStatus::kReady) {
-      ready_ = true;
-      LOG(AixLog::Severity::info) << "DLSS: helper reported ready.\n";
-    } else if (status != DlssIpc::HelperStatus::kStarting) {
-      LOG(AixLog::Severity::error)
-          << "DLSS: helper failed to start, status " << shared_->status
-          << " hr=0x" << std::hex << shared_->hresult << std::dec
-          << " -- carrying on without it.\n";
-      healthy_ = false;
-      return false;
-    }
+  const auto status = static_cast<DlssIpc::HelperStatus>(shared_->status);
+  if (status == DlssIpc::HelperStatus::kReady) {
+    ready_ = true;
+    LOG(AixLog::Severity::info) << "DLSS: helper reported ready.\n";
+    return true;
+  }
+  if (status != DlssIpc::HelperStatus::kStarting) {
+    LOG(AixLog::Severity::error)
+        << "DLSS: helper failed to start, status " << shared_->status
+        << " hr=0x" << std::hex << shared_->hresult << std::dec
+        << " -- carrying on without it.\n";
+    healthy_ = false;
     return false;
   }
+
+  // Still "starting". Two ways that can be a lie, and both used to be
+  // invisible: the process died before it could write a status at all (a
+  // missing DLL exits at load time, which is how tools/share_test once hung),
+  // or it is alive and simply never getting there.
+  if (helper_process_.hProcess &&
+      WaitForSingleObject(helper_process_.hProcess, 0) == WAIT_OBJECT_0) {
+    DWORD exit_code = 0;
+    GetExitCodeProcess(helper_process_.hProcess, &exit_code);
+    LOG(AixLog::Severity::error)
+        << "DLSS: helper exited during startup with code 0x" << std::hex
+        << exit_code << std::dec << " -- carrying on without it.\n";
+    healthy_ = false;
+    return false;
+  }
+  if (GetTickCount64() - start_tick_ > kStartupTimeoutMs) {
+    LOG(AixLog::Severity::error)
+        << "DLSS: helper still had not reported ready after "
+        << kStartupTimeoutMs << "ms -- carrying on without it.\n";
+    healthy_ = false;
+    return false;
+  }
+  return false;
+}
+
+bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
+                                    bool reset_history) {
+  if (!shared_ || !healthy_ || !ready_) return false;
 
   ++frame_index_;
   shared_->jitter_x = jitter_x;

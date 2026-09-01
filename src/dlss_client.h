@@ -44,8 +44,13 @@ class DlssClient {
   bool Start(uint32_t width, uint32_t height, DlssIpc::Mode mode);
   void Stop();
 
-  // True once the helper has reported itself ready. Until then every frame
-  // takes the ordinary path.
+  // Advances the startup state machine and returns whether the helper is
+  // ready to be handed a frame. Must be called every presented frame, and
+  // must NOT be gated on ready(): it is what makes ready() ever become true,
+  // and it is also what notices a helper that started and then died.
+  bool PollReady();
+
+  // Last value PollReady computed. Only meaningful after it has been called.
   bool ready() const { return ready_; }
   // Turns false permanently once the helper has failed or timed out often
   // enough that waiting on it is costing more than it returns.
@@ -91,6 +96,9 @@ class DlssClient {
 
   uint64_t frame_index_ = 0;
   uint32_t consecutive_timeouts_ = 0;
+  // When Start() launched the helper, so a helper that never reports ready
+  // is eventually given up on instead of being polled forever.
+  ULONGLONG start_tick_ = 0;
   bool pending_history_reset_ = true;
   uint32_t width_ = 0;
   uint32_t height_ = 0;

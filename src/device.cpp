@@ -20,6 +20,7 @@
 #include "aixlog.hpp"
 #include "buffer.h"
 #include "config.h"
+#include "dlss_client.h"
 #include "dynamic_ring_buffer.h"
 #include "raytracing.h"
 #include "rt_helper_client.h"
@@ -1874,6 +1875,87 @@ void Device::RecordMotionVectorPass() {
   has_prev_view_proj_ = true;
 }
 #endif  // DX8TO12_MOTION_VECTORS
+
+void Device::FlushCommandListNoFence() {
+  ASSERT_HR(cmd_list_->Close());
+  ID3D12CommandList *lists[] = {cmd_list_.Get()};
+  cmd_queue_->ExecuteCommandLists(1, lists);
+  // Deliberately NOT cmd_allocators_[...]->Reset(): that allocator still
+  // backs the commands just submitted, which the GPU has not finished. A
+  // command list, unlike its allocator, may be reset the moment it has been
+  // submitted, and several lists may share one allocator in sequence.
+  ASSERT_HR(cmd_list_->Reset(cmd_allocators_[current_back_buffer_].get(),
+                             nullptr));
+  // A freshly reset list has no descriptor heaps bound -- the same hazard
+  // SubmitAndWait documents at length after its own reset.
+  ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
+  cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
+  dirty_flags_ |= DIRTY_FLAG_ALL_RESOURCES;
+  dirty_flags_ |= DIRTY_FLAG_OM;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
+  last_prim_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  root_sig_bound_ = false;
+  last_set_pso_ = nullptr;
+  last_stencil_ref_ = -1;
+  dirty_texture_stage_mask_ = 0xFF;
+  dirty_sampler_stage_mask_ = 0xFF;
+  last_vbuffer_view_count_ = 0;
+}
+
+#ifdef DX8TO12_SCENE_TARGET
+void Device::RunDlaaExchange() {
+  GpuTexture *color_in = dlss_client_->color_in();
+  GpuTexture *color_out = dlss_client_->color_out();
+  GpuTexture *backbuffer = back_buffers_.at(current_back_buffer_).Get();
+  if (!color_in || !color_out || !scene_color_tex_) {
+    ResolveScenePass();
+    return;
+  }
+
+  // Hand the scene over exactly as rendered.
+  TransitionTexture(scene_color_tex_.Get(), 0,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TransitionTexture(color_in, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+  cmd_list_->CopyResource(color_in->resource(), scene_color_tex_->resource());
+  // Back to COMMON before the helper touches it: the helper's own barriers
+  // assume COMMON, and cross-process state has no shared tracker to consult.
+  TransitionTexture(color_in, 0, D3D12_RESOURCE_STATE_COMMON);
+
+  // The copy has to have executed before the helper is told the frame is
+  // ready, so submit here rather than at the end of the frame.
+  FlushCommandListNoFence();
+
+  const bool got_result = dlss_client_->SubmitFrameAndWait(
+#ifdef DX8TO12_TEMPORAL_JITTER
+      jitter_pixels_.x, jitter_pixels_.y,
+#else
+      0.f, 0.f,
+#endif
+      /*reset_history=*/false);
+
+  scene_pass_active_ = false;
+  if (!got_result) {
+    // Not an error worth stopping for: the scene is still in the scene
+    // target, so present it exactly as a build without DLAA would.
+    TransitionTexture(scene_color_tex_.Get(), 0,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+    TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd_list_->CopyResource(backbuffer->resource(),
+                            scene_color_tex_->resource());
+    dirty_flags_ |= DIRTY_FLAG_OM;
+    dirty_flags_ |= DIRTY_FLAG_PSO;
+    return;
+  }
+
+  TransitionTexture(color_out, 0, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+  cmd_list_->CopyResource(backbuffer->resource(), color_out->resource());
+  // Leave it as the helper expects to find it next frame.
+  TransitionTexture(color_out, 0, D3D12_RESOURCE_STATE_COMMON);
+  dirty_flags_ |= DIRTY_FLAG_OM;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
+}
+#endif
 
 GpuTexture *Device::CurrentColorTarget() {
   // A game-set render target always wins: that is the game explicitly drawing
@@ -6580,6 +6662,37 @@ void Device::SubmitAndWait(bool should_present) {
     RecordMotionVectorPass();
 #endif
 #ifdef DX8TO12_SCENE_TARGET
+    {
+      // Start, restart or stop the helper purely from the setting, so
+      // toggling TemporalAA at runtime works without a device Reset. A
+      // resolution change restarts it too -- the shared textures are sized
+      // once, at Start.
+      const int mode = GetConfig().temporal_aa;
+      const auto &backbuffer_desc =
+          back_buffers_.at(current_back_buffer_)->resource_desc();
+      const uint32_t width = static_cast<uint32_t>(backbuffer_desc.Width);
+      const uint32_t height = backbuffer_desc.Height;
+      if (mode != dlss_started_mode_ || width != dlss_started_width_ ||
+          height != dlss_started_height_) {
+        if (dlss_client_) dlss_client_->Stop();
+        dlss_started_mode_ = mode;
+        dlss_started_width_ = width;
+        dlss_started_height_ = height;
+        if (mode != 0) {
+          if (!dlss_client_) dlss_client_ = std::make_unique<DlssClient>(this);
+          // Stage D1: the helper implements loopback only. Requesting DLAA or
+          // DLSS gets the transport exercised end to end and an unchanged
+          // image -- deliberately, so the transport can be proven before
+          // Streamline is in the picture to be blamed.
+          LOG(AixLog::Severity::info)
+              << "DLSS: TemporalAA=" << mode
+              << " requested; running the helper in loopback (stage D1).\n";
+          dlss_client_->Start(width, height, DlssIpc::Mode::kLoopback);
+        }
+      }
+    }
+#endif
+#ifdef DX8TO12_SCENE_TARGET
     // Everything from here on -- mod callbacks, HUD overlays, the PRESENT
     // transition -- must see the real backbuffer, exactly as it did before
     // the scene target existed. MODDING.md promises mods the backbuffer, in
@@ -6591,7 +6704,16 @@ void Device::SubmitAndWait(bool should_present) {
     // in COPY_DEST with no RTV bound, and ResolveScenePass sets
     // DIRTY_FLAG_OM so that BeginScene unconditionally rebinds it as a
     // render target.
-    ResolveScenePass();
+    // PollReady, not ready(): it is what advances the startup state machine
+    // and what notices a helper that died. Gating it on ready() made the
+    // check unreachable -- the helper launched, never reported ready, and
+    // nothing ever said so, because the code that would have noticed only
+    // ran once it already had.
+    if (scene_pass_active_ && dlss_client_ && dlss_client_->PollReady()) {
+      RunDlaaExchange();
+    } else {
+      ResolveScenePass();
+    }
 #endif
     if (dirty_flags_ & DIRTY_FLAG_OM) {
       BeginScene();
@@ -6727,24 +6849,6 @@ void Device::SubmitAndWait(bool should_present) {
   // survives into the next session -- the INI and the mod API are two doors
   // onto one state. Rate-limited inside, and a no-op when nothing changed.
   if (should_present) FlushConfigIfDirty(/*force=*/false);
-
-#ifdef DX8TO12_ENABLE_VALIDATION
-  // TEMPORARY SELF-TEST -- remove once a real mod has exercised this.
-  // Nothing in this repo changes a setting at runtime, so the INI write-back
-  // path would otherwise ship having only ever been compiled, never run.
-  // Stands in for a mod's settings menu: flips one setting a few seconds in.
-  if (should_present) {
-    static int config_selftest_frames = 0;
-    if (++config_selftest_frames == 600) {
-      bool jitter = false;
-      GetConfigValueBool("TemporalJitter", &jitter);
-      SetConfigValueBool("TemporalJitter", !jitter);
-      LOG(AixLog::Severity::error)
-          << "CONFIG-SELFTEST flipped TemporalJitter " << jitter << " -> "
-          << !jitter << "; dx8to12.ini should now contain it.\n";
-    }
-  }
-#endif
 
   // Update our back buffer index.
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();

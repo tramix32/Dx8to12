@@ -75,6 +75,7 @@ class DynamicRingBuffer;
 class GpuTexture;
 class RaytracingScene;
 class RtHelperClient;
+class DlssClient;
 
 class Device : public IDirect3DDevice8, RefCounted {
  public:
@@ -837,6 +838,29 @@ class Device : public IDirect3DDevice8, RefCounted {
   // clears a render target must use this rather than repeating the choice,
   // otherwise the scene pass and the PSO's declared format drift apart.
   GpuTexture *CurrentColorTarget();
+
+  // Executes whatever is recorded so far and reopens the command list, with
+  // none of SubmitAndWait's frame bookkeeping -- no fence, no Present, no
+  // frame-resource release, no allocator reset (the allocator still backs
+  // work the GPU may be running; only the *list* is reusable once submitted).
+  //
+  // Exists because the DLAA exchange has to get its copies onto the GPU
+  // mid-frame and then record more. Calling SubmitAndWait(false) from inside
+  // SubmitAndWait(true) would do that too, but by re-entering the code that
+  // advances fence values and frees frame resources.
+  void FlushCommandListNoFence();
+
+  // Hands the finished scene to the x64 helper and copies the result onto the
+  // backbuffer, replacing ResolveScenePass for the frame. Falls back to the
+  // ordinary resolve -- and says so -- whenever the helper is not there, not
+  // ready, or too slow.
+  void RunDlaaExchange();
+  std::unique_ptr<DlssClient> dlss_client_;
+  // What the DlssClient was last started for, so a resolution change or a
+  // mode switch restarts it and nothing else does.
+  uint32_t dlss_started_width_ = 0;
+  uint32_t dlss_started_height_ = 0;
+  int dlss_started_mode_ = -1;
 
 #ifdef DX8TO12_TEMPORAL_JITTER
   // Sub-pixel camera offset for the current frame, in pixels, each component
