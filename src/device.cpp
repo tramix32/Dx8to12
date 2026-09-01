@@ -1712,6 +1712,17 @@ void Device::CaptureFrameCamera() {
   float matrix[16];
   if (!GetViewProjMatrix(matrix)) return;
   memcpy(&frame_view_proj_, matrix, sizeof(frame_view_proj_));
+  // The view and projection separately too: sl::Constants wants the
+  // projection on its own, and the camera's position and axes come from the
+  // view matrix. Neither survives the product.
+  auto transform_or_identity = [this](D3DTRANSFORMSTATETYPE state) {
+    DirectX::SimpleMath::Matrix result;
+    const auto it = transforms_.find(state);
+    if (it != transforms_.end()) memcpy(&result, &it->second, sizeof(result));
+    return result;
+  };
+  frame_view_ = transform_or_identity(D3DTS_VIEW);
+  frame_proj_ = transform_or_identity(D3DTS_PROJECTION);
   frame_view_proj_captured_ = true;
 }
 
@@ -1948,6 +1959,59 @@ void Device::RunDlaaExchange() {
   // ready, so submit here rather than at the end of the frame.
   FlushCommandListNoFence();
 
+#ifdef DX8TO12_MOTION_VECTORS
+  {
+    // Everything sl::Constants wants about the camera. Derived here because
+    // this is the only side that has the game's matrices at all.
+    DlssCameraConstants constants;
+    DirectX::SimpleMath::Matrix inv_proj, inv_view, inv_view_proj,
+        inv_prev_view_proj;
+    frame_proj_.Invert(inv_proj);
+    frame_view_.Invert(inv_view);
+    frame_view_proj_.Invert(inv_view_proj);
+    prev_view_proj_.Invert(inv_prev_view_proj);
+    const DirectX::SimpleMath::Matrix clip_to_prev =
+        inv_view_proj * prev_view_proj_;
+    const DirectX::SimpleMath::Matrix prev_to_clip =
+        inv_prev_view_proj * frame_view_proj_;
+    memcpy(constants.view_to_clip, &frame_proj_, sizeof(constants.view_to_clip));
+    memcpy(constants.clip_to_view, &inv_proj, sizeof(constants.clip_to_view));
+    memcpy(constants.clip_to_prev_clip, &clip_to_prev,
+           sizeof(constants.clip_to_prev_clip));
+    memcpy(constants.prev_clip_to_clip, &prev_to_clip,
+           sizeof(constants.prev_clip_to_clip));
+    // Rows of the inverse view matrix are the camera's own axes and position.
+    for (int i = 0; i < 3; ++i) {
+      constants.right[i] = inv_view.m[0][i];
+      constants.up[i] = inv_view.m[1][i];
+      constants.fwd[i] = inv_view.m[2][i];
+      constants.pos[i] = inv_view.m[3][i];
+    }
+    // Recovered from the projection rather than guessed: D3D8 never tells us
+    // the near/far planes or the field of view directly, but a standard
+    // perspective projection encodes all of them.
+    const float m00 = frame_proj_.m[0][0];
+    const float m11 = frame_proj_.m[1][1];
+    const float m22 = frame_proj_.m[2][2];
+    const float m32 = frame_proj_.m[3][2];
+    constants.fov = m11 != 0.f ? 2.f * std::atan(1.f / m11) : 1.f;
+    constants.aspect = m00 != 0.f ? m11 / m00 : 1.f;
+    constants.near_plane = m22 != 0.f ? -m32 / m22 : 0.1f;
+    constants.far_plane = (m22 - 1.f) != 0.f
+                              ? m22 * constants.near_plane / (m22 - 1.f)
+                              : 1000.f;
+    // The motion vector pass writes pixels of the render target; DLSS wants
+    // them normalised. If DLAA ghosts or over-sharpens in motion, this scale
+    // (or its sign) is the first thing to suspect -- it is the one part of
+    // the constants that cannot be derived, only matched to a convention.
+    const uint32_t width =
+        static_cast<uint32_t>(motion_vector_tex_->resource_desc().Width);
+    const uint32_t height = motion_vector_tex_->resource_desc().Height;
+    constants.mvec_scale[0] = width ? 1.f / static_cast<float>(width) : 1.f;
+    constants.mvec_scale[1] = height ? 1.f / static_cast<float>(height) : 1.f;
+    dlss_client_->SetCameraConstants(constants);
+  }
+#endif
   dlss_client_->SubmitFrame(
 #ifdef DX8TO12_TEMPORAL_JITTER
       jitter_pixels_.x, jitter_pixels_.y,
@@ -6724,14 +6788,12 @@ void Device::SubmitAndWait(bool should_present) {
         dlss_started_height_ = height;
         if (mode != 0) {
           if (!dlss_client_) dlss_client_ = std::make_unique<DlssClient>(this);
-          // Stage D1: the helper implements loopback only. Requesting DLAA or
-          // DLSS gets the transport exercised end to end and an unchanged
-          // image -- deliberately, so the transport can be proven before
-          // Streamline is in the picture to be blamed.
+          const DlssIpc::Mode helper_mode = mode == 2 ? DlssIpc::Mode::kDlss
+                                                      : DlssIpc::Mode::kDlaa;
           LOG(AixLog::Severity::info)
-              << "DLSS: TemporalAA=" << mode
-              << " requested; running the helper in loopback (stage D1).\n";
-          dlss_client_->Start(width, height, DlssIpc::Mode::kLoopback);
+              << "DLSS: starting helper, TemporalAA=" << mode << " -> mode "
+              << static_cast<uint32_t>(helper_mode) << ".\n";
+          dlss_client_->Start(width, height, helper_mode);
         }
       }
     }

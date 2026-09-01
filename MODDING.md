@@ -58,11 +58,18 @@ HighPrecisionDepth=false
 LightingMode=0
 
 [TemporalAA]
-; Temporal anti-aliasing / upscaling:
+; Temporal anti-aliasing / upscaling. Needs an NVIDIA RTX GPU and the files
+; dx8to12_dlaa_helper.exe + sl.*.dll + nvngx_dlss.dll next to d3d8.dll; with
+; any of them missing the game runs exactly as if this were 0, and says so in
+; log.txt.
 ;   0 = Off
-;   1 = DLAA -- native-resolution temporal AA. NOT YET IMPLEMENTED.
-;   2 = DLSS -- renders below output resolution and upscales.
-;               NOT YET IMPLEMENTED.
+;   1 = DLAA -- native-resolution temporal AA. Working.
+;   2 = DLSS -- accepted, but currently behaves as DLAA: the scene is still
+;               rendered at output resolution, so there is nothing to upscale
+;               from yet.
+; Objects that move independently of the camera (cars, pedestrians) ghost
+; slightly: the motion vectors are reconstructed from depth and describe
+; camera movement only.
 ; Turning this on also turns on TemporalJitter and MotionVectors: a temporal
 ; upscaler without both does not degrade gracefully, it produces a blurred,
 ; ghosting image that looks like a bug in the upscaler rather than a missing

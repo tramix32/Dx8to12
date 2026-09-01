@@ -16,6 +16,25 @@ namespace Dx8to12 {
 class Device;
 class GpuTexture;
 
+// Everything sl::Constants needs about the camera, computed on this side --
+// the only side that has the game's matrices. Plain floats, row-vector
+// convention (v * M) like the rest of this codebase and like D3D8.
+struct DlssCameraConstants {
+  float view_to_clip[16] = {};
+  float clip_to_view[16] = {};
+  float clip_to_prev_clip[16] = {};
+  float prev_clip_to_clip[16] = {};
+  float pos[3] = {};
+  float right[3] = {};
+  float up[3] = {};
+  float fwd[3] = {};
+  float near_plane = 0.f;
+  float far_plane = 0.f;
+  float fov = 0.f;
+  float aspect = 0.f;
+  float mvec_scale[2] = {};
+};
+
 // Drives the x64 DLAA/DLSS helper process.
 //
 // Kept separate from RtHelperClient on purpose. The two start for different
@@ -68,6 +87,10 @@ class DlssClient {
   // write slot have been recorded *and the command list submitted*, so the
   // fence this signals lands after them. Returns immediately -- the helper
   // works on this frame while the game gets on with the next one.
+  // Call before SubmitFrame. Separate from it because the caller computes
+  // these from matrices this class has no business knowing about.
+  void SetCameraConstants(const DlssCameraConstants &constants);
+
   bool SubmitFrame(float jitter_x, float jitter_y, bool reset_history);
 
   // The finished result of the *previous* frame, or nullptr if the helper has

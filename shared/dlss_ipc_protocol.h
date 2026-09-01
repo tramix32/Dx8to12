@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 2;
+inline constexpr uint32_t kVersion = 3;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -98,6 +98,30 @@ struct Handshake {
   // has to be told this or it cannot tell jitter apart from motion.
   float jitter_x = 0.f;
   float jitter_y = 0.f;
+
+  // Camera state for sl::Constants. Computed on the x86 side, which is the
+  // only side that has the game's matrices, and passed as plain floats so the
+  // x86/x64 boundary does not depend on any matrix type's ABI.
+  //
+  // All row-vector (v * M), matching D3D8 and the rest of this codebase.
+  float camera_view_to_clip[16] = {};
+  float clip_to_camera_view[16] = {};
+  // Where a point at this frame's clip position was in the previous frame's
+  // clip space. This, not the raw matrices, is what the upscaler reprojects
+  // history with.
+  float clip_to_prev_clip[16] = {};
+  float prev_clip_to_clip[16] = {};
+  float camera_pos[3] = {};
+  float camera_right[3] = {};
+  float camera_up[3] = {};
+  float camera_fwd[3] = {};
+  float camera_near = 0.f;
+  float camera_far = 0.f;
+  float camera_fov = 0.f;  // vertical, radians
+  float camera_aspect = 0.f;
+  // Converts the motion vectors from the units they are written in (pixels of
+  // the render target) to the normalised units DLSS expects.
+  float mvec_scale[2] = {};
 
   uint32_t mode = static_cast<uint32_t>(Mode::kLoopback);
   // 1 = discard temporal history. Set on the first frame, after a device

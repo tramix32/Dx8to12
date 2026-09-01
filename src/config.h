@@ -71,9 +71,13 @@ struct Config {
   // at all; with it compiled in, these decide whether it runs.
 
   //   0 = Off
-  //   1 = DLAA  -- native-resolution temporal AA. NOT YET IMPLEMENTED.
-  //   2 = DLSS  -- renders below output resolution and upscales.
-  //               NOT YET IMPLEMENTED.
+  //   1 = DLAA  -- native-resolution temporal AA. Working.
+  //   2 = DLSS  -- accepted, but currently behaves as DLAA: the scene is
+  //               still rendered at output resolution, so there is nothing to
+  //               upscale from. Rendering below output resolution is a
+  //               separate piece of work (the viewport is currently one
+  //               global value mixing "what the game set" with "what D3D12
+  //               gets"), which is why this is not simply a mode switch.
   // Turning this on implies temporal_jitter and motion_vectors: a temporal
   // upscaler is wrong without both, so enabling it enables them.
   int temporal_aa = 0;

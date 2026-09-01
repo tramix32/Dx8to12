@@ -825,6 +825,11 @@ class Device : public IDirect3DDevice8, RefCounted {
   // the HUD's, not the camera's.
   DirectX::SimpleMath::Matrix frame_view_proj_ = {};
   DirectX::SimpleMath::Matrix prev_view_proj_ = {};
+  // Kept separately as well as combined: the upscaler wants the projection on
+  // its own (and the camera's own axes, which only the view matrix has), and
+  // neither can be recovered from the product.
+  DirectX::SimpleMath::Matrix frame_view_ = {};
+  DirectX::SimpleMath::Matrix frame_proj_ = {};
   bool frame_view_proj_captured_ = false;
   bool has_prev_view_proj_ = false;
 #ifdef DX8TO12_ENABLE_VALIDATION

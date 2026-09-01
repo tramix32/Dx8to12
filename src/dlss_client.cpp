@@ -48,7 +48,9 @@ std::wstring HelperPath() {
   std::wstring result(path, len);
   const size_t slash = result.find_last_of(L"\\/");
   result = (slash == std::wstring::npos ? L"" : result.substr(0, slash + 1));
-  return result + L"dx8to12_rt_helper.exe";
+  // Not dx8to12_rt_helper.exe: DLAA needs a binary that links Streamline's
+  // interposer, which the RT helper deliberately does not.
+  return result + L"dx8to12_dlaa_helper.exe";
 }
 
 }  // namespace
@@ -345,6 +347,28 @@ bool DlssClient::PollReady() {
     return false;
   }
   return false;
+}
+
+void DlssClient::SetCameraConstants(const DlssCameraConstants &constants) {
+  if (!shared_) return;
+  memcpy(shared_->camera_view_to_clip, constants.view_to_clip,
+         sizeof(shared_->camera_view_to_clip));
+  memcpy(shared_->clip_to_camera_view, constants.clip_to_view,
+         sizeof(shared_->clip_to_camera_view));
+  memcpy(shared_->clip_to_prev_clip, constants.clip_to_prev_clip,
+         sizeof(shared_->clip_to_prev_clip));
+  memcpy(shared_->prev_clip_to_clip, constants.prev_clip_to_clip,
+         sizeof(shared_->prev_clip_to_clip));
+  memcpy(shared_->camera_pos, constants.pos, sizeof(shared_->camera_pos));
+  memcpy(shared_->camera_right, constants.right, sizeof(shared_->camera_right));
+  memcpy(shared_->camera_up, constants.up, sizeof(shared_->camera_up));
+  memcpy(shared_->camera_fwd, constants.fwd, sizeof(shared_->camera_fwd));
+  shared_->camera_near = constants.near_plane;
+  shared_->camera_far = constants.far_plane;
+  shared_->camera_fov = constants.fov;
+  shared_->camera_aspect = constants.aspect;
+  shared_->mvec_scale[0] = constants.mvec_scale[0];
+  shared_->mvec_scale[1] = constants.mvec_scale[1];
 }
 
 bool DlssClient::SubmitFrame(float jitter_x, float jitter_y,
