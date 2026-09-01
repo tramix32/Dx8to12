@@ -1488,7 +1488,165 @@ int RunDlssProbe() {
 }
 #endif  // DX8TO12_HAVE_STREAMLINE
 
+// x64 half of the cross-process shared-texture test (tools/share_test).
+// Opens the x86-created Texture2D and fences, then for each iteration waits
+// for "input ready", writes the whole texture, and signals "output ready" --
+// the DLSS D1 round trip with the upscaler replaced by a clear.
+int RunShareTest(const wchar_t* tex_name, const wchar_t* ready_name,
+                 const wchar_t* done_name, uint32_t luid_low, int32_t luid_high,
+                 int iterations) {
+  IDXGIFactory6* factory = nullptr;
+  if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return 1;
+
+  // Same GPU as the x86 side, matched by LUID rather than by enumeration
+  // order -- the two processes do not necessarily enumerate identically.
+  IDXGIAdapter1* adapter = nullptr;
+  ID3D12Device* device = nullptr;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND;
+       ++i) {
+    DXGI_ADAPTER_DESC1 desc{};
+    if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+        desc.AdapterLuid.LowPart == luid_low &&
+        desc.AdapterLuid.HighPart == luid_high &&
+        SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0,
+                                    IID_PPV_ARGS(&device)))) {
+      break;
+    }
+    adapter->Release();
+    adapter = nullptr;
+  }
+  if (!device) {
+    std::wcerr << L"share-test: no adapter with the requested LUID\n";
+    if (factory) factory->Release();
+    return 1;
+  }
+
+  ID3D12CommandQueue* queue = nullptr;
+  const D3D12_COMMAND_QUEUE_DESC queue_desc{.Type =
+                                                D3D12_COMMAND_LIST_TYPE_DIRECT};
+  HRESULT hr = device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue));
+
+  ID3D12Resource* shared_tex = nullptr;
+  ID3D12Fence* ready_fence = nullptr;
+  ID3D12Fence* done_fence = nullptr;
+  HANDLE handle = nullptr;
+  if (SUCCEEDED(hr) &&
+      SUCCEEDED(hr = device->OpenSharedHandleByName(tex_name, GENERIC_ALL,
+                                                    &handle))) {
+    hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&shared_tex));
+    CloseHandle(handle);
+    handle = nullptr;
+  }
+  if (SUCCEEDED(hr) &&
+      SUCCEEDED(hr = device->OpenSharedHandleByName(ready_name, GENERIC_ALL,
+                                                    &handle))) {
+    hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&ready_fence));
+    CloseHandle(handle);
+    handle = nullptr;
+  }
+  if (SUCCEEDED(hr) &&
+      SUCCEEDED(hr = device->OpenSharedHandleByName(done_name, GENERIC_ALL,
+                                                    &handle))) {
+    hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&done_fence));
+    CloseHandle(handle);
+    handle = nullptr;
+  }
+  if (FAILED(hr)) {
+    std::wcerr << L"share-test: open shared objects failed hr=0x" << std::hex
+               << hr << std::dec << L"\n";
+    return 1;
+  }
+  std::wcout << L"share-test(x64): opened shared texture and fences\n";
+
+  // An RTV is the cheapest way to write the whole surface every iteration,
+  // which is what matters here -- the point is to touch the shared allocation
+  // from the x64 device, not to produce a particular image.
+  ID3D12DescriptorHeap* rtv_heap = nullptr;
+  const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{
+      .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV, .NumDescriptors = 1};
+  hr = device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap));
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+  if (SUCCEEDED(hr)) {
+    rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(shared_tex, nullptr, rtv);
+  }
+
+  ID3D12CommandAllocator* allocator = nullptr;
+  ID3D12GraphicsCommandList* list = nullptr;
+  if (SUCCEEDED(hr))
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                        IID_PPV_ARGS(&allocator));
+  if (SUCCEEDED(hr))
+    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
+                                   nullptr, IID_PPV_ARGS(&list));
+  if (SUCCEEDED(hr)) hr = list->Close();
+  if (FAILED(hr)) {
+    std::wcerr << L"share-test: command objects failed hr=0x" << std::hex << hr
+               << std::dec << L"\n";
+    return 1;
+  }
+
+  for (int i = 1; i <= iterations; ++i) {
+    const uint64_t value = static_cast<uint64_t>(i);
+    if (FAILED(hr = queue->Wait(ready_fence, value))) break;
+    if (FAILED(hr = allocator->Reset())) break;
+    if (FAILED(hr = list->Reset(allocator, nullptr))) break;
+    const D3D12_RESOURCE_BARRIER to_rt = {
+        .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        .Transition = {.pResource = shared_tex,
+                       .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                       .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+                       .StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET}};
+    list->ResourceBarrier(1, &to_rt);
+    const float colour[4] = {static_cast<float>(i % 16) / 16.0f, 0.25f, 0.5f,
+                             1.0f};
+    list->ClearRenderTargetView(rtv, colour, 0, nullptr);
+    const D3D12_RESOURCE_BARRIER to_common = {
+        .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        .Transition = {.pResource = shared_tex,
+                       .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                       .StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET,
+                       .StateAfter = D3D12_RESOURCE_STATE_COMMON}};
+    list->ResourceBarrier(1, &to_common);
+    if (FAILED(hr = list->Close())) break;
+    ID3D12CommandList* lists[] = {list};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(hr = queue->Signal(done_fence, value))) break;
+
+    const HRESULT removed = device->GetDeviceRemovedReason();
+    if (removed != S_OK) {
+      std::wcerr << L"share-test(x64): DEVICE REMOVED at " << i << L" reason=0x"
+                 << std::hex << removed << std::dec << L"\n";
+      return 2;
+    }
+  }
+
+  if (FAILED(hr)) {
+    std::wcerr << L"share-test(x64): failed hr=0x" << std::hex << hr << std::dec
+               << L"\n";
+  } else {
+    std::wcout << L"share-test(x64): completed " << iterations
+               << L" iterations\n";
+  }
+  if (list) list->Release();
+  if (allocator) allocator->Release();
+  if (rtv_heap) rtv_heap->Release();
+  if (done_fence) done_fence->Release();
+  if (ready_fence) ready_fence->Release();
+  if (shared_tex) shared_tex->Release();
+  if (queue) queue->Release();
+  device->Release();
+  if (adapter) adapter->Release();
+  factory->Release();
+  return FAILED(hr) ? 1 : 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 8 && std::wstring_view(argv[1]) == L"--share-test") {
+    return RunShareTest(argv[2], argv[3], argv[4],
+                        static_cast<uint32_t>(_wtoi64(argv[5])),
+                        static_cast<int32_t>(_wtoi64(argv[6])), _wtoi(argv[7]));
+  }
   if (argc == 2 && std::wstring_view(argv[1]) == L"--dlss-probe") {
     return RunDlssProbe();
   }
