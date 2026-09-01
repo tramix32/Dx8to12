@@ -36,6 +36,40 @@ if(MSVC)
   target_compile_options(dx8to12_rt_helper PRIVATE /W4 /wd4100 /wd4505)
 endif()
 
+# Optional NVIDIA Streamline SDK (DLSS/DLAA). Supplied by the developer, never
+# committed -- it has its own licence and redistribution terms, and this is a
+# public repo (see .gitignore). Absence must not break anything: without it the
+# helper still builds and the game still runs, --dlss-probe just says so.
+#
+# Note what is deliberately NOT done here: sl.interposer.lib is not linked.
+# Linking it routes the whole process's D3D12 entry points through Streamline,
+# which would change the existing RT path for every session even when DLSS is
+# not in use. rt_helper_main.cpp loads sl.interposer.dll dynamically instead,
+# only inside --dlss-probe.
+set(DX8TO12_STREAMLINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/streamline")
+if(EXISTS "${DX8TO12_STREAMLINE_DIR}/include/sl.h")
+  message(STATUS "Streamline SDK found: ${DX8TO12_STREAMLINE_DIR}")
+  target_include_directories(dx8to12_rt_helper PRIVATE "${DX8TO12_STREAMLINE_DIR}/include")
+  target_compile_definitions(dx8to12_rt_helper PRIVATE DX8TO12_HAVE_STREAMLINE)
+  # Only the DLLs the probe (and later, DLSS itself) actually needs at runtime.
+  # nvngx_dlss.dll is the DLSS model; sl.common carries the shared plumbing.
+  foreach(sl_dll sl.interposer.dll sl.common.dll sl.dlss.dll nvngx_dlss.dll)
+    if(EXISTS "${DX8TO12_STREAMLINE_DIR}/bin/x64/${sl_dll}")
+      add_custom_command(TARGET dx8to12_rt_helper POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DX8TO12_STREAMLINE_DIR}/bin/x64/${sl_dll}"
+                "$<TARGET_FILE_DIR:dx8to12_rt_helper>/${sl_dll}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DX8TO12_STREAMLINE_DIR}/bin/x64/${sl_dll}"
+                "${CMAKE_BINARY_DIR}/dist/${sl_dll}")
+    else()
+      message(WARNING "Streamline SDK is missing bin/x64/${sl_dll}")
+    endif()
+  endforeach()
+else()
+  message(STATUS "Streamline SDK not found at ${DX8TO12_STREAMLINE_DIR} -- DLSS probing disabled")
+endif()
+
 add_custom_command(
   TARGET dx8to12_rt_helper
   POST_BUILD

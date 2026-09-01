@@ -17,6 +17,11 @@
 
 #include "rt_ipc_protocol.h"
 
+#ifdef DX8TO12_HAVE_STREAMLINE
+#include <sl.h>
+#include <sl_helpers.h>
+#endif
+
 namespace {
 
 HRESULT CompileShadowLibrary(IDxcBlob** object_out = nullptr);
@@ -35,7 +40,7 @@ HRESULT ReadbackShadowMask(ID3D12Device* device, ID3D12CommandQueue* queue,
                            Dx8to12::RtIpc::Handshake* response);
 
 void PrintUsage() {
-  std::wcerr << L"Usage: dx8to12_rt_helper --self-test\n";
+  std::wcerr << L"Usage: dx8to12_rt_helper --self-test | --dlss-probe\n";
 }
 
 int RunSelfTest() {
@@ -1360,7 +1365,133 @@ int RunHandshake(const wchar_t* map_name, const wchar_t* ready_event_name,
 
 }  // namespace
 
+// D0 from DLSS_X64_HELPER_HANDOFF.md: report which NVIDIA features this
+// machine actually offers, and never let their absence stop the game.
+//
+// Deliberately a standalone mode rather than something wired into
+// RunHandshake. Streamline is normally linked through sl.interposer.lib,
+// which routes the process's D3D12 entry points through Streamline -- that
+// would change the behaviour of the existing, working RT path for every
+// session, including ones that never asked for DLSS. Loading the interposer
+// dynamically, only in this mode, keeps that path byte-for-byte as it is.
+#ifdef DX8TO12_HAVE_STREAMLINE
+namespace {
+
+// sl::getResultAsStr returns narrow text; std::wcout has no overload for it.
+std::wstring result_to_wstring(sl::Result result) {
+  const char* text = sl::getResultAsStr(result);
+  return std::wstring(text, text + strlen(text));
+}
+
+void PrintSlResult(const wchar_t* what, sl::Result result) {
+  std::wcout << what << L": " << result_to_wstring(result) << L"\n";
+}
+
+}  // namespace
+
+int RunDlssProbe() {
+  std::wcout << L"Streamline headers: " << SL_VERSION_MAJOR << L"."
+             << SL_VERSION_MINOR << L"." << SL_VERSION_PATCH << L"\n";
+
+  // Loaded by name from the helper's own directory: the SDK's runtime DLLs are
+  // copied next to the executable at build time (see rt_helper/CMakeLists.txt).
+  HMODULE interposer = LoadLibraryW(L"sl.interposer.dll");
+  if (!interposer) {
+    std::wcout << L"sl.interposer.dll not loadable (error "
+               << GetLastError()
+               << L") -- DLSS unavailable, everything else still works.\n";
+    return 0;
+  }
+
+  auto sl_init = reinterpret_cast<PFun_slInit*>(
+      GetProcAddress(interposer, "slInit"));
+  auto sl_shutdown = reinterpret_cast<PFun_slShutdown*>(
+      GetProcAddress(interposer, "slShutdown"));
+  auto sl_is_supported = reinterpret_cast<PFun_slIsFeatureSupported*>(
+      GetProcAddress(interposer, "slIsFeatureSupported"));
+  auto sl_get_version = reinterpret_cast<PFun_slGetFeatureVersion*>(
+      GetProcAddress(interposer, "slGetFeatureVersion"));
+  if (!sl_init || !sl_shutdown || !sl_is_supported) {
+    std::wcout << L"sl.interposer.dll is missing expected exports -- DLSS "
+                  L"unavailable.\n";
+    FreeLibrary(interposer);
+    return 0;
+  }
+
+  const sl::Feature features[] = {sl::kFeatureDLSS};
+  sl::Preferences prefs{};
+  prefs.featuresToLoad = features;
+  prefs.numFeaturesToLoad = _countof(features);
+  prefs.renderAPI = sl::RenderAPI::eD3D12;
+  prefs.engine = sl::EngineType::eCustom;
+  prefs.engineVersion = "0.1";
+  // Identifies this integration to Streamline. Not an NVIDIA-issued
+  // applicationId -- the SDK accepts engine+projectId instead, which is the
+  // correct path for a project that has not been through NVIDIA onboarding.
+  prefs.projectId = "b7f1c0de-9f5a-4a3e-9a1a-dx8to12rthelper";
+  prefs.logLevel = sl::LogLevel::eOff;
+  prefs.pathToLogsAndData = nullptr;
+
+  const sl::Result init_result = sl_init(prefs, sl::kSDKVersion);
+  PrintSlResult(L"slInit", init_result);
+  if (init_result != sl::Result::eOk) {
+    FreeLibrary(interposer);
+    // Still not an error for the caller: the game must run without DLSS.
+    return 0;
+  }
+
+  if (sl_get_version) {
+    sl::FeatureVersion version{};
+    const sl::Result version_result = sl_get_version(sl::kFeatureDLSS, version);
+    if (version_result == sl::Result::eOk) {
+      std::wcout << L"DLSS plugin: sl=" << version.versionSL.toWStr()
+                 << L" ngx=" << version.versionNGX.toWStr() << L"\n";
+    } else {
+      PrintSlResult(L"slGetFeatureVersion", version_result);
+    }
+  }
+
+  // Support is per adapter, so ask about each hardware adapter rather than
+  // assuming the first one is the one the game will end up on.
+  IDXGIFactory6* factory = nullptr;
+  if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND;
+         ++i) {
+      DXGI_ADAPTER_DESC1 desc{};
+      if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+          !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+        sl::AdapterInfo info{};
+        info.deviceLUID = reinterpret_cast<uint8_t*>(&desc.AdapterLuid);
+        info.deviceLUIDSizeInBytes = sizeof(desc.AdapterLuid);
+        const sl::Result supported =
+            sl_is_supported(sl::kFeatureDLSS, info);
+        std::wcout << L"adapter[" << i << L"] " << desc.Description
+                   << L" DLSS: " << result_to_wstring(supported) << L"\n";
+      }
+      adapter->Release();
+      adapter = nullptr;
+    }
+    factory->Release();
+  }
+
+  PrintSlResult(L"slShutdown", sl_shutdown());
+  FreeLibrary(interposer);
+  return 0;
+}
+#else
+int RunDlssProbe() {
+  std::wcout << L"Built without the Streamline SDK. Drop it into "
+                L"third_party/streamline and reconfigure to enable DLSS "
+                L"probing; the game runs either way.\n";
+  return 0;
+}
+#endif  // DX8TO12_HAVE_STREAMLINE
+
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--dlss-probe") {
+    return RunDlssProbe();
+  }
   if (argc == 2 && std::wstring_view(argv[1]) == L"--self-test") {
     return RunSelfTest();
   }
