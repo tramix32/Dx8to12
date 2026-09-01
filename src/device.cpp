@@ -1516,6 +1516,14 @@ float HaltonSample(uint32_t index, uint32_t base) {
 static constexpr float kJitterPixelScale = 1.0f;
 
 void Device::AdvanceTemporalJitter() {
+  // Runtime switch, not just a build flag -- the whole point of the INI/mod
+  // API surface is that a player can turn this on without a special build.
+  // Zeroing the offset makes the injection site in PrepareDrawCall a no-op
+  // (it adds 0), so there is no second place that has to know about this.
+  if (!GetConfig().temporal_jitter) {
+    jitter_pixels_ = {};
+    return;
+  }
   // Halton(2,3), the sequence Streamline's own samples use. Index is 1-based:
   // Halton(0) is 0 for every base, i.e. a wasted frame with no offset.
   // The 16-entry loop is the usual phase count for DLSS-class upscalers.
@@ -1527,6 +1535,17 @@ void Device::AdvanceTemporalJitter() {
 #endif  // DX8TO12_TEMPORAL_JITTER
 
 #ifdef DX8TO12_SCENE_TARGET
+namespace {
+// Rendering the scene offscreen and copying it back costs a full-screen copy
+// every frame, so only do it when something downstream actually consumes the
+// offscreen image: a temporal upscaler, or the debug view that draws onto it.
+// Motion vectors alone do not need it -- they read the depth buffer.
+bool SceneTargetWanted() {
+  const Config &config = GetConfig();
+  return config.temporal_aa != 0 || config.motion_vector_debug;
+}
+}  // namespace
+
 void Device::ResolveScenePass() {
   // Idempotent: the scene pass ends exactly once per frame, at whichever
   // point first needs the backbuffer to actually hold the frame.
@@ -1703,6 +1722,7 @@ float MaxMatrixDelta(const DirectX::SimpleMath::Matrix &a,
 }  // namespace
 
 void Device::RecordMotionVectorPass() {
+  if (!GetConfig().motion_vectors) return;
   if (!motion_vector_tex_ || !mvec_pso_ || !bound_depth_target_ ||
       !frame_view_proj_captured_) {
     return;
@@ -1792,7 +1812,7 @@ void Device::RecordMotionVectorPass() {
   cmd_list_->DrawInstanced(3, 1, 0, 0);
 
 #ifdef DX8TO12_MOTION_VECTORS_DEBUG
-  if (scene_color_tex_ && mvec_debug_pso_) {
+  if (GetConfig().motion_vector_debug && scene_color_tex_ && mvec_debug_pso_) {
     TransitionTexture(scene_color_tex_.Get(), 0,
                       D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv = scene_color_tex_->rtv_handle();
@@ -2189,8 +2209,10 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
            new_format);
   }
   // Reset() ends a frame's worth of state; the next frame starts with the
-  // scene pass open again.
-  scene_pass_active_ = true;
+  // scene pass open again -- if anything wants it. With it closed, every
+  // downstream site (CurrentColorTarget, ResolveScenePass) falls back to the
+  // backbuffer on its own, so this one assignment is the whole switch.
+  scene_pass_active_ = SceneTargetWanted();
 #endif
 
 #ifdef DX8TO12_MOTION_VECTORS
@@ -6701,6 +6723,29 @@ void Device::SubmitAndWait(bool should_present) {
   ASSERT_HR(cmd_queue_->Signal(cmd_list_done_fence_.get(),
                                fence_values_[current_back_buffer_]));
 
+  // A setting a mod changed at runtime belongs in dx8to12.ini too, so it
+  // survives into the next session -- the INI and the mod API are two doors
+  // onto one state. Rate-limited inside, and a no-op when nothing changed.
+  if (should_present) FlushConfigIfDirty(/*force=*/false);
+
+#ifdef DX8TO12_ENABLE_VALIDATION
+  // TEMPORARY SELF-TEST -- remove once a real mod has exercised this.
+  // Nothing in this repo changes a setting at runtime, so the INI write-back
+  // path would otherwise ship having only ever been compiled, never run.
+  // Stands in for a mod's settings menu: flips one setting a few seconds in.
+  if (should_present) {
+    static int config_selftest_frames = 0;
+    if (++config_selftest_frames == 600) {
+      bool jitter = false;
+      GetConfigValueBool("TemporalJitter", &jitter);
+      SetConfigValueBool("TemporalJitter", !jitter);
+      LOG(AixLog::Severity::error)
+          << "CONFIG-SELFTEST flipped TemporalJitter " << jitter << " -> "
+          << !jitter << "; dx8to12.ini should now contain it.\n";
+    }
+  }
+#endif
+
   // Update our back buffer index.
   current_back_buffer_ = swap_chain_->GetCurrentBackBufferIndex();
 
@@ -6710,7 +6755,9 @@ void Device::SubmitAndWait(bool should_present) {
   // pass there was either already resolved (a backbuffer read) or must stay
   // open.
   if (should_present) {
-    scene_pass_active_ = true;
+    // Re-evaluated per frame, so a mod toggling the setting takes effect on
+    // the next frame rather than needing a device Reset.
+    scene_pass_active_ = SceneTargetWanted();
     // CurrentColorTarget() changes answer here, and the freshly-reset
     // command list has no RTV bound anyway.
     dirty_flags_ |= DIRTY_FLAG_OM;

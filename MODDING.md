@@ -56,11 +56,72 @@ HighPrecisionDepth=false
 ; requested here always falls back at startup; set it after startup instead,
 ; via Dx8to12_SetSettingInt once Dx8to12_GetRaytracingSupported returns true.
 LightingMode=0
+
+[TemporalAA]
+; Temporal anti-aliasing / upscaling:
+;   0 = Off
+;   1 = DLAA -- native-resolution temporal AA. NOT YET IMPLEMENTED.
+;   2 = DLSS -- renders below output resolution and upscales.
+;               NOT YET IMPLEMENTED.
+; Turning this on also turns on TemporalJitter and MotionVectors: a temporal
+; upscaler without both does not degrade gracefully, it produces a blurred,
+; ghosting image that looks like a bug in the upscaler rather than a missing
+; input.
+TemporalAA=0
+
+; Sub-pixel camera offset per frame (Halton). On its own this only makes the
+; image shimmer -- it is an *input* to a temporal upscaler, exposed separately
+; so a mod can drive its own.
+TemporalJitter=false
+
+; Camera motion vectors reconstructed from the depth buffer into an offscreen
+; R16G16_FLOAT target. Also an upscaler input; also useful on its own to a mod
+; doing motion blur or its own temporal effect.
+; Camera-only: cars and pedestrians get the vector of the geometry behind
+; them, so anything that moves independently of the camera will ghost.
+MotionVectors=false
+
+; Draws those motion vectors as false colour over the RIGHT HALF of the screen
+; (the left half stays playable). Diagnostic; implies MotionVectors.
+; Not written back to the INI -- see "Settings that are not persisted" below.
+MotionVectorDebug=false
 ```
 
 An unrecognized key, or a value out of the documented range, is logged as an
 error to `log.txt` and otherwise ignored (that one line's setting keeps its
 default; the rest of the file still applies normally).
+
+### The INI and the mod API are one state, not two
+
+A setting changed at runtime through `Dx8to12_SetSetting*` is **written back
+to `dx8to12.ini`**, so it survives into the next session. A mod with a
+settings menu therefore doesn't need to manage its own config file: it sets
+the value, and the player's choice persists.
+
+The file is rewritten **in place**. Existing lines keep their position, their
+trailing comments and the spelling of the key as you wrote it; keys Dx8to12
+doesn't recognize are left completely untouched (so it is safe to keep your
+own mod's settings in the same file); only keys that were missing get
+appended, under a `; Written by Dx8to12.` marker.
+
+Writes are deferred and rate-limited to at most one per second, plus a final
+write when the DLL unloads. A mod animating a value in a slider therefore
+costs one file write per second, not one per frame. There is no need -- and no
+API -- to ask for a save explicitly.
+
+#### Settings that are not persisted
+
+Two settings are deliberately never written back, because finding them still
+enabled in a later session would look like a broken game rather than a
+remembered preference:
+
+| Setting | Why |
+|---|---|
+| `FullTraceLog` | Produces an enormous `log.txt` (measured ~15k `SetTexture` calls/sec). |
+| `MotionVectorDebug` | Paints false colour over half the screen. |
+
+They still work normally at runtime, and still take effect if *you* write them
+into the INI by hand. They just don't get written there on your behalf.
 
 ## Exported API for other mods
 
@@ -442,12 +503,24 @@ shader bug, so test incrementally.
 
 ### Adding a new setting (for anyone extending this project)
 
-Add the field to `Dx8to12::Config` (`src/config.h`), then a case for it
-in each of the six `Get/SetConfigValue{Int,Float,Bool}` functions and the
-INI key-parsing `if`/`else if` chain in `src/config.cpp` -- there's a single
-source of truth per setting (the field), touched from a small, consistent
-set of places; no separate registration/reflection system. Document the new
-key in this file's INI example and the function-reference table above.
+Three places, in this order:
+
+1. The field on `Dx8to12::Config` (`src/config.h`), with a comment saying what
+   it means and what its valid range is.
+2. An entry in the `kFields` table at the top of `src/config.cpp` -- name,
+   type, and whether it should be written back to the INI. The INI parser, the
+   INI writer and the startup log all walk this table, so those three come for
+   free; there is no `if`/`else if` chain to extend any more.
+3. A case in the matching `GetConfigValue*` / `SetConfigValue*` pair, which is
+   where range validation, any cross-setting implication, and the
+   `MarkConfigDirty()` call on an actual change live.
+
+Set `persist = false` in `kFields` for anything a player would be alarmed to
+find still on next session (see "Settings that are not persisted" above).
+
+Then document the key in this file's INI example. The exported
+`Dx8to12_*Setting*` functions are generic over the key name, so a new setting
+needs no new export and no ABI version bump.
 
 **H4 helper result channel.** `Dx8to12_GetRtShadowOutputResource` returns a
 borrowed `ID3D12Resource*` containing the helper's current RT result;

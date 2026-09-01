@@ -62,6 +62,36 @@ struct Config {
   // or provisioned x64 helper backend to run any RT mode on.
   int lighting_mode = 0;
 
+  // --- Temporal anti-aliasing / upscaling -------------------------------
+  //
+  // These are the DLAA/DLSS pipeline's runtime controls. They exist as
+  // settings rather than build flags specifically so a mod (or the player,
+  // via the INI) can turn them on without a special build -- see MODDING.md.
+  // The DX8TO12_* CMake options only decide whether the code is compiled in
+  // at all; with it compiled in, these decide whether it runs.
+
+  //   0 = Off
+  //   1 = DLAA  -- native-resolution temporal AA. NOT YET IMPLEMENTED.
+  //   2 = DLSS  -- renders below output resolution and upscales.
+  //               NOT YET IMPLEMENTED.
+  // Turning this on implies temporal_jitter and motion_vectors: a temporal
+  // upscaler is wrong without both, so enabling it enables them.
+  int temporal_aa = 0;
+
+  // Sub-pixel camera offset per frame (Halton). On its own this only makes
+  // the image shimmer -- it is an *input* to a temporal upscaler, exposed
+  // separately so a mod can drive its own.
+  bool temporal_jitter = false;
+
+  // Camera motion vectors reconstructed from depth into an offscreen
+  // R16G16_FLOAT target. Also an upscaler input; also useful on its own to a
+  // mod doing motion blur or temporal effects of its own.
+  bool motion_vectors = false;
+
+  // Draws those motion vectors as false colour over the right half of the
+  // screen. Diagnostic; implies motion_vectors.
+  bool motion_vector_debug = false;
+
   // Every field above, by name, for the generic string-keyed Get/Set API in
   // dx8to12_api.cpp and the INI parser in config.cpp. Keep this in sync when
   // adding a field -- see the kFields table at the top of config.cpp.
@@ -71,6 +101,20 @@ struct Config {
 // defaults until LoadConfig() has run once, so this is always usable at
 // static-init time if something ever needs it that early.
 Config &GetConfig();
+
+// Names and types of every setting, in INI order. Both the INI parser and
+// SaveConfig walk this rather than repeating the key list, which is what the
+// comment on Config above has always promised.
+enum class ConfigFieldType { Int, Float, Bool };
+struct ConfigField {
+  const char *name;
+  ConfigFieldType type;
+  // Written back to the INI by SaveConfig. False for settings that are
+  // diagnostic-only and would be a nasty surprise to find still enabled in a
+  // later session (see kFields in config.cpp).
+  bool persist;
+};
+const ConfigField *ConfigFields(size_t *out_count);
 
 // Reads dx8to12.ini from next to `dll_module`'s own file (i.e. next to
 // wherever d3d8.dll was actually loaded from -- the game's install
@@ -91,5 +135,24 @@ bool GetConfigValueFloat(const std::string &key, float *out_value);
 bool SetConfigValueFloat(const std::string &key, float value);
 bool GetConfigValueBool(const std::string &key, bool *out_value);
 bool SetConfigValueBool(const std::string &key, bool value);
+
+// Writes the current settings back into dx8to12.ini, so a change a mod makes
+// at runtime survives into the next session -- the INI and the mod API are two
+// doors onto one state, not two separate states.
+//
+// Rewrites in place: existing lines keep their position, their comments and
+// their spelling of the key, unknown keys are left untouched, and only missing
+// keys are appended. Blowing the file away and regenerating it would silently
+// eat a modder's own notes.
+//
+// No-op before LoadConfig has run (there is no path to write to yet).
+void SaveConfig();
+
+// SetConfigValue* calls this whenever a value actually changes. The write
+// itself is deferred: a mod animating a slider would otherwise rewrite the
+// file every frame. FlushConfigIfDirty does the real work, rate-limited, and
+// is called once per presented frame plus on DLL unload.
+void MarkConfigDirty();
+void FlushConfigIfDirty(bool force);
 
 }  // namespace Dx8to12

@@ -18,10 +18,17 @@ option(DX8TO12_KEEP_TARGET_LOD "Keep the diagnosed near-road model permanently f
 # an A/B. See MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md.
 option(DX8TO12_PAD_BUFFERS "Over-allocate vertex/index buffers so the game's writes and draws past their declared end stay in valid memory instead of being clamped away" ON)
 option(DX8TO12_DRAW_STATE_CACHE "Skip re-recording PSO/root/vertex-buffer bindings when nothing they depend on changed (faster; see kCacheDrawStateBindings in device_limits.h before enabling)" OFF)
-option(DX8TO12_TEMPORAL_JITTER "Offset the projection by a per-frame sub-pixel Halton sequence (prerequisite for DLAA/DLSS; on its own it only makes the image shimmer)" OFF)
-option(DX8TO12_SCENE_TARGET "Render the game's scene into an offscreen colour target and copy it to the backbuffer before mod callbacks (prerequisite for DLAA/DLSS; on its own the image must look identical)" OFF)
-option(DX8TO12_MOTION_VECTORS "Reconstruct camera motion vectors from the depth buffer into an offscreen R16G16_FLOAT target (prerequisite for DLAA/DLSS; on its own nothing samples it -- pair with the debug view to see anything)" OFF)
-option(DX8TO12_MOTION_VECTORS_DEBUG "Draw the reconstructed motion vectors over the scene as false colour. Implies DX8TO12_MOTION_VECTORS; makes the game unplayable but is the only way to verify the vectors by eye" OFF)
+# The four below are ON by default, unlike every other option here, because
+# they are no longer what decides whether the effect happens -- dx8to12.ini
+# and the mod API are (TemporalAA, TemporalJitter, MotionVectors,
+# MotionVectorDebug, all off by default). These options only decide whether
+# the code is compiled in at all, and compiling it out makes those settings
+# silently do nothing. Turn one off only to rule its code out of a build
+# entirely, e.g. when bisecting a regression.
+option(DX8TO12_TEMPORAL_JITTER "Compile in the per-frame sub-pixel Halton projection offset (runtime switch: TemporalJitter)" ON)
+option(DX8TO12_SCENE_TARGET "Compile in the offscreen scene colour target and its copy to the backbuffer (runtime switch: TemporalAA / MotionVectorDebug)" ON)
+option(DX8TO12_MOTION_VECTORS "Compile in camera motion vector reconstruction from depth (runtime switch: MotionVectors)" ON)
+option(DX8TO12_MOTION_VECTORS_DEBUG "Compile in the false-colour motion vector overlay (runtime switch: MotionVectorDebug)" ON)
 
 if(DX8TO12_MOTION_VECTORS_DEBUG AND NOT DX8TO12_MOTION_VECTORS)
   message(STATUS "DX8TO12_MOTION_VECTORS_DEBUG implies DX8TO12_MOTION_VECTORS; enabling it")

@@ -207,7 +207,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call,
           << "DLL_THREAD_ATTACH on thread " << GetCurrentThreadId() << "\n";
       break;
     case DLL_THREAD_DETACH:
+      break;
     case DLL_PROCESS_DETACH:
+      // A setting changed in the last second before the game closed would
+      // otherwise be lost to FlushConfigIfDirty's rate limit. Forced, so it
+      // writes regardless of how recently the last save happened.
+      Dx8to12::FlushConfigIfDirty(/*force=*/true);
       break;
   }
 
