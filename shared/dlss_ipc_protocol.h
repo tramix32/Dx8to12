@@ -19,7 +19,21 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 1;
+inline constexpr uint32_t kVersion = 2;
+
+// Frame slots, so the game does not have to wait for the helper inside the
+// frame it just handed over. In frame N the game writes inputs to slot
+// N % kFrameSlots and presents the result of frame N-1 from the other slot;
+// the helper works on N meanwhile.
+//
+// Two is enough, and the reason is worth stating: slot N%2 is only rewritten
+// in frame N+2, and frame N+1 has already confirmed that frame N finished. A
+// third slot would only help if the helper regularly took longer than a whole
+// frame, which would be a problem to fix rather than to buffer around.
+//
+// The cost is one frame of latency on the scene (the HUD, drawn afterwards,
+// stays current) and twice the shared texture memory.
+inline constexpr uint32_t kFrameSlots = 2;
 
 enum class HelperStatus : uint32_t {
   kStarting = 0,
@@ -58,10 +72,10 @@ struct Handshake {
   int32_t hresult = 0;
 
   // Shared resource names, filled in by x86 before the helper is launched.
-  wchar_t color_in_name[128] = {};
-  wchar_t depth_in_name[128] = {};
-  wchar_t mvec_in_name[128] = {};
-  wchar_t color_out_name[128] = {};
+  wchar_t color_in_name[kFrameSlots][128] = {};
+  wchar_t depth_in_name[kFrameSlots][128] = {};
+  wchar_t mvec_in_name[kFrameSlots][128] = {};
+  wchar_t color_out_name[kFrameSlots][128] = {};
   // x86 signals this once a frame's inputs are recorded; the helper waits on
   // it. The helper signals done_fence; x86 waits on it *on the CPU, with a
   // timeout* -- never as a GPU queue wait. A GPU wait on a fence a crashed

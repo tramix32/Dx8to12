@@ -58,17 +58,23 @@ class DlssClient {
 
   // The texture the game's scene should be copied into, and the one the
   // result comes back in. Both are x86-owned.
-  GpuTexture *color_in() const { return color_in_.Get(); }
-  GpuTexture *color_out() const { return color_out_.Get(); }
-  GpuTexture *depth_in() const { return depth_in_.Get(); }
-  GpuTexture *mvec_in() const { return mvec_in_.Get(); }
+  // The slot this frame's inputs go into. Valid between frames; changes on
+  // every SubmitFrame.
+  GpuTexture *color_in() const { return color_in_[WriteSlot()].Get(); }
+  GpuTexture *depth_in() const { return depth_in_[WriteSlot()].Get(); }
+  GpuTexture *mvec_in() const { return mvec_in_[WriteSlot()].Get(); }
 
-  // Records nothing itself. Call after the frame's copies into color_in have
-  // been recorded and the command list submitted: signals the helper, waits
-  // for it on the CPU with a timeout, and returns true if color_out now holds
-  // this frame's result. On false the caller must fall back to presenting the
-  // scene target unchanged.
-  bool SubmitFrameAndWait(float jitter_x, float jitter_y, bool reset_history);
+  // Hands this frame's inputs to the helper. Call after the copies into the
+  // write slot have been recorded *and the command list submitted*, so the
+  // fence this signals lands after them. Returns immediately -- the helper
+  // works on this frame while the game gets on with the next one.
+  bool SubmitFrame(float jitter_x, float jitter_y, bool reset_history);
+
+  // The finished result of the *previous* frame, or nullptr if the helper has
+  // not got there yet (in which case the caller presents the scene target
+  // unchanged for this frame). Waits only briefly: the helper has had a whole
+  // frame already, so a miss means something is wrong rather than slow.
+  GpuTexture *AcquirePreviousResult();
 
   // Discards temporal history on the next frame -- a camera cut or a device
   // Reset makes the previous frame meaningless to an upscaler.
@@ -85,14 +91,20 @@ class DlssClient {
   DlssIpc::Handshake *shared_ = nullptr;
   PROCESS_INFORMATION helper_process_ = {};
 
-  ComPtr<GpuTexture> color_in_;
-  ComPtr<GpuTexture> color_out_;
-  ComPtr<GpuTexture> depth_in_;
-  ComPtr<GpuTexture> mvec_in_;
-  HANDLE color_in_handle_ = nullptr;
-  HANDLE color_out_handle_ = nullptr;
-  HANDLE depth_in_handle_ = nullptr;
-  HANDLE mvec_in_handle_ = nullptr;
+  // Slot the next SubmitFrame will write into. frame_index_ is the last one
+  // submitted, so the next frame is frame_index_ + 1.
+  size_t WriteSlot() const {
+    return static_cast<size_t>((frame_index_ + 1) % DlssIpc::kFrameSlots);
+  }
+
+  ComPtr<GpuTexture> color_in_[DlssIpc::kFrameSlots];
+  ComPtr<GpuTexture> color_out_[DlssIpc::kFrameSlots];
+  ComPtr<GpuTexture> depth_in_[DlssIpc::kFrameSlots];
+  ComPtr<GpuTexture> mvec_in_[DlssIpc::kFrameSlots];
+  HANDLE color_in_handle_[DlssIpc::kFrameSlots] = {};
+  HANDLE color_out_handle_[DlssIpc::kFrameSlots] = {};
+  HANDLE depth_in_handle_[DlssIpc::kFrameSlots] = {};
+  HANDLE mvec_in_handle_[DlssIpc::kFrameSlots] = {};
 
   ComPtr<ID3D12Fence> ready_fence_;
   ComPtr<ID3D12Fence> done_fence_;

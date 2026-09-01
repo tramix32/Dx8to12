@@ -1917,9 +1917,8 @@ void Device::FlushCommandListNoFence() {
 #ifdef DX8TO12_SCENE_TARGET
 void Device::RunDlaaExchange() {
   GpuTexture *color_in = dlss_client_->color_in();
-  GpuTexture *color_out = dlss_client_->color_out();
   GpuTexture *backbuffer = back_buffers_.at(current_back_buffer_).Get();
-  if (!color_in || !color_out || !scene_color_tex_) {
+  if (!color_in || !scene_color_tex_) {
     ResolveScenePass();
     return;
   }
@@ -1949,7 +1948,7 @@ void Device::RunDlaaExchange() {
   // ready, so submit here rather than at the end of the frame.
   FlushCommandListNoFence();
 
-  const bool got_result = dlss_client_->SubmitFrameAndWait(
+  dlss_client_->SubmitFrame(
 #ifdef DX8TO12_TEMPORAL_JITTER
       jitter_pixels_.x, jitter_pixels_.y,
 #else
@@ -1957,10 +1956,17 @@ void Device::RunDlaaExchange() {
 #endif
       /*reset_history=*/false);
 
+  // Present the *previous* frame's result. Waiting for this frame's would put
+  // the whole helper round trip back on the critical path, which measured
+  // ~1.6ms with the GPU sitting idle -- pure serialisation, not work.
+  GpuTexture *color_out = dlss_client_->AcquirePreviousResult();
+
   scene_pass_active_ = false;
-  if (!got_result) {
-    // Not an error worth stopping for: the scene is still in the scene
-    // target, so present it exactly as a build without DLAA would.
+  if (!color_out) {
+    // Normal on the first frame (there is no previous one) and on any frame
+    // the helper missed. Not an error worth stopping for: the scene is still
+    // in the scene target, so present it exactly as a build without DLAA
+    // would.
     TransitionTexture(scene_color_tex_.Get(), 0,
                       D3D12_RESOURCE_STATE_COPY_SOURCE);
     TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);

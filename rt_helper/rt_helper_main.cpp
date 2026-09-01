@@ -124,7 +124,9 @@ int RunDlaaHelper(const wchar_t* map_name) {
   // Open everything x86 created. The helper never creates a resource the game
   // has to import -- that direction is what caused this project's repeated
   // device removals.
-  Microsoft::WRL::ComPtr<ID3D12Resource> color_in, color_out;
+  constexpr uint32_t kSlots = Dx8to12::DlssIpc::kFrameSlots;
+  Microsoft::WRL::ComPtr<ID3D12Resource> color_in[kSlots], color_out[kSlots];
+  Microsoft::WRL::ComPtr<ID3D12Resource> depth_in[kSlots], mvec_in[kSlots];
   Microsoft::WRL::ComPtr<ID3D12Fence> ready_fence, done_fence;
   auto open_shared = [&](const wchar_t* name, REFIID iid, void** out) {
     HANDLE handle = nullptr;
@@ -135,20 +137,21 @@ int RunDlaaHelper(const wchar_t* map_name) {
     CloseHandle(handle);
     return open_hr;
   };
-  hr = open_shared(shared->color_in_name, __uuidof(ID3D12Resource),
-                   reinterpret_cast<void**>(color_in.GetAddressOf()));
-  if (SUCCEEDED(hr)) {
-    hr = open_shared(shared->color_out_name, __uuidof(ID3D12Resource),
-                     reinterpret_cast<void**>(color_out.GetAddressOf()));
-  }
-  Microsoft::WRL::ComPtr<ID3D12Resource> depth_in, mvec_in;
-  if (SUCCEEDED(hr) && shared->depth_in_name[0]) {
-    hr = open_shared(shared->depth_in_name, __uuidof(ID3D12Resource),
-                     reinterpret_cast<void**>(depth_in.GetAddressOf()));
-  }
-  if (SUCCEEDED(hr) && shared->mvec_in_name[0]) {
-    hr = open_shared(shared->mvec_in_name, __uuidof(ID3D12Resource),
-                     reinterpret_cast<void**>(mvec_in.GetAddressOf()));
+  for (uint32_t slot = 0; slot < kSlots && SUCCEEDED(hr); ++slot) {
+    hr = open_shared(shared->color_in_name[slot], __uuidof(ID3D12Resource),
+                     reinterpret_cast<void**>(color_in[slot].GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+      hr = open_shared(shared->color_out_name[slot], __uuidof(ID3D12Resource),
+                       reinterpret_cast<void**>(color_out[slot].GetAddressOf()));
+    }
+    if (SUCCEEDED(hr) && shared->depth_in_name[slot][0]) {
+      hr = open_shared(shared->depth_in_name[slot], __uuidof(ID3D12Resource),
+                       reinterpret_cast<void**>(depth_in[slot].GetAddressOf()));
+    }
+    if (SUCCEEDED(hr) && shared->mvec_in_name[slot][0]) {
+      hr = open_shared(shared->mvec_in_name[slot], __uuidof(ID3D12Resource),
+                       reinterpret_cast<void**>(mvec_in[slot].GetAddressOf()));
+    }
   }
   if (SUCCEEDED(hr)) {
     hr = open_shared(shared->ready_fence_name, __uuidof(ID3D12Fence),
@@ -186,17 +189,17 @@ int RunDlaaHelper(const wchar_t* map_name) {
   // proves the transport only if this matches what x86 created -- a handle
   // resolving to the wrong resource, or to the right one with a different
   // format, is silent corruption rather than a failure.
-  const D3D12_RESOURCE_DESC color_in_desc = color_in->GetDesc();
+  const D3D12_RESOURCE_DESC color_in_desc = color_in[0]->GetDesc();
   shared->seen_color_in_width = static_cast<uint32_t>(color_in_desc.Width);
   shared->seen_color_in_height = color_in_desc.Height;
   shared->seen_color_in_format = static_cast<uint32_t>(color_in_desc.Format);
-  if (depth_in) {
-    const D3D12_RESOURCE_DESC depth_desc = depth_in->GetDesc();
+  if (depth_in[0]) {
+    const D3D12_RESOURCE_DESC depth_desc = depth_in[0]->GetDesc();
     shared->seen_depth_in_width = static_cast<uint32_t>(depth_desc.Width);
     shared->seen_depth_in_format = static_cast<uint32_t>(depth_desc.Format);
   }
-  if (mvec_in) {
-    const D3D12_RESOURCE_DESC mvec_desc = mvec_in->GetDesc();
+  if (mvec_in[0]) {
+    const D3D12_RESOURCE_DESC mvec_desc = mvec_in[0]->GetDesc();
     shared->seen_mvec_in_width = static_cast<uint32_t>(mvec_desc.Width);
     shared->seen_mvec_in_format = static_cast<uint32_t>(mvec_desc.Format);
   }
@@ -233,19 +236,22 @@ int RunDlaaHelper(const wchar_t* map_name) {
     // time would keep it behind forever. Signalling the newer value satisfies
     // any older wait too, since x86 waits for "at least" its frame index.
 
+    // The game writes frame N into slot N % kSlots and reads the result of
+    // frame N-1 out of the other one, so the two never collide.
+    const uint32_t slot = static_cast<uint32_t>(wanted % kSlots);
     allocator->Reset();
     cmd_list->Reset(allocator.Get(), nullptr);
     D3D12_RESOURCE_BARRIER to_copy[2] = {};
-    to_copy[0].Transition = {.pResource = color_in.Get(),
+    to_copy[0].Transition = {.pResource = color_in[slot].Get(),
                              .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
                              .StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE};
-    to_copy[1].Transition = {.pResource = color_out.Get(),
+    to_copy[1].Transition = {.pResource = color_out[slot].Get(),
                              .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                              .StateBefore = D3D12_RESOURCE_STATE_COMMON,
                              .StateAfter = D3D12_RESOURCE_STATE_COPY_DEST};
     cmd_list->ResourceBarrier(2, to_copy);
-    cmd_list->CopyResource(color_out.Get(), color_in.Get());
+    cmd_list->CopyResource(color_out[slot].Get(), color_in[slot].Get());
     // Handed back in COMMON. The game's own state tracking believes these
     // resources sit in COMMON between frames, and it is authoritative -- the
     // helper leaving them in a copy state would desynchronise it silently.

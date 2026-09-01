@@ -64,10 +64,6 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   if (width == 0 || height == 0) return false;
 
   const std::wstring map_name = UniqueName(L"map");
-  const std::wstring color_in_name = UniqueName(L"colorin");
-  const std::wstring color_out_name = UniqueName(L"colorout");
-  const std::wstring depth_in_name = UniqueName(L"depthin");
-  const std::wstring mvec_in_name = UniqueName(L"mvecin");
   const std::wstring ready_name = UniqueName(L"ready");
   const std::wstring done_name = UniqueName(L"done");
 
@@ -132,20 +128,34 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
     *out_texture = ComOwn(GpuTexture::InitFromResource(device_, resource));
     return true;
   };
-  if (!create_shared(&color_in_, &color_in_handle_, color_in_name) ||
-      !create_shared(&color_out_, &color_out_handle_, color_out_name) ||
-      !create_shared(&depth_in_, &depth_in_handle_, depth_in_name,
-                     DXGI_FORMAT_R32_FLOAT) ||
-      !create_shared(&mvec_in_, &mvec_in_handle_, mvec_in_name,
-                     DXGI_FORMAT_R16G16_FLOAT)) {
-    LOG(AixLog::Severity::error) << "DLSS: shared texture creation failed.\n";
-    Stop();
-    return false;
+  for (uint32_t slot = 0; slot < DlssIpc::kFrameSlots; ++slot) {
+    const std::wstring suffix = L"_" + std::to_wstring(slot);
+    const std::wstring color_in_name = UniqueName((L"colorin" + suffix).c_str());
+    const std::wstring color_out_name = UniqueName((L"colorout" + suffix).c_str());
+    const std::wstring depth_in_name = UniqueName((L"depthin" + suffix).c_str());
+    const std::wstring mvec_in_name = UniqueName((L"mvecin" + suffix).c_str());
+    if (!create_shared(&color_in_[slot], &color_in_handle_[slot],
+                       color_in_name) ||
+        !create_shared(&color_out_[slot], &color_out_handle_[slot],
+                       color_out_name) ||
+        !create_shared(&depth_in_[slot], &depth_in_handle_[slot], depth_in_name,
+                       DXGI_FORMAT_R32_FLOAT) ||
+        !create_shared(&mvec_in_[slot], &mvec_in_handle_[slot], mvec_in_name,
+                       DXGI_FORMAT_R16G16_FLOAT)) {
+      LOG(AixLog::Severity::error) << "DLSS: shared texture creation failed.\n";
+      Stop();
+      return false;
+    }
+    const std::string tag = "_" + std::to_string(slot);
+    color_in_[slot]->SetName("dlss_color_in" + tag);
+    color_out_[slot]->SetName("dlss_color_out" + tag);
+    depth_in_[slot]->SetName("dlss_depth_in" + tag);
+    mvec_in_[slot]->SetName("dlss_mvec_in" + tag);
+    wcsncpy_s(shared_->color_in_name[slot], color_in_name.c_str(), _TRUNCATE);
+    wcsncpy_s(shared_->color_out_name[slot], color_out_name.c_str(), _TRUNCATE);
+    wcsncpy_s(shared_->depth_in_name[slot], depth_in_name.c_str(), _TRUNCATE);
+    wcsncpy_s(shared_->mvec_in_name[slot], mvec_in_name.c_str(), _TRUNCATE);
   }
-  color_in_->SetName("dlss_color_in");
-  color_out_->SetName("dlss_color_out");
-  depth_in_->SetName("dlss_depth_in");
-  mvec_in_->SetName("dlss_mvec_in");
 
   if (FAILED(device_->device()->CreateFence(
           0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(ready_fence_.GetForInit()))) ||
@@ -176,10 +186,6 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   shared_->output_width = width;
   shared_->output_height = height;
   shared_->mode = static_cast<uint32_t>(mode);
-  wcsncpy_s(shared_->color_in_name, color_in_name.c_str(), _TRUNCATE);
-  wcsncpy_s(shared_->color_out_name, color_out_name.c_str(), _TRUNCATE);
-  wcsncpy_s(shared_->depth_in_name, depth_in_name.c_str(), _TRUNCATE);
-  wcsncpy_s(shared_->mvec_in_name, mvec_in_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->ready_fence_name, ready_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->done_fence_name, done_name.c_str(), _TRUNCATE);
 
@@ -220,10 +226,12 @@ void DlssClient::CloseSharedObjects() {
       *handle = nullptr;
     }
   };
-  close(&color_in_handle_);
-  close(&color_out_handle_);
-  close(&depth_in_handle_);
-  close(&mvec_in_handle_);
+  for (uint32_t slot = 0; slot < DlssIpc::kFrameSlots; ++slot) {
+    close(&color_in_handle_[slot]);
+    close(&color_out_handle_[slot]);
+    close(&depth_in_handle_[slot]);
+    close(&mvec_in_handle_[slot]);
+  }
   close(&ready_fence_handle_);
   close(&done_fence_handle_);
   close(&done_event_);
@@ -247,10 +255,12 @@ void DlssClient::Stop() {
     helper_process_ = {};
   }
   CloseSharedObjects();
-  color_in_.Reset();
-  color_out_.Reset();
-  depth_in_.Reset();
-  mvec_in_.Reset();
+  for (uint32_t slot = 0; slot < DlssIpc::kFrameSlots; ++slot) {
+    color_in_[slot].Reset();
+    color_out_[slot].Reset();
+    depth_in_[slot].Reset();
+    mvec_in_[slot].Reset();
+  }
   ready_fence_.Reset();
   done_fence_.Reset();
   if (shared_) {
@@ -275,6 +285,9 @@ bool DlssClient::PollReady() {
     // Checked, not assumed: a shared handle that opens but resolves to a
     // resource of the wrong size or format corrupts silently rather than
     // failing, so compare what the helper sees against what was created.
+    // Slot 0 stands for all of them: they are created in one loop from one
+    // description, so a per-slot check would only ever catch a bug in that
+    // loop, not in the sharing this is here to verify.
     const bool matches =
         shared_->seen_color_in_width == width_ &&
         shared_->seen_color_in_height == height_ &&
@@ -334,8 +347,8 @@ bool DlssClient::PollReady() {
   return false;
 }
 
-bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
-                                    bool reset_history) {
+bool DlssClient::SubmitFrame(float jitter_x, float jitter_y,
+                             bool reset_history) {
   if (!shared_ || !healthy_ || !ready_) return false;
 
   ++frame_index_;
@@ -355,11 +368,24 @@ bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
     return false;
   }
 
-  // CPU wait, never a queue wait -- see the class comment.
-  if (done_fence_->GetCompletedValue() < frame_index_) {
-    if (FAILED(done_fence_->SetEventOnCompletion(frame_index_, done_event_))) {
+  // Deliberately no wait here: the whole point of the frame slots is that the
+  // helper works on this frame while the game moves on to the next one.
+  return true;
+}
+
+GpuTexture *DlssClient::AcquirePreviousResult() {
+  if (!shared_ || !healthy_ || !ready_) return nullptr;
+  // Frame 1 has no predecessor; nothing to present until frame 2.
+  if (frame_index_ < 2) return nullptr;
+  const uint64_t wanted = frame_index_ - 1;
+
+  // CPU wait, never a queue wait -- see the class comment. It should not
+  // actually wait: the helper has had a whole frame to finish this one, so a
+  // miss here means the helper is broken or gone, not merely behind.
+  if (done_fence_->GetCompletedValue() < wanted) {
+    if (FAILED(done_fence_->SetEventOnCompletion(wanted, done_event_))) {
       healthy_ = false;
-      return false;
+      return nullptr;
     }
     if (WaitForSingleObject(done_event_, kFrameWaitTimeoutMs) != WAIT_OBJECT_0) {
       ++consecutive_timeouts_;
@@ -370,9 +396,9 @@ bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
             << kFrameWaitTimeoutMs << "ms a frame forever.\n";
         healthy_ = false;
       }
-      // The history is now discontinuous -- this frame never went through.
+      // A frame the upscaler never saw is a hole in its history.
       pending_history_reset_ = true;
-      return false;
+      return nullptr;
     }
   }
   consecutive_timeouts_ = 0;
@@ -383,9 +409,9 @@ bool DlssClient::SubmitFrameAndWait(float jitter_x, float jitter_y,
         << " failed frames, last hr=0x" << std::hex << shared_->last_hresult
         << std::dec << "; disabling.\n";
     healthy_ = false;
-    return false;
+    return nullptr;
   }
-  return true;
+  return color_out_[static_cast<size_t>(wanted % DlssIpc::kFrameSlots)].Get();
 }
 
 }  // namespace Dx8to12
