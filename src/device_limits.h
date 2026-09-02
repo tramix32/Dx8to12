@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.h"
+
 namespace Dx8to12 {
 // Back to two. Three would let the CPU run a frame further ahead of the GPU,
 // but measurements put this shim firmly CPU-bound (0% of frame spent waiting
@@ -112,10 +114,17 @@ static constexpr bool kPersistentBufferMapping = true;
 // here shows up as a command list depending on state it never set, which is
 // exactly what a device removal during capture replay looks like. Prove it on
 // a real session (build-x86-release-vc) before making it the default.
+//
+// Now read from the DrawStateCache setting rather than being fixed at compile
+// time, so it can be toggled in one session and in one spot. Comparing two
+// builds meant comparing two places, and the frame-time difference between
+// two spots in this game is bigger than the difference this makes -- which is
+// exactly how an earlier measurement of it stayed inconclusive. The build
+// flag still decides whether the code is present at all.
 #ifdef DX8TO12_DRAW_STATE_CACHE
-static constexpr bool kCacheDrawStateBindings = true;
+inline bool CacheDrawStateBindings() { return GetConfig().draw_state_cache; }
 #else
-static constexpr bool kCacheDrawStateBindings = false;
+inline bool CacheDrawStateBindings() { return false; }
 #endif
 
 // Will implicitly disable Pso cache.

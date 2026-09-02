@@ -64,6 +64,7 @@ constexpr ConfigField kFields[] = {
     {"MvecScaleMultiplier", ConfigFieldType::Float, true},
     {"JitterSign", ConfigFieldType::Float, true},
     {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
+    {"DrawStateCache", ConfigFieldType::Bool, true},
     {"TemporalJitter", ConfigFieldType::Bool, true},
     {"MotionVectors", ConfigFieldType::Bool, true},
     {"MotionVectorDebug", ConfigFieldType::Bool, false},
@@ -466,6 +467,10 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.transpose_upscaler_matrices;
     return true;
   }
+  if (EqualsIgnoreCase(key, "DrawStateCache")) {
+    *out_value = g_config.draw_state_cache;
+    return true;
+  }
   return false;
 }
 
@@ -495,6 +500,11 @@ bool SetConfigValueBool(const std::string &key, bool value) {
   if (EqualsIgnoreCase(key, "TransposeUpscalerMatrices")) {
     if (value != g_config.transpose_upscaler_matrices) MarkConfigDirty();
     g_config.transpose_upscaler_matrices = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "DrawStateCache")) {
+    if (value != g_config.draw_state_cache) MarkConfigDirty();
+    g_config.draw_state_cache = value;
     return true;
   }
   if (EqualsIgnoreCase(key, "MotionVectorDebug")) {

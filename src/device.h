@@ -794,6 +794,24 @@ class Device : public IDirect3DDevice8, RefCounted {
   float scene_render_scale_ = 1.f;
   uint32_t scene_render_width_ = 0;
   uint32_t scene_render_height_ = 0;
+  // Captured at Reset so the scale-dependent resources can be rebuilt without
+  // one. Changing the render scale changes the size of every one of them, and
+  // they are all ours -- the game does not know they exist -- so a runtime
+  // change does not need a device Reset it never asked for.
+  uint32_t scene_output_width_ = 0;
+  uint32_t scene_output_height_ = 0;
+  D3DFORMAT scene_color_format_ = D3DFMT_UNKNOWN;
+  // D3DFMT_UNKNOWN means the game asked for no auto depth-stencil.
+  D3DFORMAT scene_depth_format_ = D3DFMT_UNKNOWN;
+  void RecreateSceneScaleResources();
+  // F5 cycles Off / DLAA / DLSS so the same spot can be compared without a
+  // restart -- comparing across restarts compares two different places.
+  void PollGraphicsHotkey();
+  bool graphics_hotkey_was_down_ = false;
+  // F6 toggles the draw state cache. Separate from F5 because it is a
+  // CPU-side optimisation and the upscaler is a GPU-side one; cycling them
+  // together would mean never measuring either on its own.
+  bool draw_cache_hotkey_was_down_ = false;
   // False once the scene has been copied out for the frame, so the mod
   // callbacks and anything else after that point go to the real backbuffer.
   bool scene_pass_active_ = false;

@@ -2138,6 +2138,154 @@ void Device::EndScenePassIfDrawIsUi(bool draw_is_pretransformed) {
 }
 #endif
 
+#if defined(DX8TO12_SCENE_TARGET) || defined(DX8TO12_MOTION_VECTORS)
+void Device::PollGraphicsHotkey() {
+  // GetAsyncKeyState rather than the game's input: this has to work while the
+  // game has focus and runs its own message loop.
+#ifdef DX8TO12_DRAW_STATE_CACHE
+  // F6, separate from F5: this is a CPU-side optimisation and the upscaler is
+  // a GPU-side one, so mixing them into one cycle would mean never measuring
+  // either alone.
+  {
+    const bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (f6 && !draw_cache_hotkey_was_down_) {
+      const bool now = !GetConfig().draw_state_cache;
+      SetConfigValueBool("DrawStateCache", now);
+      LOG(AixLog::Severity::error)
+          << "=== F6: draw state cache now " << (now ? "ON" : "OFF") << " ===\n";
+    }
+    draw_cache_hotkey_was_down_ = f6;
+  }
+#endif
+
+  const bool down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+  const bool pressed = down && !graphics_hotkey_was_down_;
+  graphics_hotkey_was_down_ = down;
+  if (!pressed) return;
+
+  // Off -> DLAA (1:1) -> DLSS (quality) -> Off. Three points is what an A/B
+  // actually needs: no upscaler, upscaler at the same resolution, and
+  // upscaler reconstructing from fewer pixels.
+  Config &config = GetConfig();
+  const char *name = nullptr;
+  if (config.temporal_aa == 0) {
+    SetConfigValueInt("TemporalAA", 1);
+    SetConfigValueFloat("RenderScale", 1.0f);
+    name = "DLAA (1:1)";
+  } else if (config.render_scale > 0.95f) {
+    SetConfigValueInt("TemporalAA", 2);
+    SetConfigValueFloat("RenderScale", 0.667f);
+    name = "DLSS quality (0.667)";
+  } else {
+    SetConfigValueInt("TemporalAA", 0);
+    SetConfigValueFloat("RenderScale", 1.0f);
+    name = "off";
+  }
+  LOG(AixLog::Severity::error)
+      << "=== F5: temporal upscaling now " << name << " ===\n";
+
+  // The resources are sized from the scale, so a change means rebuilding
+  // them -- and they may still be referenced by frames the GPU has not
+  // finished. Wait for the last submitted frame before freeing anything.
+  //
+  // Deliberately not WaitForFrame(): with the command list open, that routes
+  // into SubmitAndWait, which is the caller's caller here. This waits on the
+  // already-submitted work directly, which is all these resources can be
+  // held by.
+  if (next_fence_ > 1 &&
+      cmd_list_done_fence_->GetCompletedValue() < next_fence_ - 1) {
+    ASSERT_HR(cmd_list_done_fence_->SetEventOnCompletion(
+        next_fence_ - 1, cmd_list_done_event_handle_));
+    WaitForSingleObjectEx(cmd_list_done_event_handle_, 5000, FALSE);
+  }
+  RecreateSceneScaleResources();
+#ifdef DX8TO12_MOTION_VECTORS
+  // History across a resolution change is meaningless.
+  has_prev_view_proj_ = false;
+#endif
+}
+
+void Device::RecreateSceneScaleResources() {
+  // Everything here is sized from the render scale, so changing that scale
+  // means rebuilding all of it. Split out of Reset so a runtime change (the
+  // F5 toggle) can rebuild without a device Reset -- these are all our own
+  // resources; the game has no idea they exist.
+  scene_render_scale_ = GetConfig().temporal_aa != 0
+                            ? std::clamp(GetConfig().render_scale, 0.5f, 1.0f)
+                            : 1.0f;
+  scene_render_width_ = std::max(
+      1u, static_cast<uint32_t>(scene_output_width_ * scene_render_scale_));
+  scene_render_height_ = std::max(
+      1u, static_cast<uint32_t>(scene_output_height_ * scene_render_scale_));
+  LOG(AixLog::Severity::info)
+      << "Scene resources: " << scene_render_width_ << "x"
+      << scene_render_height_ << " (scale " << scene_render_scale_
+      << "), output " << scene_output_width_ << "x" << scene_output_height_
+      << "\n";
+
+#ifdef DX8TO12_SCENE_TARGET
+  scene_color_tex_.Reset();
+  scene_depth_tex_.Reset();
+  scene_color_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
+      this, TextureKind::Texture2d, scene_render_width_, scene_render_height_,
+      1, 1, D3DUSAGE_RENDERTARGET, scene_color_format_, D3DPOOL_DEFAULT)));
+  scene_color_tex_->SetName("scene_color_tex");
+  // A depth buffer of the scene's own size, and only when the scene is
+  // actually smaller. The game's depth_stencil_tex_ is shared with its own
+  // render targets (radar, menu blur, mirrors), which still draw at output
+  // resolution; binding a smaller depth buffer under those would clip them.
+  if (scene_render_scale_ != 1.0f && scene_depth_format_ != D3DFMT_UNKNOWN) {
+    scene_depth_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
+        this, TextureKind::Texture2d, scene_render_width_,
+        scene_render_height_, 1, 1, D3DUSAGE_DEPTHSTENCIL, scene_depth_format_,
+        D3DPOOL_DEFAULT)));
+    scene_depth_tex_->SetName("scene_depth_tex");
+  }
+#endif
+
+#ifdef DX8TO12_MOTION_VECTORS
+  motion_vector_tex_.Reset();
+  depth_copy_tex_.Reset();
+  // R16G16_FLOAT has no D3DFORMAT this codebase maps, and inventing one would
+  // put a format the game can never ask for into the conversion tables.
+  // Create the resource directly and wrap it the way the back buffers are
+  // wrapped -- InitFromResource gives it an RTV and an SRV.
+  const D3D12_HEAP_PROPERTIES heap_props{.Type = D3D12_HEAP_TYPE_DEFAULT};
+  const D3D12_RESOURCE_DESC desc{
+      .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+      .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+      // The scene's resolution, not the output's: these describe the scene
+      // the upscaler is reconstructing from.
+      .Width = scene_render_width_,
+      .Height = scene_render_height_,
+      .DepthOrArraySize = 1,
+      .MipLevels = 1,
+      .Format = DXGI_FORMAT_R16G16_FLOAT,
+      .SampleDesc = {.Count = 1, .Quality = 0},
+      .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+      .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+  ComPtr<ID3D12Resource> mvec_resource;
+  // No optimized clear value: the fullscreen triangle writes every pixel, so
+  // this target is never cleared.
+  ASSERT_HR(d3d12_device_->CreateCommittedResource(
+      &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+      nullptr, IID_PPV_ARGS(mvec_resource.GetForInit())));
+  motion_vector_tex_ = ComOwn(GpuTexture::InitFromResource(this, mvec_resource));
+  motion_vector_tex_->SetName("motion_vector_tex");
+
+  D3D12_RESOURCE_DESC depth_desc = desc;
+  depth_desc.Format = DXGI_FORMAT_R32_FLOAT;
+  ComPtr<ID3D12Resource> depth_resource;
+  ASSERT_HR(d3d12_device_->CreateCommittedResource(
+      &heap_props, D3D12_HEAP_FLAG_NONE, &depth_desc,
+      D3D12_RESOURCE_STATE_COMMON, nullptr,
+      IID_PPV_ARGS(depth_resource.GetForInit())));
+  depth_copy_tex_ = ComOwn(GpuTexture::InitFromResource(this, depth_resource));
+  depth_copy_tex_->SetName("depth_copy_tex");
+#endif
+}
+#endif
+
 GpuTexture *Device::CurrentDepthTarget() {
 #ifdef DX8TO12_SCENE_TARGET
   // Only substitute for the game's own depth while the scene pass is drawing
@@ -2476,63 +2624,26 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   }
   LOG(INFO) << "Reset: back buffers re-acquired\n";
 
-#ifdef DX8TO12_SCENE_TARGET
-  // Created here, not in Init(), for the same reason the depth-stencil is:
-  // this is the one place that knows the backbuffer's final size and format,
-  // and it runs again on every Reset (resolution change / device lost).
-  scene_color_tex_.Reset();
-  scene_depth_tex_.Reset();
-  {
-    // Resolved once per Reset rather than read per frame: every resource
-    // below is sized from it, so it cannot change without recreating them.
-    // Rendering smaller only makes sense with an upscaler to put it back.
-    scene_render_scale_ =
-        GetConfig().temporal_aa != 0
-            ? std::clamp(GetConfig().render_scale, 0.5f, 1.0f)
-            : 1.0f;
-    scene_render_width_ = std::max(
-        1u, static_cast<uint32_t>(pPresentationParameters->BackBufferWidth *
-                                  scene_render_scale_));
-    scene_render_height_ = std::max(
-        1u, static_cast<uint32_t>(pPresentationParameters->BackBufferHeight *
-                                  scene_render_scale_));
-    if (scene_render_scale_ != 1.0f) {
-      LOG(AixLog::Severity::info)
-          << "Reset: scene renders at " << scene_render_width_ << "x"
-          << scene_render_height_ << " (scale " << scene_render_scale_
-          << "), output " << pPresentationParameters->BackBufferWidth << "x"
-          << pPresentationParameters->BackBufferHeight << "\n";
-    }
-    const D3DFORMAT scene_format = DXGIToD3DFormat(new_format);
-    scene_color_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
-        this, TextureKind::Texture2d, scene_render_width_,
-        scene_render_height_, 1, 1, D3DUSAGE_RENDERTARGET,
-        scene_format, D3DPOOL_DEFAULT)));
-    scene_color_tex_->SetName("scene_color_tex");
-    // The PSO cache keys on the bound render target's DXGI format and never
-    // evicts (see CreatePSO). If the D3DFORMAT round-trip above ever landed
-    // on a different DXGI format than the swap chain's, every PSO would be
-    // built twice and -- worse -- the RTV format a PSO declares would not
-    // match the resource actually bound. Fail loudly here instead.
-    ASSERT(scene_color_tex_->resource_desc().Format == new_format);
-    ASSERT(back_buffers_.at(0)->resource_desc().Format ==
-           new_format);
-
-    // A depth buffer of the scene's own size, and only when the scene is
-    // actually smaller. The game's depth_stencil_tex_ is shared with its own
-    // render targets (radar, menu blur, mirrors), which still draw at output
-    // resolution; binding a smaller depth buffer under those would clip them.
-    if (scene_render_scale_ != 1.0f &&
-        pPresentationParameters->EnableAutoDepthStencil) {
-      D3DFORMAT depth_format = pPresentationParameters->AutoDepthStencilFormat;
-      if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
-      scene_depth_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
-          this, TextureKind::Texture2d, scene_render_width_,
-          scene_render_height_, 1, 1, D3DUSAGE_DEPTHSTENCIL, depth_format,
-          D3DPOOL_DEFAULT)));
-      scene_depth_tex_->SetName("scene_depth_tex");
-    }
+#if defined(DX8TO12_SCENE_TARGET) || defined(DX8TO12_MOTION_VECTORS)
+  // Remembered so the same resources can be rebuilt when RenderScale changes
+  // at runtime, without a device Reset the game never asked for.
+  scene_output_width_ = pPresentationParameters->BackBufferWidth;
+  scene_output_height_ = pPresentationParameters->BackBufferHeight;
+  scene_color_format_ = DXGIToD3DFormat(new_format);
+  scene_depth_format_ = D3DFMT_UNKNOWN;
+  if (pPresentationParameters->EnableAutoDepthStencil) {
+    scene_depth_format_ = pPresentationParameters->AutoDepthStencilFormat;
+    if (scene_depth_format_ == D3DFMT_UNKNOWN) scene_depth_format_ = D3DFMT_D32;
   }
+  RecreateSceneScaleResources();
+  // The PSO cache keys on the bound render target's DXGI format and never
+  // evicts (see CreatePSO). If the D3DFORMAT round-trip above ever landed on
+  // a different DXGI format than the swap chain's, every PSO would be built
+  // twice and -- worse -- the RTV format a PSO declares would not match the
+  // resource actually bound. Fail loudly here instead.
+  ASSERT(back_buffers_.at(0)->resource_desc().Format == new_format);
+#endif
+#ifdef DX8TO12_SCENE_TARGET
   // Reset() ends a frame's worth of state; the next frame starts with the
   // scene pass open again -- if anything wants it. With it closed, every
   // downstream site (CurrentColorTarget, ResolveScenePass) falls back to the
@@ -2540,56 +2651,13 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   scene_pass_active_ = SceneTargetWanted();
   frame_had_3d_draw_ = false;
 #endif
-
 #ifdef DX8TO12_MOTION_VECTORS
-  motion_vector_tex_.Reset();
-  depth_copy_tex_.Reset();
-  {
-    // R16G16_FLOAT has no D3DFORMAT this codebase maps, and inventing one
-    // would put a format the game can never ask for into the conversion
-    // tables. Create the resource directly and wrap it the same way the back
-    // buffers are wrapped -- InitFromResource gives it an RTV and an SRV.
-    const D3D12_HEAP_PROPERTIES heap_props{.Type = D3D12_HEAP_TYPE_DEFAULT};
-    const D3D12_RESOURCE_DESC desc{
-        .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-        // The scene's resolution, not the output's: these describe the scene
-        // the upscaler is reconstructing from.
-        .Width = scene_render_width_,
-        .Height = scene_render_height_,
-        .DepthOrArraySize = 1,
-        .MipLevels = 1,
-        .Format = DXGI_FORMAT_R16G16_FLOAT,
-        .SampleDesc = {.Count = 1, .Quality = 0},
-        .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-    ComPtr<ID3D12Resource> mvec_resource;
-    // No optimized clear value: the fullscreen triangle writes every pixel,
-    // so this target is never cleared.
-    ASSERT_HR(d3d12_device_->CreateCommittedResource(
-        &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-        D3D12_RESOURCE_STATE_COMMON, nullptr,
-        IID_PPV_ARGS(mvec_resource.GetForInit())));
-    motion_vector_tex_ =
-        ComOwn(GpuTexture::InitFromResource(this, mvec_resource));
-    motion_vector_tex_->SetName("motion_vector_tex");
-
-    D3D12_RESOURCE_DESC depth_desc = desc;
-    depth_desc.Format = DXGI_FORMAT_R32_FLOAT;
-    ComPtr<ID3D12Resource> depth_resource;
-    ASSERT_HR(d3d12_device_->CreateCommittedResource(
-        &heap_props, D3D12_HEAP_FLAG_NONE, &depth_desc,
-        D3D12_RESOURCE_STATE_COMMON, nullptr,
-        IID_PPV_ARGS(depth_resource.GetForInit())));
-    depth_copy_tex_ = ComOwn(GpuTexture::InitFromResource(this, depth_resource));
-    depth_copy_tex_->SetName("depth_copy_tex");
-  }
   // The camera of the frame before a Reset says nothing about the frame
   // after it -- a resolution change or device loss is a discontinuity.
   has_prev_view_proj_ = false;
   frame_view_proj_captured_ = false;
   // Rebuilt here rather than once at Init: the debug PSO's render target
-  // format comes from the scene target, which Reset just recreated.
+  // format comes from the scene target, which was just recreated.
   InitMotionVectorPass();
 #endif
 
@@ -5394,7 +5462,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // draws sharing the same range -- but those runs are common, and the
   // comparison is far cheaper than the driver call it avoids.
   const size_t vbuffer_view_count = max_index + 1;
-  if (!kCacheDrawStateBindings || vbuffer_view_count != last_vbuffer_view_count_ ||
+  if (!CacheDrawStateBindings() || vbuffer_view_count != last_vbuffer_view_count_ ||
       memcmp(last_vbuffer_views_.data(), vbuffer_views.data(),
              vbuffer_view_count * sizeof(vbuffer_views[0])) != 0) {
     cmd_list_->IASetVertexBuffers(0, static_cast<UINT>(vbuffer_view_count),
@@ -5421,7 +5489,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     if (!bound_textures_[i]) break;
     current_texture_mask |= (1u << i);
   }
-  if (!kCacheDrawStateBindings || (dirty_flags_ & DIRTY_FLAG_PSO) ||
+  if (!CacheDrawStateBindings() || (dirty_flags_ & DIRTY_FLAG_PSO) ||
       PrimitiveType != last_pso_prim_type_) {
     last_pso_ = CreatePSO(PrimitiveType);
     last_pso_prim_type_ = PrimitiveType;
@@ -5440,7 +5508,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     }
   }
 #endif
-  if (!kCacheDrawStateBindings || last_pso_.get() != last_set_pso_) {
+  if (!CacheDrawStateBindings() || last_pso_.get() != last_set_pso_) {
     cmd_list_->SetPipelineState(last_pso_.get());
     last_set_pso_ = last_pso_.get();
   }
@@ -5449,7 +5517,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   {
     const int stencil_ref =
         static_cast<int>(render_state_.stencil_ref & 0xFF);
-    if (!kCacheDrawStateBindings || stencil_ref != last_stencil_ref_) {
+    if (!CacheDrawStateBindings() || stencil_ref != last_stencil_ref_) {
       cmd_list_->OMSetStencilRef(static_cast<UINT>(stencil_ref));
       last_stencil_ref_ = stencil_ref;
     }
@@ -5583,7 +5651,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // and descriptor tables set just below it on the previous draw and relying
   // on them being re-set again. Bind it once per command list instead, and
   // invalidate our own root-argument caches whenever we do.
-  if (!kCacheDrawStateBindings || !root_sig_bound_) {
+  if (!CacheDrawStateBindings() || !root_sig_bound_) {
     cmd_list_->SetGraphicsRootSignature(main_root_sig_.get());
     root_sig_bound_ = true;
     last_root_cbvs_.fill(0);
@@ -5603,7 +5671,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
   // other draw all four are identical to what's already bound.
   auto set_root_cbv = [&](UINT slot, GpuPtr gpu_ptr) {
     const D3D12_GPU_VIRTUAL_ADDRESS address = gpu_ptr;
-    if (kCacheDrawStateBindings && last_root_cbvs_[slot] == address) return;
+    if (CacheDrawStateBindings() && last_root_cbvs_[slot] == address) return;
     last_root_cbvs_[slot] = address;
     cmd_list_->SetGraphicsRootConstantBufferView(slot, address);
   };
@@ -5652,7 +5720,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     // mask set at mutation time rather than inferred by comparing cached
     // texture identities against the current binding.
     const uint32_t mask =
-        kCacheDrawStateBindings ? dirty_texture_stage_mask_ : 0xFFu;
+        CacheDrawStateBindings() ? dirty_texture_stage_mask_ : 0xFFu;
 #ifdef DX8TO12_ENABLE_VALIDATION
     // DIAGNOSTIC: an external analysis of the reverted single-descriptor-
     // table experiment (see git branch descriptor-table-perf-investigation)
@@ -5716,7 +5784,7 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     // Set the samplers -- only the stages dirty_sampler_stage_mask_ marked
     // touched. Same reasoning as the texture loop just above.
     const uint32_t mask =
-        kCacheDrawStateBindings ? dirty_sampler_stage_mask_ : 0xFFu;
+        CacheDrawStateBindings() ? dirty_sampler_stage_mask_ : 0xFFu;
     for (int i = 0; i < kMaxTexStages; ++i) {
       if (!(mask & (1u << i))) continue;
       SamplerDesc desc(texture_stage_states_[i]);
@@ -6981,6 +7049,11 @@ HRESULT STDMETHODCALLTYPE Device::Present(CONST RECT *pSourceRect,
   TRACE_ENTRY(hDestWindowOverride);
   ASSERT(hDestWindowOverride == nullptr || hDestWindowOverride == window_);
   PollUiDumpHotkey();
+#if defined(DX8TO12_SCENE_TARGET) || defined(DX8TO12_MOTION_VECTORS)
+  // At Present, i.e. on a frame boundary: rebuilding the scene resources
+  // mid-frame would pull them out from under draws already recorded.
+  PollGraphicsHotkey();
+#endif
   SubmitAndWait(true);
   return S_OK;
 }

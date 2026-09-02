@@ -73,3 +73,7 @@ plan/
 # Internal planning, roadmaps and cross-agent handoff notes. Local only:
 # working documents, not something a reader of this repo needs.
 plan/
+
+# ETW/WPR captures and the symbol caches they drag along -- gigabytes of
+# machine-specific binary, useful only on the machine that recorded them.
+traces/

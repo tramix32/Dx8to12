@@ -82,6 +82,18 @@ struct Config {
   // upscaler is wrong without both, so enabling it enables them.
   int temporal_aa = 0;
 
+  // Reuse the previous draw's PSO lookup, root signature binding and vertex
+  // buffer views when nothing they depend on changed.
+  //
+  // A runtime setting because it is the only way to A/B it honestly: a
+  // compile-time switch means comparing two sessions in two places, and the
+  // difference between two spots in this game is larger than the difference
+  // this makes. Off by default -- it is the one optimisation that skips
+  // *recording* commands, so a mistake leaves a command list depending on
+  // state it never set, which looks like a device removal. See
+  // kCacheDrawStateBindings in device_limits.h.
+  bool draw_state_cache = false;
+
   // Fraction of the output resolution the scene is rendered at, 0.5 to 1.0.
   // 1.0 is DLAA (same resolution in and out); below that the upscaler is
   // reconstructing detail rather than only anti-aliasing it, which is where
