@@ -88,6 +88,7 @@ class DlssClient {
   uint32_t helper_status() const;
   uint32_t failed_frames() const;
   uint32_t preset() const;
+  uint32_t neural_rendering_active() const;
 
   // The texture the game's scene should be copied into, and the one the
   // result comes back in. Both are x86-owned.

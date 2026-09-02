@@ -75,6 +75,10 @@ uint32_t DlssClient::preset() const {
   return shared_ ? shared_->dlss_preset : 0u;
 }
 
+uint32_t DlssClient::neural_rendering_active() const {
+  return shared_ ? shared_->neural_rendering_active : 0u;
+}
+
 DlssClient::~DlssClient() { Stop(); }
 
 bool DlssClient::Start(uint32_t render_width, uint32_t render_height,

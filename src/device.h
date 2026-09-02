@@ -69,6 +69,9 @@ struct Dx8to12_UpscalerStatus {
   int mode;           // TemporalAA as the upscaler is running it.
   int preset;         // sl::DLSSPreset in effect; 0 means "SDK chooses".
   int helper_status;  // DlssIpc::HelperStatus, for diagnosing a failed start.
+  // Whether DLSS 5 Neural Rendering is running, which is not the same as
+  // having been asked for: it needs an NGX runtime that may be absent.
+  int neural_rendering_active;
   unsigned int failed_frames;
   unsigned int render_width;
   unsigned int render_height;

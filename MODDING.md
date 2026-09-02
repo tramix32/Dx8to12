@@ -105,6 +105,22 @@ RenderScale=1.0
 ; 12 = L, 13 = M.
 DlssPreset=0
 
+; DLSS 5 Neural Rendering, run as a post-pass after super resolution.
+; NOT YET IMPLEMENTED -- the setting and its plumbing exist so the helper side
+; can be finished without any change here.
+;
+; It is reachable at all because Neural Rendering is a post-pass over colour,
+; depth and motion vectors rather than a renderer wanting a full G-buffer, and
+; this shim already produces all three -- with motion vectors reconstructed
+; from the real depth buffer rather than estimated from the final image.
+;
+; Two things it needs beyond this setting: Streamline 2.12 exposes no feature
+; for it, so the helper has to call NGX directly (put that SDK in
+; third_party/ngx), and NVIDIA ships DLSS 5 for RTX 50 only, so RTX 40 needs a
+; runtime built for it. Dx8to12_GetUpscalerStatus reports whether it is
+; actually running, which is not the same as having been asked for.
+NeuralRendering=false
+
 [Tuning]
 ; Reuse the previous draw's PSO lookup, root signature binding and vertex
 ; buffer views when nothing they depend on changed. Measured at about 31%
