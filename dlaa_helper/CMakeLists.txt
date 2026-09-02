@@ -51,6 +51,31 @@ else()
   target_link_libraries(dx8to12_dlaa_helper PRIVATE DXGI.lib D3D12.lib)
 endif()
 
+# Optional NGX SDK (github.com/NVIDIA/DLSS), needed only for DLSS 5 Neural
+# Rendering. Streamline 2.12 has no feature for it -- its kFeature list stops
+# at DLSS, DLSS_G, DLSS_RR and DirectSR -- so NR has to be driven through NGX
+# directly, which means this SDK in addition to Streamline rather than instead
+# of it. Supplied by the developer and never committed, exactly like
+# Streamline; absence must not break anything.
+#
+# The runtime it needs, nvngx_dlssnr.dll, is a separate matter again: NVIDIA
+# ships DLSS 5 for RTX 50 only, so running it on RTX 40 needs a build made for
+# that. Put whichever you have next to the helper.
+set(DX8TO12_NGX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ngx")
+if(EXISTS "${DX8TO12_NGX_DIR}/include/nvsdk_ngx.h")
+  message(STATUS "NGX SDK found: ${DX8TO12_NGX_DIR}")
+  target_include_directories(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_DIR}/include")
+  target_compile_definitions(dx8to12_dlaa_helper PRIVATE DX8TO12_HAVE_NGX)
+  foreach(ngx_lib nvsdk_ngx_d_dbg.lib nvsdk_ngx_d.lib)
+    if(EXISTS "${DX8TO12_NGX_DIR}/lib/x64/${ngx_lib}")
+      target_link_libraries(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_DIR}/lib/x64/${ngx_lib}")
+      break()
+    endif()
+  endforeach()
+else()
+  message(STATUS "NGX SDK not found at ${DX8TO12_NGX_DIR} -- DLSS 5 Neural Rendering disabled")
+endif()
+
 if(MSVC)
   target_compile_options(dx8to12_dlaa_helper PRIVATE /W4 /wd4100 /wd4505)
 endif()

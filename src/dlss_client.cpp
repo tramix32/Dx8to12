@@ -222,6 +222,7 @@ bool DlssClient::Start(uint32_t render_width, uint32_t render_height,
   shared_->output_height = output_height;
   shared_->mode = static_cast<uint32_t>(mode);
   shared_->dlss_preset = static_cast<uint32_t>(GetConfig().dlss_preset);
+  shared_->neural_rendering = GetConfig().neural_rendering ? 1u : 0u;
   wcsncpy_s(shared_->ready_fence_name, ready_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->done_fence_name, done_name.c_str(), _TRUNCATE);
 

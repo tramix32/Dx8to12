@@ -155,6 +155,21 @@ struct Config {
   // default for DLAA/Quality), 12 (L) and 13 (M).
   int dlss_preset = 0;
 
+  // DLSS 5 Neural Rendering, run as a post-pass after super resolution.
+  // NOT YET IMPLEMENTED -- the setting and its plumbing exist so the helper
+  // side can be finished without touching anything here.
+  //
+  // Worth recording why this is reachable at all: NR is a post-pass over
+  // colour, depth and motion vectors rather than a renderer needing a full
+  // G-buffer, and those three are exactly what this shim already produces --
+  // with real motion vectors reconstructed from depth, not the estimated ones
+  // a post-process injector has to settle for.
+  //
+  // Needs an NGX runtime (nvngx_dlssnr.dll) that Streamline 2.12 does not
+  // expose as a feature, so the helper has to call NGX directly. On RTX 40
+  // hardware it also needs a runtime built for it; NVIDIA ships RTX 50 only.
+  bool neural_rendering = false;
+
   // Sub-pixel camera offset per frame (Halton). On its own this only makes
   // the image shimmer -- it is an *input* to a temporal upscaler, exposed
   // separately so a mod can drive its own.

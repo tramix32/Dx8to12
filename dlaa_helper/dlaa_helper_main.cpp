@@ -142,6 +142,61 @@ struct PresentPump {
   }
 };
 
+// DLSS 5 Neural Rendering.
+//
+// Separate from everything above because it is not a Streamline feature:
+// Streamline 2.12's kFeature list stops at DLSS, DLSS_G, DLSS_RR and
+// DirectSR, so NR is reached through NGX directly. That is why the helper can
+// end up linking both SDKs.
+//
+// It is reachable at all because NR is a post-pass over colour, depth and
+// motion vectors rather than a renderer wanting a full G-buffer -- and those
+// three are already crossing to this process every frame for super
+// resolution. The motion vectors here are reconstructed from the real depth
+// buffer rather than estimated from the final image, which is strictly more
+// than a post-process injector can offer it.
+//
+// Deliberately left unimplemented rather than guessed at: the NR feature id
+// and its NGX parameter names are not something to invent, and this session
+// has already paid for assumptions about another library's conventions. With
+// the SDK present these are declarations to read, not guesses to make.
+struct NeuralRendering {
+  bool active = false;
+
+  bool Initialise(ID3D12Device* device, uint32_t output_width,
+                  uint32_t output_height) {
+#ifdef DX8TO12_HAVE_NGX
+    (void)device;
+    (void)output_width;
+    (void)output_height;
+    std::fprintf(stderr,
+                 "DLAA helper: the NGX SDK is present but the neural "
+                 "rendering calls are not written yet.\n");
+    return false;
+#else
+    (void)device;
+    (void)output_width;
+    (void)output_height;
+    std::fprintf(stderr,
+                 "DLAA helper: neural rendering was requested, but this build "
+                 "has no NGX SDK (third_party/ngx). Running super resolution "
+                 "only.\n");
+    return false;
+#endif
+  }
+
+  // Runs after slEvaluateFeature, over its output.
+  void Evaluate(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* color,
+                ID3D12Resource* depth, ID3D12Resource* mvec) {
+    (void)cmd_list;
+    (void)color;
+    (void)depth;
+    (void)mvec;
+  }
+
+  void Shutdown() { active = false; }
+};
+
 struct SlotResources {
   ComPtr<ID3D12Resource> color_in;
   ComPtr<ID3D12Resource> color_out;
@@ -358,6 +413,15 @@ int RunDlaaHelper(const wchar_t* map_name) {
     shared->seen_mvec_in_width = static_cast<uint32_t>(d.Width);
     shared->seen_mvec_in_format = static_cast<uint32_t>(d.Format);
   }
+  NeuralRendering neural;
+  if (shared->neural_rendering) {
+    neural.active = neural.Initialise(device.Get(), shared->output_width,
+                                      shared->output_height);
+  }
+  // What is actually running, not what was asked for -- the game's status API
+  // reports this, and the two differ whenever the runtime is missing.
+  shared->neural_rendering_active = neural.active ? 1u : 0u;
+
   shared->status = static_cast<uint32_t>(Ipc::HelperStatus::kReady);
 
   HANDLE ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -479,6 +543,13 @@ int RunDlaaHelper(const wchar_t* map_name) {
                                  _countof(inputs), cmd_list.Get()),
                "slEvaluateFeature")) {
           recorded = true;
+          // After super resolution, over its output: NR is a post-pass, and
+          // the same depth and motion vectors it was given still describe the
+          // frame.
+          if (neural.active) {
+            neural.Evaluate(cmd_list.Get(), res.color_out.Get(),
+                            res.depth_in.Get(), res.mvec_in.Get());
+          }
         } else {
           shared->last_hresult = E_FAIL;
           ++shared->failed_frames;
@@ -560,6 +631,7 @@ int RunDlaaHelper(const wchar_t* map_name) {
       WaitForSingleObject(ready_event, 2000);
     }
   }
+  neural.Shutdown();
   if (shim_process) CloseHandle(shim_process);
   present_pump.Destroy();
 #ifdef DX8TO12_HAVE_STREAMLINE

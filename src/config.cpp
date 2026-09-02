@@ -62,6 +62,7 @@ constexpr ConfigField kFields[] = {
     {"TemporalAA", ConfigFieldType::Int, true},
     {"RenderScale", ConfigFieldType::Float, true},
     {"DlssPreset", ConfigFieldType::Int, true},
+    {"NeuralRendering", ConfigFieldType::Bool, true},
     {"MvecScaleMultiplier", ConfigFieldType::Float, true},
     {"JitterSign", ConfigFieldType::Float, true},
     {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
@@ -486,6 +487,10 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.draw_state_cache;
     return true;
   }
+  if (EqualsIgnoreCase(key, "NeuralRendering")) {
+    *out_value = g_config.neural_rendering;
+    return true;
+  }
   if (EqualsIgnoreCase(key, "NearPlaneClipping")) {
     *out_value = g_config.near_plane_clipping;
     return true;
@@ -524,6 +529,11 @@ bool SetConfigValueBool(const std::string &key, bool value) {
   if (EqualsIgnoreCase(key, "DrawStateCache")) {
     if (value != g_config.draw_state_cache) MarkConfigDirty();
     g_config.draw_state_cache = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NeuralRendering")) {
+    if (value != g_config.neural_rendering) MarkConfigDirty();
+    g_config.neural_rendering = value;
     return true;
   }
   if (EqualsIgnoreCase(key, "NearPlaneClipping")) {

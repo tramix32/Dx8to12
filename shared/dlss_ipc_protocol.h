@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 4;
+inline constexpr uint32_t kVersion = 5;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -127,6 +127,11 @@ struct Handshake {
   // which is what lets a newer DLSS model be picked up without a code change.
   uint32_t dlss_preset = 0;
 
+  // 1 = also run DLSS 5 Neural Rendering as a post-pass. The helper reports
+  // back through neural_rendering_active whether it managed to, which is not
+  // the same question -- it needs an NGX runtime that may not be present.
+  uint32_t neural_rendering = 0;
+
   uint32_t mode = static_cast<uint32_t>(Mode::kLoopback);
   // 1 = discard temporal history. Set on the first frame, after a device
   // Reset, and on a camera cut -- feeding history across one produces a
@@ -151,6 +156,8 @@ struct Handshake {
   uint32_t seen_depth_in_format = 0;
   uint32_t seen_mvec_in_width = 0;
   uint32_t seen_mvec_in_format = 0;
+  // Whether neural rendering is actually running, as opposed to requested.
+  uint32_t neural_rendering_active = 0;
 };
 
 }  // namespace Dx8to12::DlssIpc
