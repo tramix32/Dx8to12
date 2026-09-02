@@ -5,6 +5,7 @@
 #include <string>
 
 #include "aixlog.hpp"
+#include "config.h"
 #include "device.h"
 #include "texture.h"
 #include "utils/asserts.h"
@@ -451,6 +452,18 @@ bool DlssClient::SubmitFrame(float jitter_x, float jitter_y,
   shared_->jitter_y = jitter_y;
   shared_->reset_history =
       (reset_history || pending_history_reset_) ? 1u : 0u;
+  // Refreshed per frame, not at Start: these are the knobs a mod's panel
+  // moves while the game is running, and a value that only took effect on
+  // restart would make that panel look broken.
+  const Config &config = GetConfig();
+  shared_->nr_style = static_cast<uint32_t>(config.nr_style);
+  shared_->nr_auto_mask = config.nr_auto_mask ? 1u : 0u;
+  shared_->nr_ui_correction = config.nr_ui_correction ? 1u : 0u;
+  shared_->nr_intensity = config.nr_intensity;
+  shared_->nr_global_tone = config.nr_global_tone;
+  shared_->nr_local_tone = config.nr_local_tone;
+  shared_->nr_local_structure = config.nr_local_structure;
+  shared_->nr_skin_structure = config.nr_skin_structure;
   pending_history_reset_ = false;
   // Published last: the helper treats a new frame_index as "everything else
   // in this struct is now valid for that frame".

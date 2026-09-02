@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 6;
+inline constexpr uint32_t kVersion = 7;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -168,6 +168,18 @@ struct Handshake {
   // this project can know ahead of time -- NVIDIA ships DLSS 5 for RTX 50
   // only, so an RTX 40 build arrives from outside and may be called anything.
   char neural_rendering_runtime[64] = {};
+
+  // The look knobs feature 18 exposes. Read every frame rather than at
+  // create time, so a mod's slider moves the image while the game runs --
+  // which is the whole point of the mod API carrying them.
+  uint32_t nr_style = 1;
+  uint32_t nr_auto_mask = 0;
+  uint32_t nr_ui_correction = 0;
+  float nr_intensity = 2.0f;
+  float nr_global_tone = 1.0f;
+  float nr_local_tone = 1.0f;
+  float nr_local_structure = 2.0f;
+  float nr_skin_structure = -1.0f;
 };
 
 }  // namespace Dx8to12::DlssIpc

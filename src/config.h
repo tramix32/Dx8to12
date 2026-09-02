@@ -170,6 +170,21 @@ struct Config {
   // hardware it also needs a runtime built for it; NVIDIA ships RTX 50 only.
   bool neural_rendering = false;
 
+  // Feature 18's look knobs, defaulted to what NVIDIA's own presets ship
+  // with. Read every frame, so a mod moving a slider changes the image
+  // without a restart. Ranges are the runtime's to enforce -- passing a value
+  // through and letting it clamp is better than guessing a limit here and
+  // capping something the runtime would have accepted.
+  int nr_style = 1;
+  int nr_preset = 0;
+  bool nr_auto_mask = false;
+  bool nr_ui_correction = false;
+  float nr_intensity = 2.0f;
+  float nr_global_tone = 1.0f;
+  float nr_local_tone = 1.0f;
+  float nr_local_structure = 2.0f;
+  float nr_skin_structure = -1.0f;
+
   // Sub-pixel camera offset per frame (Halton). On its own this only makes
   // the image shimmer -- it is an *input* to a temporal upscaler, exposed
   // separately so a mod can drive its own.

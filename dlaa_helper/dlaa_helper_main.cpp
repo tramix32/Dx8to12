@@ -28,6 +28,11 @@
 #include <string_view>
 #include <vector>
 
+#ifdef DX8TO12_HAVE_NGX
+#include <nvsdk_ngx.h>
+#include <nvsdk_ngx_helpers.h>
+#endif
+
 #include "dlss_ipc_protocol.h"
 
 #ifdef DX8TO12_HAVE_STREAMLINE
@@ -291,6 +296,29 @@ bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
 // buffer rather than estimated from the final image, which is strictly more
 // than a post-process injector can offer it.
 //
+// The parameter contract for feature 18, read off a shipping implementation
+// (RenoDX's DLSS 5 ReShade add-on) rather than invented. Names are NGX
+// parameter strings, set on the block from NVSDK_NGX_D3D12_AllocateParameters
+// before CreateFeature/EvaluateFeature:
+//
+//   create:   DLSSNR.Width, DLSSNR.Height, DLSSNR.InputWidth,
+//             DLSSNR.InputHeight, DLSSNR.OutputWidth, DLSSNR.OutputHeight,
+//             DLSSNR.Upscaling, DLSSNR.ScalingRatio,
+//             DLSSNR.Hint.Render.Preset
+//   evaluate: DLSSNR.Color, DLSSNR.Depth, DLSSNR.MVec, DLSSNR.Output,
+//             DLSSNR.MVecScaleX / Y, DLSSNR.DepthInverted, DLSSNR.Reset,
+//             DLSSNR.Enabled, plus a *SubrectBaseX/Y and *SubrectWidth/Height
+//             quad for each of Color, Depth, MVec and Output
+//   look:     DLSSNR.Style, DLSSNR.Intensity, DLSSNR.GlobalToneStrength,
+//             DLSSNR.LocalToneStrength, DLSSNR.LocalStructureStrength,
+//             DLSSNR.SkinStructureStrength, DLSSNR.UseAutoMask,
+//             DLSSNR.UICorrection
+//
+// Two behaviours worth knowing before wiring it: the feature expects an
+// *opaque* colour input, with alpha restored afterwards by the caller; and
+// the runtime may refuse to upscale and fall back to native, so the 1:1 path
+// has to work on its own rather than being a special case of the scaled one.
+//
 // What is known about the remaining work, so it is not re-derived:
 //
 //   * The feature is NGX feature id 18, driven through the NGX D3D12 entry
@@ -327,14 +355,39 @@ struct NeuralRendering {
                   uint32_t output_height) {
     if (!available) return false;
 #ifdef DX8TO12_HAVE_NGX
-    (void)device;
-    (void)output_width;
-    (void)output_height;
+    device_ = device;
+    width_ = output_width;
+    height_ = output_height;
+
+    // A real project identity, because the runtime declines callers it cannot
+    // identify. ENGINE_TYPE_CUSTOM is what the SDK documents for anything
+    // that is not Unreal/Unity/Omniverse, which this is.
+    const NVSDK_NGX_Result init = NVSDK_NGX_D3D12_Init_with_ProjectID(
+        kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion,
+        L".", device, nullptr, NVSDK_NGX_Version_API);
+    if (NVSDK_NGX_FAILED(init)) {
+      std::fprintf(stderr,
+                   "DLAA helper: NGX init failed 0x%08X; neural rendering "
+                   "off.\n",
+                   static_cast<unsigned>(init));
+      return false;
+    }
+    ngx_initialised_ = true;
+
+    const NVSDK_NGX_Result alloc =
+        NVSDK_NGX_D3D12_AllocateParameters(&params_);
+    if (NVSDK_NGX_FAILED(alloc) || params_ == nullptr) {
+      std::fprintf(stderr, "DLAA helper: NGX AllocateParameters failed 0x%08X\n",
+                   static_cast<unsigned>(alloc));
+      return false;
+    }
+
     std::fprintf(stderr,
-                 "DLAA helper: found %s and the NGX SDK, but the neural "
-                 "rendering calls are not written yet.\n",
-                 runtime_name.c_str());
-    return false;
+                 "DLAA helper: NGX up for neural rendering via %s, %ux%u. The "
+                 "feature itself is created on the first frame, where there "
+                 "is a command list to create it on.\n",
+                 runtime_name.c_str(), width_, height_);
+    return true;
 #else
     (void)device;
     (void)output_width;
@@ -348,19 +401,253 @@ struct NeuralRendering {
 #endif
   }
 
-  // Runs after slEvaluateFeature, over its output.
+  // Runs after slEvaluateFeature, over its output. `color` is both the input
+  // and, after the copy at the end, where the result lands -- the feature
+  // wants a distinct output resource, so one is kept here and copied back
+  // rather than exposed to the rest of the pipeline.
   void Evaluate(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* color,
-                ID3D12Resource* depth, ID3D12Resource* mvec) {
+                ID3D12Resource* depth, ID3D12Resource* mvec,
+                const Ipc::Handshake* shared) {
+#ifdef DX8TO12_HAVE_NGX
+    if (!params_ || create_failed_ || !cmd_list || !color) return;
+    if (!EnsureOutput(color)) return;
+    if (!EnsureFeature(cmd_list)) return;
+
+    // Everything arrives and leaves in COMMON: that is what this helper tags
+    // to Streamline, so it is the state the rest of the frame assumes.
+    const D3D12_RESOURCE_BARRIER to_nr[] = {
+        Barrier(color, D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Barrier(output_.Get(), D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    cmd_list->ResourceBarrier(_countof(to_nr), to_nr);
+
+    NVSDK_NGX_Parameter_SetD3d12Resource(params_, "DLSSNR.Color", color);
+    NVSDK_NGX_Parameter_SetD3d12Resource(params_, "DLSSNR.Output",
+                                         output_.Get());
+    NVSDK_NGX_Parameter_SetD3d12Resource(params_, "DLSSNR.Depth", depth);
+    NVSDK_NGX_Parameter_SetD3d12Resource(params_, "DLSSNR.MVec", mvec);
+
+    SetSubrect("DLSSNR.Color", width_, height_);
+    SetSubrect("DLSSNR.Depth", width_, height_);
+    SetSubrect("DLSSNR.MVec", width_, height_);
+    SetSubrect("DLSSNR.Output", width_, height_);
+
+    // Motion vectors are already in pixels here (the shim's own pass writes
+    // them that way), so the scale is 1 rather than the render dimensions.
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.MVecScaleX", 1.0f);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.MVecScaleY", 1.0f);
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.DepthInverted", 0);
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.Enabled", 1);
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.Reset",
+                             shared && shared->reset_history ? 1 : 0);
+    ApplyLook(shared);
+
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
+    __try {
+      result = NVSDK_NGX_D3D12_EvaluateFeature(cmd_list, handle_, params_,
+                                               nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      // A signed runtime that dislikes its caller can take the process down
+      // rather than return a code. Losing neural rendering is recoverable;
+      // losing the helper mid-frame is what leaves the game without an
+      // upscaler at all.
+      std::fprintf(stderr,
+                   "DLAA helper: feature 18 evaluate raised an exception; "
+                   "neural rendering disabled for this session.\n");
+      create_failed_ = true;
+      active = false;
+      result = NVSDK_NGX_Result_Fail;
+    }
+
+    const D3D12_RESOURCE_BARRIER from_nr[] = {
+        Barrier(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST),
+        Barrier(output_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    cmd_list->ResourceBarrier(_countof(from_nr), from_nr);
+
+    if (NVSDK_NGX_SUCCEED(result)) {
+      cmd_list->CopyResource(color, output_.Get());
+      if (++evaluations_ == 1) {
+        std::fprintf(stderr, "DLAA helper: feature 18 evaluation succeeded.\n");
+      }
+    } else if (!create_failed_) {
+      std::fprintf(stderr, "DLAA helper: feature 18 evaluate failed 0x%08X\n",
+                   static_cast<unsigned>(result));
+      create_failed_ = true;
+      active = false;
+    }
+
+    const D3D12_RESOURCE_BARRIER back[] = {
+        Barrier(color, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON),
+        Barrier(output_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON)};
+    cmd_list->ResourceBarrier(_countof(back), back);
+#else
     (void)cmd_list;
     (void)color;
     (void)depth;
     (void)mvec;
+    (void)shared;
+#endif
   }
 
-  void Shutdown() { active = false; }
+  void Shutdown() {
+    active = false;
+#ifdef DX8TO12_HAVE_NGX
+    if (handle_) {
+      NVSDK_NGX_D3D12_ReleaseFeature(handle_);
+      handle_ = nullptr;
+    }
+    if (params_) {
+      NVSDK_NGX_D3D12_DestroyParameters(params_);
+      params_ = nullptr;
+    }
+    if (ngx_initialised_) {
+      NVSDK_NGX_D3D12_Shutdown1(device_);
+      ngx_initialised_ = false;
+    }
+    output_.Reset();
+#endif
+  }
 
  private:
   std::wstring runtime_path_;
+#ifdef DX8TO12_HAVE_NGX
+  // Identity this project presents to NGX. Its own, deliberately: the runtime
+  // wants to know who is calling, and answering with somebody else's is not
+  // something this project does.
+  static constexpr const char* kProjectId =
+      "a1d4f0e2-6c3b-4f5a-9d21-dx8to12neural";
+  static constexpr const char* kEngineVersion = "1.0";
+
+  static D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource* resource,
+                                        D3D12_RESOURCE_STATES before,
+                                        D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    return barrier;
+  }
+
+  void SetSubrect(const char* prefix, uint32_t w, uint32_t h) {
+    char key[64];
+    std::snprintf(key, sizeof(key), "%s%s", prefix, "SubrectBaseX");
+    NVSDK_NGX_Parameter_SetUI(params_, key, 0);
+    std::snprintf(key, sizeof(key), "%s%s", prefix, "SubrectBaseY");
+    NVSDK_NGX_Parameter_SetUI(params_, key, 0);
+    std::snprintf(key, sizeof(key), "%s%s", prefix, "SubrectWidth");
+    NVSDK_NGX_Parameter_SetUI(params_, key, w);
+    std::snprintf(key, sizeof(key), "%s%s", prefix, "SubrectHeight");
+    NVSDK_NGX_Parameter_SetUI(params_, key, h);
+  }
+
+  void ApplyLook(const Ipc::Handshake* shared) {
+    if (!shared) return;
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.Style",
+                             static_cast<int>(shared->nr_style));
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.Intensity", shared->nr_intensity);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.GlobalToneStrength",
+                             shared->nr_global_tone);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.LocalToneStrength",
+                             shared->nr_local_tone);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.LocalStructureStrength",
+                             shared->nr_local_structure);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.SkinStructureStrength",
+                             shared->nr_skin_structure);
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.UseAutoMask",
+                             shared->nr_auto_mask ? 1 : 0);
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.UICorrection",
+                             shared->nr_ui_correction ? 1 : 0);
+  }
+
+  bool EnsureOutput(ID3D12Resource* color) {
+    if (output_) return true;
+    D3D12_RESOURCE_DESC desc = color->GetDesc();
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    const HRESULT hr = device_->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, IID_PPV_ARGS(&output_));
+    if (FAILED(hr)) {
+      std::fprintf(stderr,
+                   "DLAA helper: neural rendering output alloc failed 0x%08X\n",
+                   static_cast<unsigned>(hr));
+      create_failed_ = true;
+      return false;
+    }
+    width_ = static_cast<uint32_t>(desc.Width);
+    height_ = desc.Height;
+    return true;
+  }
+
+  bool EnsureFeature(ID3D12GraphicsCommandList* cmd_list) {
+    if (handle_) return true;
+
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.Width", width_);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.Height", height_);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.InputWidth", width_);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.InputHeight", height_);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.OutputWidth", width_);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.OutputHeight", height_);
+    // Super resolution has already run by this point, so NR runs 1:1 over its
+    // output. Its own upscaling is a separate thing and the runtime is free
+    // to refuse it, which is why nothing here depends on it.
+    NVSDK_NGX_Parameter_SetI(params_, "DLSSNR.Upscaling", 0);
+    NVSDK_NGX_Parameter_SetF(params_, "DLSSNR.ScalingRatio", 1.0f);
+    NVSDK_NGX_Parameter_SetUI(params_, "DLSSNR.Hint.Render.Preset",
+                              nr_preset_);
+    NVSDK_NGX_Parameter_SetUI(params_, "CreationNodeMask", 1);
+    NVSDK_NGX_Parameter_SetUI(params_, "VisibilityNodeMask", 1);
+
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
+    __try {
+      result = NVSDK_NGX_D3D12_CreateFeature(
+          cmd_list, static_cast<NVSDK_NGX_Feature>(kFeatureNeuralRendering),
+          params_, &handle_);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      std::fprintf(stderr,
+                   "DLAA helper: feature 18 create raised an exception; "
+                   "nothing was submitted.\n");
+      handle_ = nullptr;
+      create_failed_ = true;
+      active = false;
+      return false;
+    }
+    if (NVSDK_NGX_FAILED(result) || handle_ == nullptr) {
+      std::fprintf(stderr, "DLAA helper: feature 18 create failed 0x%08X\n",
+                   static_cast<unsigned>(result));
+      handle_ = nullptr;
+      create_failed_ = true;
+      active = false;
+      return false;
+    }
+    std::fprintf(stderr, "DLAA helper: feature 18 created, %ux%u.\n", width_,
+                 height_);
+    return true;
+  }
+
+  // NVSDK_NGX_Feature_Reserved18 in the public SDK; DLSSNR/reserved-18 in the
+  // runtime. Named here so the number is not a bare literal at the call site.
+  static constexpr int kFeatureNeuralRendering = 18;
+
+  ID3D12Device* device_ = nullptr;
+  NVSDK_NGX_Parameter* params_ = nullptr;
+  NVSDK_NGX_Handle* handle_ = nullptr;
+  ComPtr<ID3D12Resource> output_;
+  uint32_t width_ = 0;
+  uint32_t height_ = 0;
+  uint32_t nr_preset_ = 0;
+  uint64_t evaluations_ = 0;
+  bool ngx_initialised_ = false;
+  bool create_failed_ = false;
+#endif
 };
 
 struct SlotResources {
@@ -721,7 +1008,7 @@ int RunDlaaHelper(const wchar_t* map_name) {
           // frame.
           if (neural.active) {
             neural.Evaluate(cmd_list.Get(), res.color_out.Get(),
-                            res.depth_in.Get(), res.mvec_in.Get());
+                            res.depth_in.Get(), res.mvec_in.Get(), shared);
           }
         } else {
           shared->last_hresult = E_FAIL;

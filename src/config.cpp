@@ -63,6 +63,15 @@ constexpr ConfigField kFields[] = {
     {"RenderScale", ConfigFieldType::Float, true},
     {"DlssPreset", ConfigFieldType::Int, true},
     {"NeuralRendering", ConfigFieldType::Bool, true},
+    {"NRStyle", ConfigFieldType::Int, true},
+    {"NRPreset", ConfigFieldType::Int, true},
+    {"NRAutoMask", ConfigFieldType::Bool, true},
+    {"NRUICorrection", ConfigFieldType::Bool, true},
+    {"NRIntensity", ConfigFieldType::Float, true},
+    {"NRGlobalTone", ConfigFieldType::Float, true},
+    {"NRLocalTone", ConfigFieldType::Float, true},
+    {"NRLocalStructure", ConfigFieldType::Float, true},
+    {"NRSkinStructure", ConfigFieldType::Float, true},
     {"MvecScaleMultiplier", ConfigFieldType::Float, true},
     {"JitterSign", ConfigFieldType::Float, true},
     {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
@@ -333,6 +342,14 @@ bool GetConfigValueInt(const std::string &key, int *out_value) {
     *out_value = g_config.dlss_preset;
     return true;
   }
+  if (EqualsIgnoreCase(key, "NRStyle")) {
+    *out_value = g_config.nr_style;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRPreset")) {
+    *out_value = g_config.nr_preset;
+    return true;
+  }
   return false;
 }
 
@@ -402,6 +419,16 @@ bool SetConfigValueInt(const std::string &key, int value) {
     }
     return true;
   }
+  if (EqualsIgnoreCase(key, "NRStyle")) {
+    if (value != g_config.nr_style) MarkConfigDirty();
+    g_config.nr_style = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRPreset")) {
+    if (value != g_config.nr_preset) MarkConfigDirty();
+    g_config.nr_preset = value;
+    return true;
+  }
   return false;
 }
 
@@ -420,6 +447,26 @@ bool GetConfigValueFloat(const std::string &key, float *out_value) {
   }
   if (EqualsIgnoreCase(key, "JitterSign")) {
     *out_value = g_config.jitter_sign;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRIntensity")) {
+    *out_value = g_config.nr_intensity;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRGlobalTone")) {
+    *out_value = g_config.nr_global_tone;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRLocalTone")) {
+    *out_value = g_config.nr_local_tone;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRLocalStructure")) {
+    *out_value = g_config.nr_local_structure;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRSkinStructure")) {
+    *out_value = g_config.nr_skin_structure;
     return true;
   }
   return false;
@@ -453,6 +500,31 @@ bool SetConfigValueFloat(const std::string &key, float value) {
     if (value != 1.f && value != -1.f) return false;
     if (value != g_config.jitter_sign) MarkConfigDirty();
     g_config.jitter_sign = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRIntensity")) {
+    if (value != g_config.nr_intensity) MarkConfigDirty();
+    g_config.nr_intensity = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRGlobalTone")) {
+    if (value != g_config.nr_global_tone) MarkConfigDirty();
+    g_config.nr_global_tone = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRLocalTone")) {
+    if (value != g_config.nr_local_tone) MarkConfigDirty();
+    g_config.nr_local_tone = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRLocalStructure")) {
+    if (value != g_config.nr_local_structure) MarkConfigDirty();
+    g_config.nr_local_structure = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRSkinStructure")) {
+    if (value != g_config.nr_skin_structure) MarkConfigDirty();
+    g_config.nr_skin_structure = value;
     return true;
   }
   return false;
@@ -493,6 +565,14 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
   }
   if (EqualsIgnoreCase(key, "NearPlaneClipping")) {
     *out_value = g_config.near_plane_clipping;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRAutoMask")) {
+    *out_value = g_config.nr_auto_mask;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRUICorrection")) {
+    *out_value = g_config.nr_ui_correction;
     return true;
   }
   return false;
@@ -552,6 +632,16 @@ bool SetConfigValueBool(const std::string &key, bool value) {
     g_config.motion_vector_debug = value;
     // Asking to see the vectors is asking for them to exist.
     if (value) SetConfigValueBool("MotionVectors", true);
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRAutoMask")) {
+    if (value != g_config.nr_auto_mask) MarkConfigDirty();
+    g_config.nr_auto_mask = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NRUICorrection")) {
+    if (value != g_config.nr_ui_correction) MarkConfigDirty();
+    g_config.nr_ui_correction = value;
     return true;
   }
   return false;

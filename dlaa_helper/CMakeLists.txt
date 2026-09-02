@@ -66,12 +66,19 @@ if(EXISTS "${DX8TO12_NGX_DIR}/include/nvsdk_ngx.h")
   message(STATUS "NGX SDK found: ${DX8TO12_NGX_DIR}")
   target_include_directories(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_DIR}/include")
   target_compile_definitions(dx8to12_dlaa_helper PRIVATE DX8TO12_HAVE_NGX)
-  foreach(ngx_lib nvsdk_ngx_d_dbg.lib nvsdk_ngx_d.lib)
-    if(EXISTS "${DX8TO12_NGX_DIR}/lib/x64/${ngx_lib}")
-      target_link_libraries(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_DIR}/lib/x64/${ngx_lib}")
-      break()
-    endif()
-  endforeach()
+  # lib/Windows_x86_64/x64 is the current-toolset import library. The sibling
+  # vs2010/vs2012/vs2013 directories are for those compilers and link against
+  # a CRT this one does not have -- picking one of those gives a wall of
+  # _MSC_VER mismatch and missing __imp___iob_func, which is what a naive
+  # "first match wins" glob over that tree produces. nvsdk_ngx_d is the
+  # dynamic-CRT variant, matching this target's default /MD.
+  set(DX8TO12_NGX_LIB "${DX8TO12_NGX_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+  if(EXISTS "${DX8TO12_NGX_LIB}")
+    message(STATUS "NGX import library: ${DX8TO12_NGX_LIB}")
+    target_link_libraries(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_LIB}")
+  else()
+    message(WARNING "NGX headers found but no lib/Windows_x86_64/x64/nvsdk_ngx_d.lib -- neural rendering will not link")
+  endif()
 else()
   message(STATUS "NGX SDK not found at ${DX8TO12_NGX_DIR} -- DLSS 5 Neural Rendering disabled")
 endif()

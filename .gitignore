@@ -11,6 +11,9 @@ build-*/
 # licence and redistribution terms -- this is a public fork, so they are kept
 # out of the repo and each developer drops their own copy in here.
 third_party/streamline/
+# NVIDIA NGX SDK (github.com/NVIDIA/DLSS). Vendor-licensed, same as Streamline:
+# this fork is public, so the SDK is fetched by the developer, never committed.
+third_party/ngx/
 
 # Game-specific binary analysis artifacts (not for the public repo).
 d3d8_calls_*.txt
@@ -77,3 +80,12 @@ plan/
 # ETW/WPR captures and the symbol caches they drag along -- gigabytes of
 # machine-specific binary, useful only on the machine that recorded them.
 traces/
+
+# Belt and braces for vendor-licensed binaries. The SDK directories above are
+# already ignored, but these names are also what someone copies next to a
+# build or a game while testing, and this fork is public: an NVIDIA runtime
+# must never be committable by accident, from anywhere in the tree.
+nvngx*.dll
+nvsdk_ngx*.lib
+sl.*.dll
+*.addon64
