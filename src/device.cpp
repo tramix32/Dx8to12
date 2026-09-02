@@ -5023,6 +5023,18 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
               // surface it's meant to sit on top of.
               .DepthBias = -static_cast<INT>(render_state_.z_bias) * 16,
               .DepthBiasClamp = 0.f,
+              // D3D8 always clips to the near plane -- it has no render state
+              // to turn that off. D3D12 does, and a zero-initialised
+              // D3D12_RASTERIZER_DESC leaves it FALSE, which is the opposite
+              // of both D3D8's behaviour and D3D12's own documented default
+              // state. Geometry crossing the near plane was therefore not
+              // clipped but depth-clamped, so a triangle with a vertex behind
+              // the camera stretched across the screen instead of being cut.
+              // Observed in Vice City as bush foliage smearing over the radar
+              // and hiding the rotating map inside it (the icons and the ring,
+              // drawn afterwards, stayed visible -- which is what showed the
+              // map was being covered rather than going missing).
+              .DepthClipEnable = TRUE,
               .MultisampleEnable = render_state_.multisample_antialias != 0,
               .AntialiasedLineEnable = render_state_.edge_antialias != 0,
           },
@@ -5255,6 +5267,55 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     const bool pretransformed =
         shader_it != vertex_shaders_.end() &&
         HasFlag(shader_it->second->fvf_desc, D3DFVF_XYZRHW);
+#ifdef DX8TO12_ENABLE_VALIDATION
+    // Every 2D draw the game makes, whichever entry point it came through.
+    // The existing UI dump only instruments DrawPrimitiveUP and
+    // DrawIndexedPrimitiveUP, and the radar goes through neither -- it
+    // produced zero lines while the radar was visibly glitching. This is the
+    // one place all of them pass, since it is where the 3D-to-2D transition
+    // is detected.
+    if (pretransformed && ui_dump_enabled_) {
+      static uint64_t ui_draw_seq = 0;
+      // With the screen-space bounding box, so a draw can be identified by
+      // where it lands rather than guessed at from its texture pointer. Every
+      // earlier attempt to find the radar's map tiles searched one entry
+      // point at a time and missed them; this is the one place all 2D draws
+      // pass through, whatever path and topology they arrived on.
+      float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
+      if (bound_vertex_streams_[0] && num_vertices > 0) {
+        Buffer *vb = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
+        const UINT stride = bound_vertex_stream_strides_[0];
+        const uint64_t byte_offset =
+            static_cast<uint64_t>(start_vertex) * stride;
+        const uint64_t byte_size =
+            static_cast<uint64_t>(num_vertices) * stride;
+        if (stride >= 8 &&
+            byte_offset + byte_size <= vb->resource_desc().Width &&
+            byte_offset <= INT_MAX && byte_size <= INT_MAX) {
+          if (const char *verts = vb->DebugCpuPtr(
+                  static_cast<int>(byte_offset), static_cast<int>(byte_size))) {
+            for (int i = 0; i < num_vertices; ++i) {
+              float pos[2];
+              memcpy(pos, verts + static_cast<size_t>(i) * stride, sizeof(pos));
+              if (!std::isfinite(pos[0]) || !std::isfinite(pos[1])) continue;
+              min_x = std::min(min_x, pos[0]);
+              max_x = std::max(max_x, pos[0]);
+              min_y = std::min(min_y, pos[1]);
+              max_y = std::max(max_y, pos[1]);
+            }
+          }
+        }
+      }
+      LOG(AixLog::Severity::error)
+          << "UI2D seq=" << ++ui_draw_seq << " frame=" << CurrentFrame()
+          << " prim=" << PrimitiveType << " startVert=" << start_vertex
+          << " numVerts=" << num_vertices << " tex0="
+          << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+          << " fvf=0x" << std::hex << shader_it->second->fvf_desc << std::dec
+          << " bbox=(" << min_x << "," << min_y << ")-(" << max_x << ","
+          << max_y << ")\n";
+    }
+#endif
     EndScenePassIfDrawIsUi(pretransformed);
   }
 #endif
@@ -5739,6 +5800,42 @@ HRESULT STDMETHODCALLTYPE Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType,
         .SizeInBytes = safe_cast<UINT>(index_bytes),
         .Format = DXGI_FORMAT_R16_UINT};
 
+#ifdef DX8TO12_ENABLE_VALIDATION
+    // Triangle fans are, in Vice City, essentially only the radar: the map
+    // tiles are clipped against the circle and each clipped polygon comes
+    // through here. So this logs the geometry the game actually submitted --
+    // the question being whether the wedge that goes missing on screen is
+    // already missing from these vertices (the game's own clipping) or is
+    // present here and lost afterwards (ours).
+    if (ui_dump_enabled_ && bound_vertex_streams_[0]) {
+      Buffer *vb = static_cast<Buffer *>(bound_vertex_streams_[0].Get());
+      const UINT stride = bound_vertex_stream_strides_[0];
+      const uint64_t byte_offset = static_cast<uint64_t>(StartVertex) * stride;
+      const uint64_t byte_size = static_cast<uint64_t>(vertex_count) * stride;
+      const char *verts =
+          (stride >= 8 && byte_offset + byte_size <= vb->resource_desc().Width &&
+           byte_offset <= INT_MAX && byte_size <= INT_MAX)
+              ? vb->DebugCpuPtr(static_cast<int>(byte_offset),
+                                static_cast<int>(byte_size))
+              : nullptr;
+      std::ostringstream dump;
+      dump << "FANDUMP frame=" << CurrentFrame() << " prims=" << PrimitiveCount
+           << " startVert=" << StartVertex << " stride=" << stride << " tex0="
+           << (bound_textures_[0] ? bound_textures_[0].Get() : nullptr)
+           << " pos=[";
+      if (verts) {
+        for (UINT i = 0; i < vertex_count; ++i) {
+          float pos[2];
+          memcpy(pos, verts + static_cast<size_t>(i) * stride, sizeof(pos));
+          dump << "(" << pos[0] << "," << pos[1] << ")";
+        }
+      } else {
+        dump << "unreadable";
+      }
+      dump << "]\n";
+      LOG(AixLog::Severity::error) << dump.str();
+    }
+#endif
     HR_OR_RETURN(
         PrepareDrawCall(D3DPT_TRIANGLELIST, StartVertex, vertex_count));
     cmd_list_->IASetIndexBuffer(&ib_view);
