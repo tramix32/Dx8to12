@@ -94,6 +94,17 @@ struct Config {
   // kCacheDrawStateBindings in device_limits.h.
   bool draw_state_cache = false;
 
+  // Clip geometry to the near plane, as D3D8 always did. On by default
+  // because it is what D3D8 does and leaving it off let foliage crossing the
+  // near plane stretch across the screen.
+  //
+  // Adjustable because enabling it changes what renders: clipping *removes*
+  // geometry that depth-clamping used to keep, so anything the game draws
+  // just outside the frustum stops appearing. That makes it the first thing
+  // to rule in or out when something starts disappearing, and toggling beats
+  // rebuilding to find out.
+  bool near_plane_clipping = true;
+
   // Fraction of the output resolution the scene is rendered at, 0.5 to 1.0.
   // 1.0 is DLAA (same resolution in and out); below that the upscaler is
   // reconstructing detail rather than only anti-aliasing it, which is where

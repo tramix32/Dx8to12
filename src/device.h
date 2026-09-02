@@ -132,6 +132,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   // see the method's definition (device.cpp) for how, without leaving
   // vertex_shaders_ missing a handle mid-frame.
   void OnLightingModeChanged();
+  // Drops every cached pipeline state. Needed by settings that are baked into
+  // a PSO at creation rather than read per draw -- a stale cache would keep
+  // serving the old behaviour until each permutation happened to be rebuilt.
+  void InvalidatePsoCache();
   DXGI_FORMAT backbuffer_format() const;
   // Bumped once per Device::Reset() (window resize, fullscreen toggle,
   // format change): back buffer resources, format, and dimensions are all
@@ -812,6 +816,8 @@ class Device : public IDirect3DDevice8, RefCounted {
   // CPU-side optimisation and the upscaler is a GPU-side one; cycling them
   // together would mean never measuring either on its own.
   bool draw_cache_hotkey_was_down_ = false;
+  // F7 toggles near-plane clipping.
+  bool clip_hotkey_was_down_ = false;
   // False once the scene has been copied out for the frame, so the mod
   // callbacks and anything else after that point go to the real backbuffer.
   bool scene_pass_active_ = false;

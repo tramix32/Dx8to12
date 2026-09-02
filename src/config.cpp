@@ -65,6 +65,7 @@ constexpr ConfigField kFields[] = {
     {"JitterSign", ConfigFieldType::Float, true},
     {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
     {"DrawStateCache", ConfigFieldType::Bool, true},
+    {"NearPlaneClipping", ConfigFieldType::Bool, true},
     {"TemporalJitter", ConfigFieldType::Bool, true},
     {"MotionVectors", ConfigFieldType::Bool, true},
     {"MotionVectorDebug", ConfigFieldType::Bool, false},
@@ -471,6 +472,10 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.draw_state_cache;
     return true;
   }
+  if (EqualsIgnoreCase(key, "NearPlaneClipping")) {
+    *out_value = g_config.near_plane_clipping;
+    return true;
+  }
   return false;
 }
 
@@ -505,6 +510,18 @@ bool SetConfigValueBool(const std::string &key, bool value) {
   if (EqualsIgnoreCase(key, "DrawStateCache")) {
     if (value != g_config.draw_state_cache) MarkConfigDirty();
     g_config.draw_state_cache = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "NearPlaneClipping")) {
+    if (value != g_config.near_plane_clipping) {
+      g_config.near_plane_clipping = value;
+      MarkConfigDirty();
+      // No cache invalidation: this is part of the PSO key (PSOState,
+      // render_state.h), so the new value simply looks up a different entry.
+      // Clearing the cache instead would free pipeline states that submitted
+      // command lists still reference, which crashes inside the display
+      // driver -- observed once, in nvwgf2um.dll via D3D12Core.
+    }
     return true;
   }
   if (EqualsIgnoreCase(key, "MotionVectorDebug")) {

@@ -188,10 +188,18 @@ struct PSOState {
   D3DPRIMITIVETYPE prim_type;
   DXGI_FORMAT dsv_format;
   DXGI_FORMAT rtv_format;
+  // Part of the key rather than a reason to clear the cache. Anything baked
+  // into a PSO has to be, otherwise changing it means throwing away pipeline
+  // states that submitted command lists may still reference -- and freeing
+  // one out from under the GPU crashes inside the display driver. Keyed
+  // instead, the old states simply stop being looked up and are released by
+  // the ordinary frame-resource path.
+  bool near_plane_clipping;
   bool operator==(const PSOState &other) const {
     return vs == other.vs && ps == other.ps && rs == other.rs &&
            prim_type == other.prim_type && dsv_format == other.dsv_format &&
-           rtv_format == other.rtv_format;
+           rtv_format == other.rtv_format &&
+           near_plane_clipping == other.near_plane_clipping;
   }
 };
 

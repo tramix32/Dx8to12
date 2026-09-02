@@ -2157,6 +2157,20 @@ void Device::PollGraphicsHotkey() {
     draw_cache_hotkey_was_down_ = f6;
   }
 #endif
+  {
+    // F7: near-plane clipping. Its own key for the same reason as F6 -- it
+    // changes what renders, not how fast, so bundling it into another cycle
+    // would make both harder to attribute.
+    const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (f7 && !clip_hotkey_was_down_) {
+      const bool now = !GetConfig().near_plane_clipping;
+      SetConfigValueBool("NearPlaneClipping", now);
+      LOG(AixLog::Severity::error)
+          << "=== F7: near plane clipping now " << (now ? "ON" : "OFF")
+          << " ===\n";
+    }
+    clip_hotkey_was_down_ = f7;
+  }
 
   const bool down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
   const bool pressed = down && !graphics_hotkey_was_down_;
@@ -4540,6 +4554,31 @@ HRESULT STDMETHODCALLTYPE Device::GetVertexShader(DWORD *pHandle) {
   return S_OK;
 }
 
+void Device::InvalidatePsoCache() {
+  // Wait for work already on the GPU before freeing anything. Command lists
+  // that have been submitted still reference the pipeline states they were
+  // recorded with, and releasing one out from under the GPU crashes inside
+  // the display driver -- observed as an access violation in nvwgf2um.dll
+  // called from D3D12Core, moments after this was first wired to a hotkey.
+  //
+  // Not WaitForFrame(): with the command list open that re-enters
+  // SubmitAndWait. This waits directly on the last submitted frame, which is
+  // the only thing that can still hold these.
+  if (next_fence_ > 1 && cmd_list_done_fence_ &&
+      cmd_list_done_fence_->GetCompletedValue() < next_fence_ - 1) {
+    ASSERT_HR(cmd_list_done_fence_->SetEventOnCompletion(
+        next_fence_ - 1, cmd_list_done_event_handle_));
+    WaitForSingleObjectEx(cmd_list_done_event_handle_, 5000, FALSE);
+  }
+  pso_cache_.clear();
+  // The cached "currently set" PSO pointer now names a freed object, and the
+  // next draw must not compare against it.
+  last_pso_.Reset();
+  last_set_pso_ = nullptr;
+  dirty_flags_ |= DIRTY_FLAG_PSO;
+  LOG(AixLog::Severity::info) << "InvalidatePsoCache: cleared.\n";
+}
+
 void Device::OnLightingModeChanged() {
   // Every already-compiled fixed-function vertex shader was built with the
   // old mode's PER_PIXEL_LIGHTING define (or lack of it) baked in as a
@@ -4953,7 +4992,8 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
                         ? DepthDsvFormatFromTypeless(
                               bound_depth_target_->resource_desc().Format)
                         : DXGI_FORMAT_UNKNOWN,
-      .rtv_format = current_rtv_format};
+      .rtv_format = current_rtv_format,
+      .near_plane_clipping = GetConfig().near_plane_clipping};
 
   // Zero out/normalize every RenderState field that doesn't actually affect
   // the D3D12_GRAPHICS_PIPELINE_STATE_DESC built below, isn't fed into any
@@ -5102,7 +5142,23 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
               // and hiding the rotating map inside it (the icons and the ring,
               // drawn afterwards, stayed visible -- which is what showed the
               // map was being covered rather than going missing).
-              .DepthClipEnable = TRUE,
+              //
+              // Driven by D3DRS_CLIPPING, which is what D3D8 actually exposes
+              // -- an earlier version of this hardcoded TRUE on the claim
+              // that D3D8 had no such state. It does. The state was already
+              // tracked here and simply never reached a PSO, the same way
+              // stencil once didn't, so a game turning clipping off for
+              // geometry it has pre-clipped itself was ignored and had that
+              // geometry clipped anyway. Measured: forcing it on produced
+              // roughly three times as many dropped frames as leaving it off.
+              //
+              // NearPlaneClipping remains as a global override for bisecting;
+              // render_state_ is already part of the PSO key, so honouring the
+              // game's own state needs no extra key field.
+              .DepthClipEnable =
+                  (render_state_.clipping && GetConfig().near_plane_clipping)
+                      ? TRUE
+                      : FALSE,
               .MultisampleEnable = render_state_.multisample_antialias != 0,
               .AntialiasedLineEnable = render_state_.edge_antialias != 0,
           },
