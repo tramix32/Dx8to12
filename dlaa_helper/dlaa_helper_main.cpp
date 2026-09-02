@@ -314,6 +314,20 @@ int RunDlaaHelper(const wchar_t* map_name) {
     options.outputWidth = shared->output_width;
     options.outputHeight = shared->output_height;
     options.colorBuffersHDR = sl::Boolean::eFalse;
+    // Zero means "let the SDK choose", which is both the right default and
+    // what lets a newer DLSS model be adopted by dropping in newer DLLs. A
+    // non-zero value is passed straight through, so a preset that does not
+    // exist yet is still selectable from the INI without changing this code.
+    if (shared->dlss_preset != 0) {
+      const auto preset = static_cast<sl::DLSSPreset>(shared->dlss_preset);
+      options.dlaaPreset = preset;
+      options.qualityPreset = preset;
+      options.balancedPreset = preset;
+      options.performancePreset = preset;
+      options.ultraPerformancePreset = preset;
+      std::fprintf(stderr, "DLAA helper: requesting DLSS preset %u\n",
+                   shared->dlss_preset);
+    }
     std::fprintf(stderr,
                  "DLAA helper: render %ux%u -> output %ux%u (scale %.3f), "
                  "DLSSMode %d\n",
@@ -347,8 +361,28 @@ int RunDlaaHelper(const wchar_t* map_name) {
   shared->status = static_cast<uint32_t>(Ipc::HelperStatus::kReady);
 
   HANDLE ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+  // A handle to the game, waited on alongside the frame fence. shutdown_
+  // requested only arrives if the game exits cleanly; when it crashes -- or is
+  // killed -- nothing writes it, and this process would sit in its wait loop
+  // forever. Orphans were observed accumulating exactly that way, one per
+  // crashed session, each holding its own view of shared memory.
+  HANDLE shim_process =
+      shared->shim_process_id
+          ? OpenProcess(SYNCHRONIZE, FALSE, shared->shim_process_id)
+          : nullptr;
+  if (!shim_process) {
+    std::fprintf(stderr,
+                 "DLAA helper: could not open the game process; will exit only "
+                 "on a clean shutdown request.\n");
+  }
+
   uint64_t processed = 0;
   while (shared->shutdown_requested == 0) {
+    if (shim_process && WaitForSingleObject(shim_process, 0) == WAIT_OBJECT_0) {
+      std::fprintf(stderr, "DLAA helper: the game exited; shutting down.\n");
+      break;
+    }
     // Block on the fence; never poll. A Sleep(1) here sleeps a full ~15.6 ms
     // timer tick at Windows' default granularity, which measured as the game
     // dropping from 249 to 64 fps with the GPU completely idle.
@@ -356,8 +390,17 @@ int RunDlaaHelper(const wchar_t* map_name) {
     if (wanted <= processed) {
       if (FAILED(ready_fence->SetEventOnCompletion(processed + 1, ready_event)))
         break;
-      // Bounded, so shutdown is still noticed while the game is paused.
-      if (WaitForSingleObject(ready_event, 100) != WAIT_OBJECT_0) continue;
+      // Waits on the game's process handle as well as the frame, so a crash
+      // wakes this immediately instead of after the timeout. Still bounded, so
+      // a clean shutdown request is noticed while the game sits paused.
+      HANDLE waits[2] = {ready_event, shim_process};
+      const DWORD count = shim_process ? 2u : 1u;
+      const DWORD woke = WaitForMultipleObjects(count, waits, FALSE, 100);
+      if (woke == WAIT_OBJECT_0 + 1) {
+        std::fprintf(stderr, "DLAA helper: the game exited; shutting down.\n");
+        break;
+      }
+      if (woke != WAIT_OBJECT_0) continue;
       wanted = ready_fence->GetCompletedValue();
       if (wanted <= processed) continue;
     }
@@ -517,6 +560,7 @@ int RunDlaaHelper(const wchar_t* map_name) {
       WaitForSingleObject(ready_event, 2000);
     }
   }
+  if (shim_process) CloseHandle(shim_process);
   present_pump.Destroy();
 #ifdef DX8TO12_HAVE_STREAMLINE
   if (streamline_ready) slShutdown();

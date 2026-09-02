@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 3;
+inline constexpr uint32_t kVersion = 4;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -122,6 +122,10 @@ struct Handshake {
   // Converts the motion vectors from the units they are written in (pixels of
   // the render target) to the normalised units DLSS expects.
   float mvec_scale[2] = {};
+
+  // sl::DLSSPreset, passed straight through. 0 leaves the choice to the SDK,
+  // which is what lets a newer DLSS model be picked up without a code change.
+  uint32_t dlss_preset = 0;
 
   uint32_t mode = static_cast<uint32_t>(Mode::kLoopback);
   // 1 = discard temporal history. Set on the first frame, after a device

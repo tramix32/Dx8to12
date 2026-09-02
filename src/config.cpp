@@ -61,6 +61,7 @@ constexpr ConfigField kFields[] = {
     {"FullTraceLog", ConfigFieldType::Bool, false},
     {"TemporalAA", ConfigFieldType::Int, true},
     {"RenderScale", ConfigFieldType::Float, true},
+    {"DlssPreset", ConfigFieldType::Int, true},
     {"MvecScaleMultiplier", ConfigFieldType::Float, true},
     {"JitterSign", ConfigFieldType::Float, true},
     {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
@@ -327,6 +328,10 @@ bool GetConfigValueInt(const std::string &key, int *out_value) {
     *out_value = g_config.temporal_aa;
     return true;
   }
+  if (EqualsIgnoreCase(key, "DlssPreset")) {
+    *out_value = g_config.dlss_preset;
+    return true;
+  }
   return false;
 }
 
@@ -341,6 +346,15 @@ bool SetConfigValueInt(const std::string &key, int value) {
     if (value != 1 && value != 2 && value != 4 && value != 8) return false;
     if (value != g_config.msaa_samples) MarkConfigDirty();
     g_config.msaa_samples = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "DlssPreset")) {
+    // Not range-checked against today's enum on purpose: a preset added by a
+    // future SDK should be selectable without this needing an edit. The
+    // helper reports what the SDK made of it.
+    if (value < 0 || value > 63) return false;
+    if (value != g_config.dlss_preset) MarkConfigDirty();
+    g_config.dlss_preset = value;
     return true;
   }
   if (EqualsIgnoreCase(key, "TemporalAA")) {

@@ -145,6 +145,16 @@ struct Config {
   // the blurring or ghosting a wrong scale produces.
   bool transpose_upscaler_matrices = false;
 
+  // Which DLSS model preset to ask for. 0 leaves the choice to the SDK,
+  // which picks the best one it has -- normally what you want, and what makes
+  // a newer DLSS pick itself up with no code change.
+  //
+  // Non-zero passes the value straight through as sl::DLSSPreset, so a model
+  // added after this was written is selectable without touching anything
+  // here. As of Streamline 2.12 the interesting ones are 11 (K, transformer,
+  // default for DLAA/Quality), 12 (L) and 13 (M).
+  int dlss_preset = 0;
+
   // Sub-pixel camera offset per frame (Halton). On its own this only makes
   // the image shimmer -- it is an *input* to a temporal upscaler, exposed
   // separately so a mod can drive its own.

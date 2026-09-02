@@ -88,6 +88,55 @@ TemporalJitter=false
 ; them, so anything that moves independently of the camera will ghost.
 MotionVectors=false
 
+; Fraction of the output resolution the scene is rendered at, 0.5 to 1.0.
+; 1.0 is DLAA (same resolution in and out); below that the upscaler is
+; reconstructing detail rather than only anti-aliasing it, which is where any
+; performance actually comes from. Only does anything with TemporalAA on.
+; The conventional DLSS ratios: 0.667 Quality, 0.58 Balanced, 0.5 Performance.
+; The HUD is drawn after upscaling, at full resolution, so it stays sharp.
+RenderScale=1.0
+
+; Which DLSS model preset to ask for, as an sl::DLSSPreset value. 0 leaves the
+; choice to the SDK, which picks the best it has -- normally what you want, and
+; what lets a newer DLSS be adopted by dropping in newer DLLs with no code
+; change. A non-zero value is passed straight through, so a preset added by a
+; future SDK is selectable from here without this being edited. As of
+; Streamline 2.12: 11 = K (transformer, the default for DLAA and Quality),
+; 12 = L, 13 = M.
+DlssPreset=0
+
+[Tuning]
+; Reuse the previous draw's PSO lookup, root signature binding and vertex
+; buffer views when nothing they depend on changed. Measured at about 31%
+; faster on a CPU-bound scene (3.99ms -> 3.04ms). Off by default: it is the
+; only optimisation that skips *recording* commands, so a mistake in it leaves
+; a command list depending on state it never set, which presents as a device
+; removal rather than a small glitch. Turn it on, play for a while, and report
+; anything odd.
+DrawStateCache=false
+
+; Clip geometry to the near plane. Follows the game's own D3DRS_CLIPPING; this
+; is a global override for ruling the whole thing in or out. Setting it false
+; lets geometry crossing the near plane stretch across the screen instead of
+; being cut.
+NearPlaneClipping=true
+
+; Conventions the upscaler expects, which cannot be derived from anything the
+; game provides -- they can only match or fail to match, and a wrong value
+; produces a subtly wrong image rather than an error. Tune against a flat sky
+; with the camera rotating: a visible seam or a rotating outline means the
+; upscaler decided it had no history for that region.
+;   MvecScaleMultiplier -- multiplies the motion vector scale. Vectors are
+;     written in render pixels and normalised by 1/resolution; 2.0 tests the
+;     [-1,1] convention instead.
+;   JitterSign -- the projection is offset by +jitter, but the upscaler may
+;     define this value as the correction for that offset. -1 tests the other.
+;   TransposeUpscalerMatrices -- this codebase is row-vector (v * M) like
+;     D3D8; transposes if the upscaler reads column-vector.
+MvecScaleMultiplier=1.0
+JitterSign=1.0
+TransposeUpscalerMatrices=false
+
 ; Draws those motion vectors as false colour over the RIGHT HALF of the screen
 ; (the left half stays playable). Diagnostic; implies MotionVectors.
 ; Not written back to the INI -- see "Settings that are not persisted" below.
@@ -115,6 +164,30 @@ Writes are deferred and rate-limited to at most one per second, plus a final
 write when the DLL unloads. A mod animating a value in a slider therefore
 costs one file write per second, not one per frame. There is no need -- and no
 API -- to ask for a save explicitly.
+
+### Hotkeys
+
+Debug builds and the measurement profile bind three keys. They are separate
+keys on purpose: each changes a different thing, and cycling them together
+would mean never being able to attribute a result to one of them.
+
+| Key | Cycles | Axis |
+|---|---|---|
+| F5 | upscaling off → DLAA (1:1) → DLSS (0.667) | GPU |
+| F6 | draw state cache | CPU |
+| F7 | near-plane clipping override | image correctness |
+
+They exist because comparing across restarts compares two different places in
+the game, and the frame-time difference between two spots is larger than most
+of the differences worth measuring.
+
+### Upgrading DLSS
+
+Nothing here is tied to a DLSS version. Newer models ship as newer
+`nvngx_dlss.dll` plus, if the API moved, a newer Streamline; drop them into
+`third_party/streamline/` and rebuild -- the helper's CMake copies whatever is
+there next to the executable. `DlssPreset=0` (the default) asks the SDK to
+choose, so a newer model is picked up without touching any code.
 
 #### Settings that are not persisted
 

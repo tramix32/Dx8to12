@@ -75,6 +75,28 @@ Use `build-x86/dist/` while actively working on this codebase (a real bug is muc
 
 **Do not run a `mindebug` build against any game other than GTA: Vice City.** Those builds read *and write* the host process's memory at addresses hardcoded for VC 1.0 (entity lists, streaming tables, and with `DX8TO12_KEEP_TARGET_LOD` a model's alpha byte). Under a different executable those addresses are meaningless. All of it lives inside `#ifdef DX8TO12_ENABLE_MINDEBUG` in `device.cpp` and is compiled out of every other profile -- `kGtaPreferredImageBase` is defined inside that block, so a stray use outside it would fail to link rather than ship silently.
 
+### Measuring anything
+
+Compare one binary against itself, in one place, toggled at runtime. Almost
+every graphics and tuning switch is a `dx8to12.ini` setting rather than a
+build flag for exactly this reason: the frame-time difference between two
+spots in Vice City is larger than most of the differences worth measuring, so
+a comparison across two builds -- which means two sessions and two places --
+returns noise. Several measurements in this project were inconclusive until
+they were redone this way.
+
+Use `build-x86-perf` (or `build-x86-perf-cache`), stand still, and let the
+`Perf:` lines accumulate for ~10s per configuration. F5/F6/F7 switch modes in
+place; each writes a marker line to `log.txt`, so samples can be attributed
+afterwards.
+
+`tools/record_cpu_trace.ps1` records a WPR CPU trace when the question is
+"what is the CPU actually doing" rather than "how long is a frame". It needs
+Administrator. Process the result with `xperf -i trace.etl -tle -tti -symbols
+-a stack -butterfly 500 -process gta-vc.exe` -- `-tle -tti` because a trace
+with lost events is otherwise refused, and note that its own stack-walking
+shows up as ~20% of the samples.
+
 ### CMake options
 
 | Option | Default | Effect |
@@ -82,7 +104,8 @@ Use `build-x86/dist/` while actively working on this codebase (a real bug is muc
 | `DX8TO12_ENABLE_VALIDATION` | ON | D3D12 debug layer + `TRACE_ENTRY` + full AixLog. Roughly halves FPS; turn off for anything but development. |
 | `DX8TO12_ENABLE_MINDEBUG` | OFF | Compact GTA VC-specific diagnostics through `WriteMindebugDiagnosticLine` instead of AixLog. Requires `ENABLE_VALIDATION=OFF`. |
 | `DX8TO12_PAD_BUFFERS` | **ON** | Over-allocates every vertex/index buffer and hides the pad from `GetDesc`. Fixes the "disappearing road/building" bug -- GTA VC writes past the end of its own static index buffers and the draw count was then clamped, dropping the trailing triangles. Turn OFF only to reproduce that bug. See `plan/MISSING_TEXTURES_DIAGNOSTIC_HANDOFF.md`. |
-| `DX8TO12_DRAW_STATE_CACHE` | OFF | Skips re-recording PSO/root/vertex-buffer bindings when nothing changed. Faster, but the only optimisation that skips *recording* commands -- read `kCacheDrawStateBindings` in `device_limits.h` first. |
+| `DX8TO12_DRAW_STATE_CACHE` | OFF | Compiles in the draw-state binding cache; the `DrawStateCache` setting then decides whether it runs. Measured at ~31% faster on a CPU-bound scene, but it is the only optimisation that skips *recording* commands -- read `CacheDrawStateBindings` in `device_limits.h` first. |
+| `DX8TO12_PERF_LOG` | OFF | Release speed with one frame-time line per ~120 frames. Exists because the only build that reported frame times was the dev build, whose debug layer roughly halves the frame rate -- so it could measure the debug layer and nothing else. |
 | `DX8TO12_TEMPORAL_JITTER` | OFF | Sub-pixel Halton offset on the projection. A temporal upscaler needs it; on its own it only makes the image shimmer. |
 | `DX8TO12_SCENE_TARGET` | OFF | Renders the scene into an offscreen colour target and copies it to the backbuffer before mod callbacks. Correct means **invisible**: any difference from a build without it is a bug. |
 | `DX8TO12_MOTION_VECTORS` | OFF | Camera-only motion vectors reconstructed from depth into an offscreen `R16G16_FLOAT` target. Requires `SCENE_TARGET`. Nothing samples it yet. |
