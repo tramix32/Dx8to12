@@ -62,6 +62,19 @@ std::wstring HelperPath() {
 
 DlssClient::DlssClient(Device *device) : device_(device) {}
 
+uint32_t DlssClient::helper_status() const {
+  return shared_ ? shared_->status
+                 : static_cast<uint32_t>(DlssIpc::HelperStatus::kStarting);
+}
+
+uint32_t DlssClient::failed_frames() const {
+  return shared_ ? shared_->failed_frames : 0u;
+}
+
+uint32_t DlssClient::preset() const {
+  return shared_ ? shared_->dlss_preset : 0u;
+}
+
 DlssClient::~DlssClient() { Stop(); }
 
 bool DlssClient::Start(uint32_t render_width, uint32_t render_height,

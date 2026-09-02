@@ -78,6 +78,16 @@ class DlssClient {
   // Turns false permanently once the helper has failed or timed out often
   // enough that waiting on it is costing more than it returns.
   bool healthy() const { return healthy_; }
+  bool helper_running() const { return helper_process_.hProcess != nullptr; }
+  uint32_t render_width() const { return render_width_; }
+  uint32_t render_height() const { return render_height_; }
+  uint32_t output_width() const { return output_width_; }
+  uint32_t output_height() const { return output_height_; }
+  // Straight from the shared handshake, so a mod's panel can show why a start
+  // failed rather than only that it did.
+  uint32_t helper_status() const;
+  uint32_t failed_frames() const;
+  uint32_t preset() const;
 
   // The texture the game's scene should be copied into, and the one the
   // result comes back in. Both are x86-owned.

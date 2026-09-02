@@ -14,7 +14,10 @@
 #include "device_limits.h"
 
 namespace {
-constexpr int kApiVersion = 1;
+// 2 adds setting enumeration (Dx8to12_GetSettingCount/GetSettingInfo) and
+// Dx8to12_GetUpscalerStatus, so a mod can build a settings panel without a
+// hardcoded key list and can show what the upscaler is really doing.
+constexpr int kApiVersion = 2;
 }  // namespace
 
 extern "C" {
@@ -61,6 +64,41 @@ __declspec(dllexport) bool __cdecl Dx8to12_SetSettingBool(const char *key,
                                                            bool value) {
   if (!key) return false;
   return ::Dx8to12::SetConfigValueBool(key, value);
+}
+
+// Enumeration, so a mod can build a settings panel without a hardcoded list
+// of key names -- a setting added to this DLL later then appears in that
+// panel on its own, with no matching mod update.
+__declspec(dllexport) int __cdecl Dx8to12_GetSettingCount() {
+  size_t count = 0;
+  ::Dx8to12::ConfigFields(&count);
+  return static_cast<int>(count);
+}
+
+__declspec(dllexport) bool __cdecl Dx8to12_GetSettingInfo(
+    int index, Dx8to12_SettingInfo *out) {
+  if (!out) return false;
+  size_t count = 0;
+  const ::Dx8to12::ConfigField *fields = ::Dx8to12::ConfigFields(&count);
+  if (index < 0 || static_cast<size_t>(index) >= count) return false;
+  const ::Dx8to12::ConfigField &field = fields[index];
+  *out = Dx8to12_SettingInfo{};
+  strncpy_s(out->name, field.name, _TRUNCATE);
+  out->type = static_cast<int>(field.type);
+  out->persists = field.persist ? 1 : 0;
+  return true;
+}
+
+// What the upscaler is actually doing, as opposed to what the settings asked
+// for. A panel that only reads settings back cannot tell a working upscaler
+// from one that silently failed to start.
+__declspec(dllexport) bool __cdecl Dx8to12_GetUpscalerStatus(
+    Dx8to12_UpscalerStatus *out) {
+  if (!out) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  if (!device) return false;
+  device->GetUpscalerStatus(out);
+  return true;
 }
 
 // Whether an RT backend is available: native D3D12 DXR, or the provisioned

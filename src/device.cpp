@@ -2372,6 +2372,34 @@ bool Device::GetViewProjMatrix(float out_matrix[16]) const {
   return true;
 }
 
+void Device::GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const {
+  if (!out) return;
+  *out = Dx8to12_UpscalerStatus{};
+  out->mode = GetConfig().temporal_aa;
+#if defined(DX8TO12_SCENE_TARGET) && defined(DX8TO12_MOTION_VECTORS)
+  out->compiled_in = 1;
+  out->output_width = scene_output_width_;
+  out->output_height = scene_output_height_;
+  out->render_width = scene_render_width_;
+  out->render_height = scene_render_height_;
+  if (dlss_client_) {
+    out->helper_running = dlss_client_->helper_running() ? 1 : 0;
+    out->ready = dlss_client_->ready() ? 1 : 0;
+    out->healthy = dlss_client_->healthy() ? 1 : 0;
+    out->helper_status = static_cast<int>(dlss_client_->helper_status());
+    out->failed_frames = dlss_client_->failed_frames();
+    out->preset = static_cast<int>(dlss_client_->preset());
+    // The client's own sizes are authoritative once it is running: they are
+    // what the shared textures were actually created at, which is not the
+    // same as the current setting if the setting changed since.
+    out->render_width = dlss_client_->render_width();
+    out->render_height = dlss_client_->render_height();
+    out->output_width = dlss_client_->output_width();
+    out->output_height = dlss_client_->output_height();
+  }
+#endif
+}
+
 int Device::GetActiveLightCount() const {
   return static_cast<int>(enabled_lights_.size());
 }

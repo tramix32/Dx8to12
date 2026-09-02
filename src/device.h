@@ -52,6 +52,38 @@ struct Dx8to12_LightInfo {
   float phi;
 };
 
+// What the temporal upscaler is actually doing, for a mod drawing a settings
+// panel -- the equivalent of the "ACTIVE / render -> output" line such panels
+// show. Filled by Dx8to12_GetUpscalerStatus.
+//
+// Deliberately reports what is *happening* rather than what was *asked for*:
+// the settings say what was requested, and the two differ whenever the helper
+// failed to start, the GPU has no DLSS, or a mode was clamped. A panel that
+// only reads the settings back cannot tell a working upscaler from a silently
+// disabled one.
+struct Dx8to12_UpscalerStatus {
+  int compiled_in;    // The code is present in this build at all.
+  int helper_running; // The x64 helper process was launched.
+  int ready;          // It reported itself ready and its resources matched.
+  int healthy;        // Still trusted; goes to 0 after repeated failures.
+  int mode;           // TemporalAA as the upscaler is running it.
+  int preset;         // sl::DLSSPreset in effect; 0 means "SDK chooses".
+  int helper_status;  // DlssIpc::HelperStatus, for diagnosing a failed start.
+  unsigned int failed_frames;
+  unsigned int render_width;
+  unsigned int render_height;
+  unsigned int output_width;
+  unsigned int output_height;
+};
+
+// One setting, for a mod enumerating them to build a panel without hardcoding
+// key names -- so a setting added later shows up in that panel by itself.
+struct Dx8to12_SettingInfo {
+  char name[64];
+  int type;     // 0 = int, 1 = float, 2 = bool.
+  int persists; // Whether a runtime change is written back to dx8to12.ini.
+};
+
 // Level 3 mod-API: injects a custom HLSL fragment into the generated
 // fixed-function pixel shader (ff_pixel_shader.cpp's CreatePixelShaderFromState)
 // -- see MODDING.md's "Pixel shader injection" section. Called once per
@@ -120,6 +152,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   uint64_t depth_buffer_srv_gpu_handle();
   uint32_t depth_buffer_srv_format();
   bool GetViewProjMatrix(float out_matrix[16]) const;
+  // See Dx8to12_UpscalerStatus. Always fills the struct, even when nothing is
+  // compiled in -- a mod should be able to render a greyed-out panel rather
+  // than having to guess why a call failed.
+  void GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const;
   int GetActiveLightCount() const;
   bool GetActiveLight(int index, Dx8to12_LightInfo* out) const;
 

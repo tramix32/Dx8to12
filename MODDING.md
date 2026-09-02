@@ -165,6 +165,45 @@ write when the DLL unloads. A mod animating a value in a slider therefore
 costs one file write per second, not one per frame. There is no need -- and no
 API -- to ask for a save explicitly.
 
+### Building a settings panel
+
+Every setting in the INI is reachable at runtime by name through
+`Dx8to12_GetSetting*` / `Dx8to12_SetSetting*`, so a mod can drive the whole
+upscaler from its own UI. Two calls exist so it doesn't have to hardcode the
+list:
+
+```c
+int count = Dx8to12_GetSettingCount();
+Dx8to12_SettingInfo info;              // name[64], type (0 int/1 float/2 bool), persists
+for (int i = 0; i < count; ++i) {
+  if (Dx8to12_GetSettingInfo(i, &info)) { /* build a row */ }
+}
+```
+
+A setting added to a later version of this DLL then appears in that panel by
+itself, with no matching mod update.
+
+For the "is it actually on" line such panels show, ask what the upscaler is
+*doing* rather than reading the settings back:
+
+```c
+Dx8to12_UpscalerStatus status;
+if (Dx8to12_GetUpscalerStatus(&status)) {
+  // compiled_in, helper_running, ready, healthy, mode, preset,
+  // helper_status, failed_frames, render_*/output_*
+}
+```
+
+The distinction matters: the settings say what was requested, the status says
+what happened. They differ whenever the helper failed to start, the GPU has no
+DLSS, or a value was clamped -- and a panel reading only the settings back
+cannot tell a working upscaler from a silently disabled one. `helper_status`
+carries the reason (adapter not found, Streamline init failed, shared handles
+failed, and so on) so the panel can say which.
+
+`compiled_in` is 0 in a build with the upscaler compiled out; a panel should
+grey itself out rather than treat that as an error.
+
 ### Hotkeys
 
 Debug builds and the measurement profile bind three keys. They are separate
