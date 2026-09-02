@@ -17,7 +17,7 @@ namespace {
 // 2 adds setting enumeration (Dx8to12_GetSettingCount/GetSettingInfo) and
 // Dx8to12_GetUpscalerStatus, so a mod can build a settings panel without a
 // hardcoded key list and can show what the upscaler is really doing.
-constexpr int kApiVersion = 2;
+constexpr int kApiVersion = 3;
 }  // namespace
 
 extern "C" {

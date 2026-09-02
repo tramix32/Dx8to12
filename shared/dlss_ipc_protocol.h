@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 5;
+inline constexpr uint32_t kVersion = 6;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -158,6 +158,16 @@ struct Handshake {
   uint32_t seen_mvec_in_format = 0;
   // Whether neural rendering is actually running, as opposed to requested.
   uint32_t neural_rendering_active = 0;
+  // Whether a neural rendering runtime was found at all. Separate from
+  // _active because the two fail for different reasons and a settings panel
+  // wants to say which: "no runtime installed" is the user's to fix by
+  // dropping a DLL in, "found but not running" is not.
+  uint32_t neural_rendering_available = 0;
+  // The file the helper decided was that runtime, or the reason field stays
+  // empty. Reported rather than assumed because the name is not something
+  // this project can know ahead of time -- NVIDIA ships DLSS 5 for RTX 50
+  // only, so an RTX 40 build arrives from outside and may be called anything.
+  char neural_rendering_runtime[64] = {};
 };
 
 }  // namespace Dx8to12::DlssIpc

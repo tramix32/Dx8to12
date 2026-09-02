@@ -2391,6 +2391,11 @@ void Device::GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const {
     out->preset = static_cast<int>(dlss_client_->preset());
     out->neural_rendering_active =
         static_cast<int>(dlss_client_->neural_rendering_active());
+    out->neural_rendering_available =
+        static_cast<int>(dlss_client_->neural_rendering_available());
+    strncpy_s(out->neural_rendering_runtime,
+              sizeof(out->neural_rendering_runtime),
+              dlss_client_->neural_rendering_runtime(), _TRUNCATE);
     // The client's own sizes are authoritative once it is running: they are
     // what the shared textures were actually created at, which is not the
     // same as the current setting if the setting changed since.

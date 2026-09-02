@@ -72,6 +72,14 @@ struct Dx8to12_UpscalerStatus {
   // Whether DLSS 5 Neural Rendering is running, which is not the same as
   // having been asked for: it needs an NGX runtime that may be absent.
   int neural_rendering_active;
+  // Whether such a runtime was found. A panel should offer the option only
+  // when this is set -- an unavailable feature the user can switch on and
+  // watch do nothing is worse than one that is visibly not installed.
+  int neural_rendering_available;
+  // Which file that was, or empty. Named because the user is the one who
+  // installs it, so the useful message is "found nvngx_dlssnr.dll" rather
+  // than "yes".
+  char neural_rendering_runtime[64];
   unsigned int failed_frames;
   unsigned int render_width;
   unsigned int render_height;

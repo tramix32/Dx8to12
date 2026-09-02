@@ -22,8 +22,11 @@
 #include <wrl/client.h>
 
 #include <cstdio>
+#include <cstring>
 #include <iostream>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "dlss_ipc_protocol.h"
 
@@ -142,6 +145,138 @@ struct PresentPump {
   }
 };
 
+// Runtimes NGX ships that are definitely not neural rendering. Observed on
+// this machine (Streamline 2.12.0 / NGX 310.7.0): nvngx_dlss = super
+// resolution, nvngx_dlssd = ray reconstruction, nvngx_dlssg = frame
+// generation, nvngx_deepdvc = the video colour filter, nvngx = the loader.
+// Listed so an unrecognised nvngx_*.dll can be reported as interesting.
+constexpr const wchar_t* kKnownNonNrRuntimes[] = {
+    L"nvngx.dll", L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"nvngx_dlssg.dll",
+    L"nvngx_deepdvc.dll"};
+
+// The neural rendering runtime. nvngx_dlssnr.dll is NGX feature 18; the
+// build circulating at the time of writing reports itself as DLSSNR
+// 310.8.0.0 and is around 158 MB, so a stub or a rename is easy to spot by
+// size alone. The alternative spellings are kept because this file arrives
+// from outside NVIDIA's own distribution -- and the search below also accepts
+// an unrecognised nvngx_*.dll placed deliberately next to the helper or the
+// game, so a differently-named build still works without a code change.
+constexpr const wchar_t* kNeuralRenderingCandidates[] = {
+    L"nvngx_dlssnr.dll", L"nvngx_dlssn.dll", L"nvngx_nr.dll"};
+
+bool EqualsIgnoreCaseW(const wchar_t* a, const wchar_t* b) {
+  return _wcsicmp(a, b) == 0;
+}
+
+std::wstring DirectoryOfThisExecutable() {
+  wchar_t path[MAX_PATH] = {};
+  if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return L"";
+  std::wstring s(path);
+  const size_t slash = s.find_last_of(L'\\');
+  return slash == std::wstring::npos ? L"" : s.substr(0, slash);
+}
+
+// Where the driver keeps its own NGX runtimes. Read from the registry rather
+// than assembled from a guessed Program Files path -- on this machine the
+// value points into the driver store, under a directory whose name carries a
+// driver hash, which no hardcoded path would ever match.
+std::wstring DriverNgxDirectory() {
+  wchar_t buffer[MAX_PATH] = {};
+  DWORD size = sizeof(buffer);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                   L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+                   L"FullPath", RRF_RT_REG_SZ, nullptr, buffer,
+                   &size) != ERROR_SUCCESS) {
+    return L"";
+  }
+  return buffer;
+}
+
+// Looks for a neural rendering runtime and reports what it found either way.
+//
+// This is a *hint*, not the authoritative check. NGX selects a feature by its
+// enum id and derives the runtime filename itself; the correct availability
+// query is NVSDK_NGX_..._GetCapabilityParameters plus that feature's
+// _Available parameter, which needs the SDK headers this build may not have.
+// Until those are present the presence of the file is the best evidence
+// obtainable, and saying so is better than either silently assuming yes or
+// refusing to look.
+//
+// `trusted` distinguishes a directory the user deliberately put files in
+// (next to the helper, or next to the game) from the driver store: in the
+// former an unrecognised nvngx_*.dll is taken as the runtime, because putting
+// it there is exactly how someone would install one. In the latter only the
+// candidate names are accepted -- picking up an unknown driver-shipped DLL
+// and loading it into the game is not a decision to make on the user's
+// behalf.
+bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
+                                 std::string* found_name) {
+  struct SearchDir {
+    std::wstring path;
+    bool trusted;
+  };
+  std::vector<SearchDir> dirs;
+  const std::wstring exe_dir = DirectoryOfThisExecutable();
+  if (!exe_dir.empty()) dirs.push_back({exe_dir, true});
+  wchar_t cwd[MAX_PATH] = {};
+  if (GetCurrentDirectoryW(MAX_PATH, cwd) != 0 &&
+      (exe_dir.empty() || !EqualsIgnoreCaseW(cwd, exe_dir.c_str()))) {
+    dirs.push_back({cwd, true});
+  }
+  const std::wstring driver_dir = DriverNgxDirectory();
+  if (!driver_dir.empty()) dirs.push_back({driver_dir, false});
+
+  for (const SearchDir& dir : dirs) {
+    const std::wstring pattern = dir.path + L"\\nvngx_*.dll";
+    WIN32_FIND_DATAW find = {};
+    HANDLE handle = FindFirstFileW(pattern.c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) continue;
+    do {
+      if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+      bool known_other = false;
+      for (const wchar_t* known : kKnownNonNrRuntimes) {
+        if (EqualsIgnoreCaseW(find.cFileName, known)) known_other = true;
+      }
+      if (known_other) continue;
+
+      bool is_candidate = false;
+      for (const wchar_t* candidate : kNeuralRenderingCandidates) {
+        if (EqualsIgnoreCaseW(find.cFileName, candidate)) is_candidate = true;
+      }
+      if (!is_candidate && !dir.trusted) {
+        // Interesting, but not ours to load. Name it so it stops being a
+        // mystery if neural rendering is expected and does not appear.
+        std::fprintf(stderr,
+                     "DLAA helper: driver ships an unrecognised NGX runtime "
+                     "%ls; not loaded (only a deliberately installed one "
+                     "is).\n",
+                     find.cFileName);
+        continue;
+      }
+      const std::wstring path = dir.path + L"\\" + find.cFileName;
+      char narrow[64] = {};
+      WideCharToMultiByte(CP_UTF8, 0, find.cFileName, -1, narrow,
+                          static_cast<int>(sizeof(narrow) - 1), nullptr,
+                          nullptr);
+      std::fprintf(stderr,
+                   "DLAA helper: neural rendering runtime candidate %ls (%s) "
+                   "in %ls\n",
+                   find.cFileName,
+                   is_candidate ? "known name" : "installed here",
+                   dir.path.c_str());
+      FindClose(handle);
+      if (found_path) *found_path = path;
+      if (found_name) *found_name = narrow;
+      return true;
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+  }
+  std::fprintf(stderr,
+               "DLAA helper: no neural rendering runtime found. Drop one next "
+               "to the game or this helper to enable it.\n");
+  return false;
+}
+
 // DLSS 5 Neural Rendering.
 //
 // Separate from everything above because it is not a Streamline feature:
@@ -156,31 +291,59 @@ struct PresentPump {
 // buffer rather than estimated from the final image, which is strictly more
 // than a post-process injector can offer it.
 //
-// Deliberately left unimplemented rather than guessed at: the NR feature id
-// and its NGX parameter names are not something to invent, and this session
-// has already paid for assumptions about another library's conventions. With
-// the SDK present these are declarations to read, not guesses to make.
+// What is known about the remaining work, so it is not re-derived:
+//
+//   * The feature is NGX feature id 18, driven through the NGX D3D12 entry
+//     points -- not through Streamline, whose 2.12 feature list stops at
+//     DLSS, DLSS_G, DLSS_RR and DirectSR.
+//   * It evaluates *on D3D12*. Every other integration of it has to mirror
+//     colour, depth and motion vectors into shared D3D12 textures and copy
+//     the result back; this helper is already a D3D12 process being handed
+//     exactly those three as shared textures, which is why the transport work
+//     is done rather than pending.
+//   * Depth must be a 32-bit format. Ours is R32_FLOAT, so that holds.
+//   * The runtime refuses calls from a caller it does not recognise: it wants
+//     a real NVSDK_NGX_D3D12_Init_ProjectID, not a placeholder. This is the
+//     part that cannot be written without the SDK headers, and the reason
+//     the calls below are absent rather than approximated.
+//   * RTX 40 is a supported target, not only RTX 50.
 struct NeuralRendering {
   bool active = false;
+  bool available = false;
+  std::string runtime_name;
+
+  // Looks for the runtime whether or not it was asked for, so a settings
+  // panel can offer the option only when it would do something. The
+  // difference between "no runtime installed" and "installed but switched
+  // off" is the user's to see and only one of the two is theirs to fix,
+  // which is why this is separate from Initialise.
+  void Probe() {
+    std::wstring path;
+    available = ProbeNeuralRenderingRuntime(&path, &runtime_name);
+    runtime_path_ = path;
+  }
 
   bool Initialise(ID3D12Device* device, uint32_t output_width,
                   uint32_t output_height) {
+    if (!available) return false;
 #ifdef DX8TO12_HAVE_NGX
     (void)device;
     (void)output_width;
     (void)output_height;
     std::fprintf(stderr,
-                 "DLAA helper: the NGX SDK is present but the neural "
-                 "rendering calls are not written yet.\n");
+                 "DLAA helper: found %s and the NGX SDK, but the neural "
+                 "rendering calls are not written yet.\n",
+                 runtime_name.c_str());
     return false;
 #else
     (void)device;
     (void)output_width;
     (void)output_height;
     std::fprintf(stderr,
-                 "DLAA helper: neural rendering was requested, but this build "
-                 "has no NGX SDK (third_party/ngx). Running super resolution "
-                 "only.\n");
+                 "DLAA helper: found %s, but this build has no NGX SDK "
+                 "(third_party/ngx) to drive it with. Running super "
+                 "resolution only.\n",
+                 runtime_name.c_str());
     return false;
 #endif
   }
@@ -195,6 +358,9 @@ struct NeuralRendering {
   }
 
   void Shutdown() { active = false; }
+
+ private:
+  std::wstring runtime_path_;
 };
 
 struct SlotResources {
@@ -414,6 +580,13 @@ int RunDlaaHelper(const wchar_t* map_name) {
     shared->seen_mvec_in_format = static_cast<uint32_t>(d.Format);
   }
   NeuralRendering neural;
+  // Probe regardless of the request: the shim reports availability to mods,
+  // and a panel needs to know before anyone asks for it.
+  neural.Probe();
+  shared->neural_rendering_available = neural.available ? 1u : 0u;
+  strncpy_s(shared->neural_rendering_runtime,
+            sizeof(shared->neural_rendering_runtime),
+            neural.runtime_name.c_str(), _TRUNCATE);
   if (shared->neural_rendering) {
     neural.active = neural.Initialise(device.Get(), shared->output_width,
                                       shared->output_height);

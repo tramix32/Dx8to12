@@ -76,6 +76,10 @@ else()
   message(STATUS "NGX SDK not found at ${DX8TO12_NGX_DIR} -- DLSS 5 Neural Rendering disabled")
 endif()
 
+# RegGetValueW, for the driver's own NGX directory. Linked in both branches
+# because the Streamline one replaces D3D12.lib/DXGI.lib, not the rest of Win32.
+target_link_libraries(dx8to12_dlaa_helper PRIVATE Advapi32.lib)
+
 if(MSVC)
   target_compile_options(dx8to12_dlaa_helper PRIVATE /W4 /wd4100 /wd4505)
 endif()

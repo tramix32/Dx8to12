@@ -79,6 +79,14 @@ uint32_t DlssClient::neural_rendering_active() const {
   return shared_ ? shared_->neural_rendering_active : 0u;
 }
 
+uint32_t DlssClient::neural_rendering_available() const {
+  return shared_ ? shared_->neural_rendering_available : 0u;
+}
+
+const char *DlssClient::neural_rendering_runtime() const {
+  return shared_ ? shared_->neural_rendering_runtime : "";
+}
+
 DlssClient::~DlssClient() { Stop(); }
 
 bool DlssClient::Start(uint32_t render_width, uint32_t render_height,
