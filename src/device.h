@@ -782,12 +782,40 @@ class Device : public IDirect3DDevice8, RefCounted {
   // substitution happens only where a target is actually bound, in
   // CurrentColorTarget().
   ComPtr<GpuTexture> scene_color_tex_;
+  // The scene's own depth buffer, at render resolution. Separate from the
+  // game's depth_stencil_tex_ because that one is shared with the game's own
+  // render targets (radar, menu blur, mirrors) and those still draw at output
+  // resolution -- a smaller depth buffer bound underneath them would clip
+  // them. See CurrentDepthTarget.
+  ComPtr<GpuTexture> scene_depth_tex_;
+  // Output resolution divided by this is the scene's resolution. 1.0 unless
+  // an upscaler is running, since rendering smaller without one just renders
+  // the game smaller.
+  float scene_render_scale_ = 1.f;
+  uint32_t scene_render_width_ = 0;
+  uint32_t scene_render_height_ = 0;
   // False once the scene has been copied out for the frame, so the mod
   // callbacks and anything else after that point go to the real backbuffer.
   bool scene_pass_active_ = false;
   // Ends the scene pass: copies scene_color_tex_ into the current backbuffer
   // and marks the OM dirty so the next BeginScene rebinds it. Idempotent.
   void ResolveScenePass();
+
+  // Called before every draw. Ends the scene pass at the frame's first
+  // pre-transformed (2D) draw, so the HUD is drawn onto the finished,
+  // full-resolution frame instead of going through the upscaler with it.
+  //
+  // 2D content must not go through a temporal upscaler, for three separate
+  // reasons, all three observed: it has no motion vectors of its own so it
+  // inherits the world's and gets reprojected as if it were scenery; it is
+  // never jittered, so un-jittering the whole image makes it shake; and at a
+  // reduced render scale it would be upscaled along with the scene and come
+  // out blurry.
+  void EndScenePassIfDrawIsUi(bool draw_is_pretransformed);
+  // Whether any 3D geometry has been drawn this frame yet. Without this, a
+  // game that opens a frame with a 2D element (a fade, a letterbox) would end
+  // the scene pass before the scene existed.
+  bool frame_had_3d_draw_ = false;
 #endif
 
  public:
@@ -849,6 +877,19 @@ class Device : public IDirect3DDevice8, RefCounted {
   // otherwise the scene pass and the PSO's declared format drift apart.
   GpuTexture *CurrentColorTarget();
 
+  // The depth target that belongs with CurrentColorTarget(). Only differs
+  // from the game's own while the scene pass is rendering at a reduced
+  // resolution; D3D12 needs the depth buffer to match the colour target it is
+  // bound with.
+  GpuTexture *CurrentDepthTarget();
+
+  // The viewport to actually give D3D12, which is the game's scaled into the
+  // scene's resolution while the scene pass is active. viewport_ itself stays
+  // exactly as the game set it -- GetViewport has to keep returning that, and
+  // the XYZRHW vertex path converts screen coordinates using the game's own
+  // dimensions.
+  D3D12_VIEWPORT EffectiveViewport();
+
   // Executes whatever is recorded so far and reopens the command list, with
   // none of SubmitAndWait's frame bookkeeping -- no fence, no Present, no
   // frame-resource release, no allocator reset (the allocator still backs
@@ -870,6 +911,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   // mode switch restarts it and nothing else does.
   uint32_t dlss_started_width_ = 0;
   uint32_t dlss_started_height_ = 0;
+  uint32_t dlss_started_render_width_ = 0;
   int dlss_started_mode_ = -1;
 
 #ifdef DX8TO12_TEMPORAL_JITTER

@@ -1555,6 +1555,37 @@ void Device::ResolveScenePass() {
   if (!scene_color_tex_) return;
 
   GpuTexture *backbuffer = back_buffers_.at(current_back_buffer_).Get();
+  // CopyResource needs identical dimensions. They differ whenever the scene
+  // is being rendered smaller than the output, in which case the upscaler --
+  // not this copy -- is what puts an image on the backbuffer, and there is
+  // nothing sensible to do here. Presenting the previous backbuffer for a
+  // frame beats a validation error and a corrupt one.
+  if (backbuffer->resource_desc().Width != scene_color_tex_->resource_desc().Width ||
+      backbuffer->resource_desc().Height != scene_color_tex_->resource_desc().Height) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG_ERROR() << "ResolveScenePass: scene is "
+                  << scene_color_tex_->resource_desc().Width << "x"
+                  << scene_color_tex_->resource_desc().Height
+                  << " but the backbuffer is "
+                  << backbuffer->resource_desc().Width << "x"
+                  << backbuffer->resource_desc().Height
+                  << "; clearing instead of copying (the upscaler owns this "
+                     "frame's output).\n";
+    }
+    // Cleared rather than left alone. A backbuffer nothing wrote holds
+    // whatever the swap chain last had there, which shows up as torn strips
+    // of colour on black -- exactly what a loading screen or a menu frame
+    // that never reached the upscaler looks like.
+    TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float black[4] = {0.f, 0.f, 0.f, 1.f};
+    cmd_list_->ClearRenderTargetView(backbuffer->rtv_handle(), black, 0,
+                                     nullptr);
+    dirty_flags_ |= DIRTY_FLAG_OM;
+    dirty_flags_ |= DIRTY_FLAG_PSO;
+    return;
+  }
   TransitionTexture(scene_color_tex_.Get(), 0,
                     D3D12_RESOURCE_STATE_COPY_SOURCE);
   TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1741,10 +1772,25 @@ float MaxMatrixDelta(const DirectX::SimpleMath::Matrix &a,
 
 void Device::RecordMotionVectorPass() {
   if (!GetConfig().motion_vectors) return;
+#ifdef DX8TO12_SCENE_TARGET
+  // Only meaningful while the scene pass is open, and only once per frame:
+  // it advances prev_view_proj_, so running it twice would compare a frame
+  // against itself. The scene pass now ends at the first 2D draw (see
+  // EndScenePassIfDrawIsUi), which is where this normally runs from; the
+  // call at Present is then a no-op.
+  if (!scene_pass_active_) return;
+#endif
   if (!motion_vector_tex_ || !depth_copy_tex_ || !mvec_pso_ ||
-      !bound_depth_target_ || !frame_view_proj_captured_) {
+      !frame_view_proj_captured_) {
     return;
   }
+  // The depth the scene was actually rendered into, which is not the game's
+  // own once the scene renders at a reduced resolution. Reading the game's
+  // there means reading a buffer nothing wrote this frame -- which produces
+  // motion vectors for geometry that never moved, and so ghosting on static
+  // scenery.
+  GpuTexture *scene_depth = CurrentDepthTarget();
+  if (!scene_depth) return;
   // Nothing to compare against on the first frame after startup or a Reset.
   DirectX::SimpleMath::Matrix inv_view_proj;
   frame_view_proj_.Invert(inv_view_proj);
@@ -1809,7 +1855,7 @@ void Device::RecordMotionVectorPass() {
   const D3D12_CPU_DESCRIPTOR_HANDLE mvec_rtvs[2] = {
       motion_vector_tex_->rtv_handle(), depth_copy_tex_->rtv_handle()};
   cmd_list_->OMSetRenderTargets(2, mvec_rtvs, FALSE, nullptr);
-  TransitionTexture(bound_depth_target_.Get(), 0,
+  TransitionTexture(scene_depth, 0,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -1830,7 +1876,7 @@ void Device::RecordMotionVectorPass() {
   cmd_list_->SetGraphicsRootConstantBufferView(
       0, dynamic_ring_buffer_->GetGpuPtrFor(alloc));
   cmd_list_->SetGraphicsRootDescriptorTable(
-      1, srv_heap_.GetGPUHandleFor(bound_depth_target_->srv_handle()));
+      1, srv_heap_.GetGPUHandleFor(scene_depth->srv_handle()));
   cmd_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   cmd_list_->DrawInstanced(3, 1, 0, 0);
 
@@ -1857,8 +1903,7 @@ void Device::RecordMotionVectorPass() {
   }
 #endif
 
-  TransitionTexture(bound_depth_target_.Get(), 0,
-                    D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  TransitionTexture(scene_depth, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
   MarkResourceAsUsed(InternalPtr(motion_vector_tex_.Get()));
   MarkResourceAsUsed(InternalPtr(depth_copy_tex_.Get()));
 
@@ -1974,12 +2019,25 @@ void Device::RunDlaaExchange() {
         inv_view_proj * prev_view_proj_;
     const DirectX::SimpleMath::Matrix prev_to_clip =
         inv_prev_view_proj * frame_view_proj_;
-    memcpy(constants.view_to_clip, &frame_proj_, sizeof(constants.view_to_clip));
-    memcpy(constants.clip_to_view, &inv_proj, sizeof(constants.clip_to_view));
-    memcpy(constants.clip_to_prev_clip, &clip_to_prev,
-           sizeof(constants.clip_to_prev_clip));
-    memcpy(constants.prev_clip_to_clip, &prev_to_clip,
-           sizeof(constants.prev_clip_to_clip));
+    // Row-vector (v * M) throughout this codebase, matching D3D8. If the
+    // upscaler reads them as column-vector every matrix is effectively
+    // transposed, and history gets reprojected by the wrong transform --
+    // which looks like content sheared into a skewed quad rather than merely
+    // blurred. TransposeUpscalerMatrices exists to settle that by experiment
+    // instead of by guessing at another library's convention.
+    const bool transpose = GetConfig().transpose_upscaler_matrices;
+    auto store = [transpose](float out[16],
+                             const DirectX::SimpleMath::Matrix &m) {
+      for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+          out[row * 4 + col] = transpose ? m.m[col][row] : m.m[row][col];
+        }
+      }
+    };
+    store(constants.view_to_clip, frame_proj_);
+    store(constants.clip_to_view, inv_proj);
+    store(constants.clip_to_prev_clip, clip_to_prev);
+    store(constants.prev_clip_to_clip, prev_to_clip);
     // Rows of the inverse view matrix are the camera's own axes and position.
     for (int i = 0; i < 3; ++i) {
       constants.right[i] = inv_view.m[0][i];
@@ -2007,14 +2065,21 @@ void Device::RunDlaaExchange() {
     const uint32_t width =
         static_cast<uint32_t>(motion_vector_tex_->resource_desc().Width);
     const uint32_t height = motion_vector_tex_->resource_desc().Height;
-    constants.mvec_scale[0] = width ? 1.f / static_cast<float>(width) : 1.f;
-    constants.mvec_scale[1] = height ? 1.f / static_cast<float>(height) : 1.f;
+    const float mvec_multiplier = GetConfig().mvec_scale_multiplier;
+    constants.mvec_scale[0] =
+        width ? mvec_multiplier / static_cast<float>(width) : 1.f;
+    constants.mvec_scale[1] =
+        height ? mvec_multiplier / static_cast<float>(height) : 1.f;
     dlss_client_->SetCameraConstants(constants);
   }
 #endif
   dlss_client_->SubmitFrame(
 #ifdef DX8TO12_TEMPORAL_JITTER
-      jitter_pixels_.x, jitter_pixels_.y,
+      // JitterSign: the projection is offset by +jitter, but the upscaler may
+      // define this value as the correction for that offset rather than the
+      // offset itself. Nothing in either API says which.
+      GetConfig().jitter_sign * jitter_pixels_.x,
+      GetConfig().jitter_sign * jitter_pixels_.y,
 #else
       0.f, 0.f,
 #endif
@@ -2025,21 +2090,16 @@ void Device::RunDlaaExchange() {
   // ~1.6ms with the GPU sitting idle -- pure serialisation, not work.
   GpuTexture *color_out = dlss_client_->AcquirePreviousResult();
 
-  scene_pass_active_ = false;
   if (!color_out) {
     // Normal on the first frame (there is no previous one) and on any frame
-    // the helper missed. Not an error worth stopping for: the scene is still
-    // in the scene target, so present it exactly as a build without DLAA
-    // would.
-    TransitionTexture(scene_color_tex_.Get(), 0,
-                      D3D12_RESOURCE_STATE_COPY_SOURCE);
-    TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
-    cmd_list_->CopyResource(backbuffer->resource(),
-                            scene_color_tex_->resource());
-    dirty_flags_ |= DIRTY_FLAG_OM;
-    dirty_flags_ |= DIRTY_FLAG_PSO;
+    // the helper missed. Falls back to the plain resolve, which itself knows
+    // to do nothing when the scene and the backbuffer are different sizes.
+    // Called before clearing scene_pass_active_, because that flag is exactly
+    // what ResolveScenePass early-returns on.
+    ResolveScenePass();
     return;
   }
+  scene_pass_active_ = false;
 
   TransitionTexture(color_out, 0, D3D12_RESOURCE_STATE_COPY_SOURCE);
   TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2050,6 +2110,59 @@ void Device::RunDlaaExchange() {
   dirty_flags_ |= DIRTY_FLAG_PSO;
 }
 #endif
+
+#ifdef DX8TO12_SCENE_TARGET
+void Device::EndScenePassIfDrawIsUi(bool draw_is_pretransformed) {
+  if (!scene_pass_active_) return;
+  if (!draw_is_pretransformed) {
+    frame_had_3d_draw_ = true;
+    return;
+  }
+  // A 2D draw before any 3D one is not the HUD arriving -- it is a fade, a
+  // letterbox or a loading screen, and the scene has not been rendered yet.
+  if (!frame_had_3d_draw_) return;
+
+#ifdef DX8TO12_MOTION_VECTORS
+  // Must run while the scene's depth buffer still holds this frame's scene,
+  // i.e. before the pass below ends it.
+  RecordMotionVectorPass();
+#endif
+  // From here the frame is finished as far as the upscaler is concerned:
+  // resolve it onto the backbuffer, and let everything after this draw onto
+  // that, at output resolution and with no temporal processing.
+  if (dlss_client_ && dlss_client_->PollReady()) {
+    RunDlaaExchange();
+  } else {
+    ResolveScenePass();
+  }
+}
+#endif
+
+GpuTexture *Device::CurrentDepthTarget() {
+#ifdef DX8TO12_SCENE_TARGET
+  // Only substitute for the game's own depth while the scene pass is drawing
+  // into the scene target at a different size. Anything the game renders to
+  // its own target keeps its own depth buffer, at its own resolution.
+  if (scene_pass_active_ && !bound_render_target_ && scene_depth_tex_ &&
+      scene_render_scale_ != 1.f && bound_depth_target_) {
+    return scene_depth_tex_.Get();
+  }
+#endif
+  return bound_depth_target_.Get();
+}
+
+D3D12_VIEWPORT Device::EffectiveViewport() {
+  D3D12_VIEWPORT result = viewport_;
+#ifdef DX8TO12_SCENE_TARGET
+  if (scene_pass_active_ && !bound_render_target_ && scene_render_scale_ != 1.f) {
+    result.TopLeftX *= scene_render_scale_;
+    result.TopLeftY *= scene_render_scale_;
+    result.Width *= scene_render_scale_;
+    result.Height *= scene_render_scale_;
+  }
+#endif
+  return result;
+}
 
 GpuTexture *Device::CurrentColorTarget() {
   // A game-set render target always wins: that is the game explicitly drawing
@@ -2368,11 +2481,32 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // this is the one place that knows the backbuffer's final size and format,
   // and it runs again on every Reset (resolution change / device lost).
   scene_color_tex_.Reset();
+  scene_depth_tex_.Reset();
   {
+    // Resolved once per Reset rather than read per frame: every resource
+    // below is sized from it, so it cannot change without recreating them.
+    // Rendering smaller only makes sense with an upscaler to put it back.
+    scene_render_scale_ =
+        GetConfig().temporal_aa != 0
+            ? std::clamp(GetConfig().render_scale, 0.5f, 1.0f)
+            : 1.0f;
+    scene_render_width_ = std::max(
+        1u, static_cast<uint32_t>(pPresentationParameters->BackBufferWidth *
+                                  scene_render_scale_));
+    scene_render_height_ = std::max(
+        1u, static_cast<uint32_t>(pPresentationParameters->BackBufferHeight *
+                                  scene_render_scale_));
+    if (scene_render_scale_ != 1.0f) {
+      LOG(AixLog::Severity::info)
+          << "Reset: scene renders at " << scene_render_width_ << "x"
+          << scene_render_height_ << " (scale " << scene_render_scale_
+          << "), output " << pPresentationParameters->BackBufferWidth << "x"
+          << pPresentationParameters->BackBufferHeight << "\n";
+    }
     const D3DFORMAT scene_format = DXGIToD3DFormat(new_format);
     scene_color_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
-        this, TextureKind::Texture2d, pPresentationParameters->BackBufferWidth,
-        pPresentationParameters->BackBufferHeight, 1, 1, D3DUSAGE_RENDERTARGET,
+        this, TextureKind::Texture2d, scene_render_width_,
+        scene_render_height_, 1, 1, D3DUSAGE_RENDERTARGET,
         scene_format, D3DPOOL_DEFAULT)));
     scene_color_tex_->SetName("scene_color_tex");
     // The PSO cache keys on the bound render target's DXGI format and never
@@ -2383,12 +2517,28 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     ASSERT(scene_color_tex_->resource_desc().Format == new_format);
     ASSERT(back_buffers_.at(0)->resource_desc().Format ==
            new_format);
+
+    // A depth buffer of the scene's own size, and only when the scene is
+    // actually smaller. The game's depth_stencil_tex_ is shared with its own
+    // render targets (radar, menu blur, mirrors), which still draw at output
+    // resolution; binding a smaller depth buffer under those would clip them.
+    if (scene_render_scale_ != 1.0f &&
+        pPresentationParameters->EnableAutoDepthStencil) {
+      D3DFORMAT depth_format = pPresentationParameters->AutoDepthStencilFormat;
+      if (depth_format == D3DFMT_UNKNOWN) depth_format = D3DFMT_D32;
+      scene_depth_tex_ = ComOwn(static_cast<GpuTexture *>(BaseTexture::Create(
+          this, TextureKind::Texture2d, scene_render_width_,
+          scene_render_height_, 1, 1, D3DUSAGE_DEPTHSTENCIL, depth_format,
+          D3DPOOL_DEFAULT)));
+      scene_depth_tex_->SetName("scene_depth_tex");
+    }
   }
   // Reset() ends a frame's worth of state; the next frame starts with the
   // scene pass open again -- if anything wants it. With it closed, every
   // downstream site (CurrentColorTarget, ResolveScenePass) falls back to the
   // backbuffer on its own, so this one assignment is the whole switch.
   scene_pass_active_ = SceneTargetWanted();
+  frame_had_3d_draw_ = false;
 #endif
 
 #ifdef DX8TO12_MOTION_VECTORS
@@ -2403,8 +2553,10 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     const D3D12_RESOURCE_DESC desc{
         .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-        .Width = pPresentationParameters->BackBufferWidth,
-        .Height = pPresentationParameters->BackBufferHeight,
+        // The scene's resolution, not the output's: these describe the scene
+        // the upscaler is reconstructing from.
+        .Width = scene_render_width_,
+        .Height = scene_render_height_,
         .DepthOrArraySize = 1,
         .MipLevels = 1,
         .Format = DXGI_FORMAT_R16G16_FLOAT,
@@ -4721,6 +4873,7 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
   // backbuffer's format.
   const DXGI_FORMAT current_rtv_format =
       CurrentColorTarget()->resource_desc().Format;
+  GpuTexture *const current_depth_target = CurrentDepthTarget();
 
   // Now that we know our pixel shader, try to look into the PSO cache.
   PSOState pso_key{
@@ -4962,9 +5115,12 @@ ComPtr<ID3D12PipelineState> Device::CreatePSO(D3DPRIMITIVETYPE d3d8_prim_type) {
       // must be the concrete DSV-compatible format instead, or D3D12
       // rejects every draw with "the depth stencil format does not match
       // that specified by the current pipeline state".
-      .DSVFormat = bound_depth_target_
+      // CurrentDepthTarget, not bound_depth_target_: it is what BeginScene
+      // actually binds, and a PSO whose DSVFormat disagrees with the bound
+      // DSV makes D3D12 reject every draw.
+      .DSVFormat = current_depth_target
                        ? DepthDsvFormatFromTypeless(
-                             bound_depth_target_->resource_desc().Format)
+                             current_depth_target->resource_desc().Format)
                        : DXGI_FORMAT_UNKNOWN,
       .SampleDesc = {.Count = 1, .Quality = 0}};
   ComPtr<ID3D12PipelineState> pso;
@@ -4980,18 +5136,23 @@ HRESULT STDMETHODCALLTYPE Device::BeginScene() {
 #ifdef DX8TO12_ENABLE_MINDEBUG
   KeepGtaTargetRoadLodVisible();
 #endif
-  // Set viewports.
-  cmd_list_->RSSetViewports(1, &viewport_);
+  // Set viewports. Scaled into the scene's resolution when it is rendering
+  // smaller than the output; viewport_ itself stays as the game set it.
+  const D3D12_VIEWPORT effective = EffectiveViewport();
+  cmd_list_->RSSetViewports(1, &effective);
   D3D12_RECT scissors = {.left = 0,
                          .top = 0,
-                         .right = static_cast<LONG>(viewport_.Width),
-                         .bottom = static_cast<LONG>(viewport_.Height)};
+                         .right = static_cast<LONG>(effective.Width),
+                         .bottom = static_cast<LONG>(effective.Height)};
   cmd_list_->RSSetScissorRects(1, &scissors);
 
   ID3D12DescriptorHeap *heaps[] = {srv_heap_.heap(), sampler_heap_.heap()};
   cmd_list_->SetDescriptorHeaps(sizeof(heaps) / sizeof(heaps[0]), heaps);
 
   GpuTexture *render_target = CurrentColorTarget();
+  // Must be chosen together with the colour target: D3D12 renders only where
+  // both cover, so a mismatched pair silently clips the frame.
+  GpuTexture *depth_target = CurrentDepthTarget();
 
   // Transition the back buffer from present (or common) to render target.
   TransitionTexture(render_target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -4999,12 +5160,13 @@ HRESULT STDMETHODCALLTYPE Device::BeginScene() {
   // Set the default render targets.
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = render_target->rtv_handle();
   D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = {};
-  if (bound_depth_target_) {
-    dsv_handle = bound_depth_target_->dsv_handle();
-    MarkResourceAsUsed(InternalPtr(bound_depth_target_.Get()));
+  if (depth_target) {
+    TransitionTexture(depth_target, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    dsv_handle = depth_target->dsv_handle();
+    MarkResourceAsUsed(InternalPtr(depth_target));
   }
   cmd_list_->OMSetRenderTargets(1, &rtv_handle, 1,
-                                bound_depth_target_ ? &dsv_handle : nullptr);
+                                depth_target ? &dsv_handle : nullptr);
   MarkResourceAsUsed(InternalPtr(render_target));
   dirty_flags_ ^= DIRTY_FLAG_OM;
   return S_OK;
@@ -5026,11 +5188,18 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
       rect_storage.resize(Count);
       rect_dest = rect_storage.data();
     }
+    // The game states its rects in its own coordinates. When the scene is
+    // being rendered smaller than the game thinks, they have to be scaled
+    // with it or a partial clear lands in the wrong place.
+    const float scale =
+        (viewport_.Width > 0.f) ? EffectiveViewport().Width / viewport_.Width
+                                : 1.f;
     for (DWORD i = 0; i < Count; ++i) {
-      rect_dest[i] = {.left = pRects[i].x1,
-                         .top = pRects[i].y1,
-                         .right = pRects[i].x2,
-                         .bottom = pRects[i].y2};
+      rect_dest[i] = {
+          .left = static_cast<LONG>(pRects[i].x1 * scale),
+          .top = static_cast<LONG>(pRects[i].y1 * scale),
+          .right = static_cast<LONG>(pRects[i].x2 * scale),
+          .bottom = static_cast<LONG>(pRects[i].y2 * scale)};
     }
     rects = rect_dest;
   }
@@ -5048,16 +5217,21 @@ HRESULT STDMETHODCALLTYPE Device::Clear(DWORD Count, CONST D3DRECT *pRects,
                                      rects);
   }
   if (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) {
-    if (!bound_depth_target_) {
+    // The one BeginScene will actually bind, which is not the game's own
+    // while the scene renders at a reduced resolution. Clearing the other one
+    // would leave the depth actually in use holding the previous frame.
+    GpuTexture *depth_target = CurrentDepthTarget();
+    if (!depth_target) {
       LOG_ERROR()
           << "Do not have any depth stencil texture allocated to clear.\n";
       return D3DERR_INVALIDCALL;
     }
+    TransitionTexture(depth_target, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_CLEAR_FLAGS clear_flags = {};
     if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D12_CLEAR_FLAG_DEPTH;
     if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D12_CLEAR_FLAG_STENCIL;
     cmd_list_->ClearDepthStencilView(
-        bound_depth_target_->dsv_handle(), clear_flags, Z,
+        depth_target->dsv_handle(), clear_flags, Z,
         static_cast<UINT8>(Stencil), static_cast<UINT>(rects ? Count : 0),
         rects);
   }
@@ -5072,6 +5246,17 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
                               D3D12_RESOURCE_STATE_INDEX_BUFFER);
 #ifdef DX8TO12_MOTION_VECTORS
   CaptureFrameCamera();
+#endif
+#ifdef DX8TO12_SCENE_TARGET
+  {
+    // The HUD must be drawn onto the finished frame, not through the
+    // upscaler with it -- see EndScenePassIfDrawIsUi.
+    const auto shader_it = vertex_shaders_.find(bound_vertex_shader_);
+    const bool pretransformed =
+        shader_it != vertex_shaders_.end() &&
+        HasFlag(shader_it->second->fvf_desc, D3DFVF_XYZRHW);
+    EndScenePassIfDrawIsUi(pretransformed);
+  }
 #endif
   if (PrimitiveType > D3DPT_TRIANGLEFAN) {
     LOG_ERROR() << "Invalid primitive type " << PrimitiveType << "\n";
@@ -5239,10 +5424,15 @@ HRESULT Device::PrepareDrawCall(D3DPRIMITIVETYPE PrimitiveType,
     // transforms_ itself is left untouched so Device::GetViewProjMatrix (and
     // therefore mods reconstructing world position from depth) keeps seeing
     // the true, unjittered camera.
-    if (viewport_.Width > 0.f && viewport_.Height > 0.f) {
-      proj.m[2][0] += 2.f * jitter_pixels_.x / viewport_.Width;
+    // Divided by the *scene's* width, not the game's: the offset is defined
+    // in the pixels actually being rendered, which is what the upscaler is
+    // told about. Using the output width would make the jitter too small to
+    // do its job whenever the scene renders smaller.
+    const D3D12_VIEWPORT jitter_viewport = EffectiveViewport();
+    if (jitter_viewport.Width > 0.f && jitter_viewport.Height > 0.f) {
+      proj.m[2][0] += 2.f * jitter_pixels_.x / jitter_viewport.Width;
       // NDC y runs opposite to pixel y.
-      proj.m[2][1] += -2.f * jitter_pixels_.y / viewport_.Height;
+      proj.m[2][1] += -2.f * jitter_pixels_.y / jitter_viewport.Height;
     }
 #endif
     cbuffer->world_view_proj = world * view * proj;
@@ -6780,8 +6970,12 @@ void Device::SubmitAndWait(bool should_present) {
           back_buffers_.at(current_back_buffer_)->resource_desc();
       const uint32_t width = static_cast<uint32_t>(backbuffer_desc.Width);
       const uint32_t height = backbuffer_desc.Height;
+      // Restart on a render-resolution change too: the shared textures are
+      // sized once, at Start.
       if (mode != dlss_started_mode_ || width != dlss_started_width_ ||
-          height != dlss_started_height_) {
+          height != dlss_started_height_ ||
+          scene_render_width_ != dlss_started_render_width_) {
+        dlss_started_render_width_ = scene_render_width_;
         if (dlss_client_) dlss_client_->Stop();
         dlss_started_mode_ = mode;
         dlss_started_width_ = width;
@@ -6793,7 +6987,8 @@ void Device::SubmitAndWait(bool should_present) {
           LOG(AixLog::Severity::info)
               << "DLSS: starting helper, TemporalAA=" << mode << " -> mode "
               << static_cast<uint32_t>(helper_mode) << ".\n";
-          dlss_client_->Start(width, height, helper_mode);
+          dlss_client_->Start(scene_render_width_, scene_render_height_, width,
+                              height, helper_mode);
         }
       }
     }
@@ -6968,6 +7163,7 @@ void Device::SubmitAndWait(bool should_present) {
     // Re-evaluated per frame, so a mod toggling the setting takes effect on
     // the next frame rather than needing a device Reset.
     scene_pass_active_ = SceneTargetWanted();
+    frame_had_3d_draw_ = false;
     // CurrentColorTarget() changes answer here, and the freshly-reset
     // command list has no RTV bound anyway.
     dirty_flags_ |= DIRTY_FLAG_OM;

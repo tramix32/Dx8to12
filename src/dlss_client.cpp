@@ -32,9 +32,10 @@ std::wstring UniqueName(const wchar_t *suffix) {
          L"_" + suffix;
 }
 
-// The helper sits next to d3d8.dll, not next to the game's exe -- it ships
-// with this DLL.
-std::wstring HelperPath() {
+// Directory d3d8.dll itself was loaded from -- the game's install folder,
+// which is also where the helper and its log live. Not the working
+// directory, which a game is free to change.
+std::wstring HelperDirectory() {
   HMODULE self = nullptr;
   if (!GetModuleHandleExW(
           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -47,10 +48,14 @@ std::wstring HelperPath() {
   if (len == 0 || len == MAX_PATH) return L"";
   std::wstring result(path, len);
   const size_t slash = result.find_last_of(L"\\/");
-  result = (slash == std::wstring::npos ? L"" : result.substr(0, slash + 1));
-  // Not dx8to12_rt_helper.exe: DLAA needs a binary that links Streamline's
-  // interposer, which the RT helper deliberately does not.
-  return result + L"dx8to12_dlaa_helper.exe";
+  return (slash == std::wstring::npos ? L"" : result.substr(0, slash + 1));
+}
+
+// Not dx8to12_rt_helper.exe: DLAA needs a binary that links Streamline's
+// interposer, which the RT helper deliberately does not.
+std::wstring HelperPath() {
+  const std::wstring dir = HelperDirectory();
+  return dir.empty() ? L"" : dir + L"dx8to12_dlaa_helper.exe";
 }
 
 }  // namespace
@@ -59,11 +64,18 @@ DlssClient::DlssClient(Device *device) : device_(device) {}
 
 DlssClient::~DlssClient() { Stop(); }
 
-bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
+bool DlssClient::Start(uint32_t render_width, uint32_t render_height,
+                       uint32_t output_width, uint32_t output_height,
+                       DlssIpc::Mode mode) {
   Stop();
-  width_ = width;
-  height_ = height;
-  if (width == 0 || height == 0) return false;
+  render_width_ = render_width;
+  render_height_ = render_height;
+  output_width_ = output_width;
+  output_height_ = output_height;
+  if (render_width == 0 || render_height == 0 || output_width == 0 ||
+      output_height == 0) {
+    return false;
+  }
 
   const std::wstring map_name = UniqueName(L"map");
   const std::wstring ready_name = UniqueName(L"ready");
@@ -94,8 +106,10 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   D3D12_RESOURCE_DESC desc{
       .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
       .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-      .Width = width,
-      .Height = height,
+      // Overwritten per texture by create_shared below -- inputs are the
+      // scene's size, the output is the presented size.
+      .Width = render_width,
+      .Height = render_height,
       .DepthOrArraySize = 1,
       .MipLevels = 1,
       .Format = format,
@@ -110,9 +124,13 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
 
   auto create_shared = [&](ComPtr<GpuTexture> *out_texture, HANDLE *out_handle,
-                           const std::wstring &name,
+                           const std::wstring &name, bool at_output_resolution,
                            DXGI_FORMAT override_format = DXGI_FORMAT_UNKNOWN) {
     D3D12_RESOURCE_DESC this_desc = desc;
+    // Only the upscaled result is output-sized; everything the upscaler reads
+    // describes the smaller scene.
+    this_desc.Width = at_output_resolution ? output_width : render_width;
+    this_desc.Height = at_output_resolution ? output_height : render_height;
     if (override_format != DXGI_FORMAT_UNKNOWN) {
       this_desc.Format = override_format;
     }
@@ -137,12 +155,14 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
     const std::wstring depth_in_name = UniqueName((L"depthin" + suffix).c_str());
     const std::wstring mvec_in_name = UniqueName((L"mvecin" + suffix).c_str());
     if (!create_shared(&color_in_[slot], &color_in_handle_[slot],
-                       color_in_name) ||
+                       color_in_name, /*at_output_resolution=*/false) ||
         !create_shared(&color_out_[slot], &color_out_handle_[slot],
-                       color_out_name) ||
+                       color_out_name, /*at_output_resolution=*/true) ||
         !create_shared(&depth_in_[slot], &depth_in_handle_[slot], depth_in_name,
+                       /*at_output_resolution=*/false,
                        DXGI_FORMAT_R32_FLOAT) ||
         !create_shared(&mvec_in_[slot], &mvec_in_handle_[slot], mvec_in_name,
+                       /*at_output_resolution=*/false,
                        DXGI_FORMAT_R16G16_FLOAT)) {
       LOG(AixLog::Severity::error) << "DLSS: shared texture creation failed.\n";
       Stop();
@@ -183,10 +203,10 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   shared_->shim_process_id = GetCurrentProcessId();
   shared_->adapter_luid_low = luid.LowPart;
   shared_->adapter_luid_high = luid.HighPart;
-  shared_->render_width = width;
-  shared_->render_height = height;
-  shared_->output_width = width;
-  shared_->output_height = height;
+  shared_->render_width = render_width;
+  shared_->render_height = render_height;
+  shared_->output_width = output_width;
+  shared_->output_height = output_height;
   shared_->mode = static_cast<uint32_t>(mode);
   wcsncpy_s(shared_->ready_fence_name, ready_name.c_str(), _TRUNCATE);
   wcsncpy_s(shared_->done_fence_name, done_name.c_str(), _TRUNCATE);
@@ -200,15 +220,38 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   std::wstring command_line = L"\"" + helper + L"\" --dlaa \"" + map_name + L"\"";
   STARTUPINFOW startup = {};
   startup.cb = sizeof(startup);
+
+  // Capture the helper's output. It runs with no console, and Streamline
+  // reports most of its real failures only through its log callback -- which
+  // means that without this, a failed slEvaluateFeature is completely silent
+  // on this side and shows up only as a black screen.
+  const std::wstring helper_log = HelperDirectory() + L"dx8to12_dlaa_helper.log";
+  SECURITY_ATTRIBUTES inheritable{.nLength = sizeof(SECURITY_ATTRIBUTES),
+                                  .lpSecurityDescriptor = nullptr,
+                                  .bInheritHandle = TRUE};
+  HANDLE log_handle = CreateFileW(
+      helper_log.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+      &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  const bool have_log = log_handle != INVALID_HANDLE_VALUE;
+  if (have_log) {
+    startup.dwFlags |= STARTF_USESTDHANDLES;
+    startup.hStdOutput = log_handle;
+    startup.hStdError = log_handle;
+    startup.hStdInput = nullptr;
+  }
   if (!CreateProcessW(helper.c_str(), command_line.data(), nullptr, nullptr,
-                      FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                      /*bInheritHandles=*/have_log ? TRUE : FALSE,
+                      CREATE_NO_WINDOW, nullptr, nullptr, &startup,
                       &helper_process_)) {
+    if (have_log) CloseHandle(log_handle);
     LOG(AixLog::Severity::error)
         << "DLSS: could not launch " << std::string(helper.begin(), helper.end())
         << ", error " << GetLastError() << "\n";
     Stop();
     return false;
   }
+  // The child holds its own duplicate; this one is done with.
+  if (have_log) CloseHandle(log_handle);
 
   healthy_ = true;
   pending_history_reset_ = true;
@@ -216,8 +259,9 @@ bool DlssClient::Start(uint32_t width, uint32_t height, DlssIpc::Mode mode) {
   consecutive_timeouts_ = 0;
   start_tick_ = GetTickCount64();
   LOG(AixLog::Severity::info)
-      << "DLSS: helper launched for " << width << "x" << height << ", mode "
-      << static_cast<uint32_t>(mode) << ".\n";
+      << "DLSS: helper launched, rendering " << render_width << "x"
+      << render_height << " -> " << output_width << "x" << output_height
+      << ", mode " << static_cast<uint32_t>(mode) << ".\n";
   return true;
 }
 
@@ -291,10 +335,10 @@ bool DlssClient::PollReady() {
     // description, so a per-slot check would only ever catch a bug in that
     // loop, not in the sharing this is here to verify.
     const bool matches =
-        shared_->seen_color_in_width == width_ &&
-        shared_->seen_color_in_height == height_ &&
-        shared_->seen_depth_in_width == width_ &&
-        shared_->seen_mvec_in_width == width_ &&
+        shared_->seen_color_in_width == render_width_ &&
+        shared_->seen_color_in_height == render_height_ &&
+        shared_->seen_depth_in_width == render_width_ &&
+        shared_->seen_mvec_in_width == render_width_ &&
         shared_->seen_depth_in_format ==
             static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT) &&
         shared_->seen_mvec_in_format ==

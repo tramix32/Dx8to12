@@ -60,6 +60,10 @@ constexpr ConfigField kFields[] = {
     {"HighPrecisionDepth", ConfigFieldType::Bool, true},
     {"FullTraceLog", ConfigFieldType::Bool, false},
     {"TemporalAA", ConfigFieldType::Int, true},
+    {"RenderScale", ConfigFieldType::Float, true},
+    {"MvecScaleMultiplier", ConfigFieldType::Float, true},
+    {"JitterSign", ConfigFieldType::Float, true},
+    {"TransposeUpscalerMatrices", ConfigFieldType::Bool, true},
     {"TemporalJitter", ConfigFieldType::Bool, true},
     {"MotionVectors", ConfigFieldType::Bool, true},
     {"MotionVectorDebug", ConfigFieldType::Bool, false},
@@ -389,6 +393,18 @@ bool GetConfigValueFloat(const std::string &key, float *out_value) {
     *out_value = g_config.sharpen_strength;
     return true;
   }
+  if (EqualsIgnoreCase(key, "RenderScale")) {
+    *out_value = g_config.render_scale;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "MvecScaleMultiplier")) {
+    *out_value = g_config.mvec_scale_multiplier;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "JitterSign")) {
+    *out_value = g_config.jitter_sign;
+    return true;
+  }
   return false;
 }
 
@@ -397,6 +413,29 @@ bool SetConfigValueFloat(const std::string &key, float value) {
     if (value < 0.0f || value > 1.0f) return false;
     if (value != g_config.sharpen_strength) MarkConfigDirty();
     g_config.sharpen_strength = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "RenderScale")) {
+    // Below 0.5 the upscaler has too little to reconstruct from and the
+    // result looks broken rather than fast; above 1.0 is supersampling, which
+    // is a different feature and not one this path implements.
+    if (value < 0.5f || value > 1.0f) return false;
+    if (value != g_config.render_scale) MarkConfigDirty();
+    g_config.render_scale = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "MvecScaleMultiplier")) {
+    if (value <= 0.f || value > 8.f) return false;
+    if (value != g_config.mvec_scale_multiplier) MarkConfigDirty();
+    g_config.mvec_scale_multiplier = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "JitterSign")) {
+    // Only the two values mean anything; anything else is a typo, not a
+    // setting.
+    if (value != 1.f && value != -1.f) return false;
+    if (value != g_config.jitter_sign) MarkConfigDirty();
+    g_config.jitter_sign = value;
     return true;
   }
   return false;
@@ -423,6 +462,10 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.motion_vector_debug;
     return true;
   }
+  if (EqualsIgnoreCase(key, "TransposeUpscalerMatrices")) {
+    *out_value = g_config.transpose_upscaler_matrices;
+    return true;
+  }
   return false;
 }
 
@@ -447,6 +490,11 @@ bool SetConfigValueBool(const std::string &key, bool value) {
     // The debug overlay draws the motion vectors; with them off there is
     // nothing for it to draw, so it cannot stay on by itself.
     if (!value) g_config.motion_vector_debug = false;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "TransposeUpscalerMatrices")) {
+    if (value != g_config.transpose_upscaler_matrices) MarkConfigDirty();
+    g_config.transpose_upscaler_matrices = value;
     return true;
   }
   if (EqualsIgnoreCase(key, "MotionVectorDebug")) {

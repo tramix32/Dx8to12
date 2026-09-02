@@ -82,6 +82,46 @@ struct Config {
   // upscaler is wrong without both, so enabling it enables them.
   int temporal_aa = 0;
 
+  // Fraction of the output resolution the scene is rendered at, 0.5 to 1.0.
+  // 1.0 is DLAA (same resolution in and out); below that the upscaler is
+  // reconstructing detail rather than only anti-aliasing it, which is where
+  // the performance actually comes from. Only has an effect with temporal_aa
+  // on -- without an upscaler this would just render the game smaller.
+  //
+  // The conventional DLSS ratios: 0.667 Quality, 0.58 Balanced,
+  // 0.5 Performance.
+  float render_scale = 1.0f;
+
+  // --- Upscaler convention tuning ---------------------------------------
+  //
+  // Two values that cannot be derived from anything the game provides; they
+  // only match (or fail to match) what the upscaler expects. Wrong values do
+  // not produce an error -- they produce a subtly wrong image, which is why
+  // they are adjustable at runtime rather than compiled in.
+  //
+  // Symptom to tune against: rotate the camera against a flat sky. A visible
+  // seam or rotating outline is the boundary of the region the upscaler
+  // decided it had no history for, and means these are wrong.
+
+  // Multiplies the motion vector scale. The pass writes vectors in render
+  // pixels and they are normalised by 1/resolution, which is what Streamline
+  // documents for pixel-space vectors. 2.0 tests the [-1,1] convention.
+  float mvec_scale_multiplier = 1.0f;
+
+  // Sign of the jitter offset handed to the upscaler. The projection is
+  // offset by +jitter, so the upscaler may want +jitter or -jitter depending
+  // on whether it defines the value as the applied shift or the correction
+  // for it. -1 tests the other one.
+  float jitter_sign = 1.0f;
+
+  // Transposes the camera matrices before handing them to the upscaler.
+  // This codebase is row-vector (v * M) throughout, matching D3D8; if the
+  // upscaler reads them as column-vector, every one is transposed and history
+  // gets reprojected by the wrong transform. The giveaway is geometric --
+  // content appearing sheared or rotated into a skewed quad -- as opposed to
+  // the blurring or ghosting a wrong scale produces.
+  bool transpose_upscaler_matrices = false;
+
   // Sub-pixel camera offset per frame (Halton). On its own this only makes
   // the image shimmer -- it is an *input* to a temporal upscaler, exposed
   // separately so a mod can drive its own.

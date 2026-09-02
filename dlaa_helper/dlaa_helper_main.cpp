@@ -90,6 +90,58 @@ sl::float4x4 ToSlMatrix(const float m[16]) {
 }
 #endif
 
+// Streamline's sl.common plugin does its per-frame bookkeeping and garbage
+// collection inside the Present it hooks. A helper process has no reason of
+// its own to present anything, and without a Present slEvaluateFeature
+// reports "presentCommon() was not observed" and misbehaves.
+//
+// So the helper gets a swap chain purely to have something to present: a 1x1
+// hidden window, flip-discard, presented once per processed frame. Nothing
+// ever looks at it. This is the cost of running Streamline somewhere it does
+// not expect to be -- which is itself forced, since it is x64-only and the
+// game is not.
+struct PresentPump {
+  HWND window = nullptr;
+  ComPtr<IDXGISwapChain1> swap_chain;
+
+  bool Create(ID3D12CommandQueue* queue) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"Dx8to12DlaaPresentPump";
+    RegisterClassExW(&wc);
+    window = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!window) return false;
+
+    ComPtr<IDXGIFactory2> factory;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return false;
+    const DXGI_SWAP_CHAIN_DESC1 desc = {
+        .Width = 1,
+        .Height = 1,
+        .Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .SampleDesc = {.Count = 1},
+        .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        .BufferCount = 2,
+        .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD};
+    return SUCCEEDED(factory->CreateSwapChainForHwnd(
+        queue, window, &desc, nullptr, nullptr, &swap_chain));
+  }
+
+  void Pump() {
+    if (swap_chain) swap_chain->Present(0, 0);
+  }
+
+  void Destroy() {
+    swap_chain.Reset();
+    if (window) {
+      DestroyWindow(window);
+      window = nullptr;
+    }
+  }
+};
+
 struct SlotResources {
   ComPtr<ID3D12Resource> color_in;
   ComPtr<ID3D12Resource> color_out;
@@ -230,17 +282,44 @@ int RunDlaaHelper(const wchar_t* map_name) {
   if (FAILED(hr)) return fail(Ipc::HelperStatus::kDeviceCreateFailed, hr);
   cmd_list->Close();
 
+  PresentPump present_pump;
 #ifdef DX8TO12_HAVE_STREAMLINE
+  if (streamline_ready && !present_pump.Create(queue.Get())) {
+    std::fprintf(stderr,
+                 "DLAA helper: could not create the present pump; Streamline's "
+                 "per-frame bookkeeping will not run.\n");
+  }
+
   sl::ViewportHandle viewport{0};
   if (streamline_ready) {
     sl::DLSSOptions options{};
-    // DLAA is DLSS at 1:1 -- same machinery, render resolution equal to
-    // output. Anything below that is stage E's job, not this one's.
-    options.mode = mode == Ipc::Mode::kDlss ? sl::DLSSMode::eBalanced
-                                            : sl::DLSSMode::eDLAA;
+    // Derived from the resolution the game actually chose rather than
+    // hardcoded: DLSS sizes its internal buffers from the mode, so a mode
+    // that disagrees with the render extent being tagged is asking it to
+    // reconstruct from something other than what it is given.
+    const float scale =
+        shared->output_width
+            ? static_cast<float>(shared->render_width) /
+                  static_cast<float>(shared->output_width)
+            : 1.f;
+    if (mode == Ipc::Mode::kDlaa || scale > 0.95f) {
+      options.mode = sl::DLSSMode::eDLAA;
+    } else if (scale > 0.62f) {
+      options.mode = sl::DLSSMode::eMaxQuality;
+    } else if (scale > 0.54f) {
+      options.mode = sl::DLSSMode::eBalanced;
+    } else {
+      options.mode = sl::DLSSMode::eMaxPerformance;
+    }
     options.outputWidth = shared->output_width;
     options.outputHeight = shared->output_height;
     options.colorBuffersHDR = sl::Boolean::eFalse;
+    std::fprintf(stderr,
+                 "DLAA helper: render %ux%u -> output %ux%u (scale %.3f), "
+                 "DLSSMode %d\n",
+                 shared->render_width, shared->render_height,
+                 shared->output_width, shared->output_height, scale,
+                 static_cast<int>(options.mode));
     if (!Ok(slDLSSSetOptions(viewport, options), "slDLSSSetOptions")) {
       return fail(Ipc::HelperStatus::kFeatureUnavailable, E_FAIL);
     }
@@ -365,10 +444,27 @@ int RunDlaaHelper(const wchar_t* map_name) {
     }
 #endif
 
+    if (!recorded && shared->render_width != shared->output_width) {
+      // Nothing sensible to fall back to: CopyResource needs identical
+      // dimensions, and issuing it anyway is what turned a failed evaluate
+      // into a black screen with no error anywhere. Report it instead, so the
+      // game stops waiting on a helper that cannot deliver.
+      std::fprintf(stderr,
+                   "DLAA helper: frame %llu could not be evaluated and the "
+                   "sizes differ, so there is no copy fallback.\n",
+                   static_cast<unsigned long long>(wanted));
+      shared->last_hresult = E_FAIL;
+      ++shared->failed_frames;
+      queue->Signal(done_fence.Get(), wanted);
+      processed = wanted;
+      shared->completed_frame_index = wanted;
+      cmd_list->Close();
+      continue;
+    }
     if (!recorded) {
-      // Loopback, and the fallback if an evaluate could not be recorded: the
-      // game still gets a correct (if un-upscaled) frame rather than a stale
-      // or empty one.
+      // Loopback, and the fallback if an evaluate could not be recorded at
+      // 1:1: the game still gets a correct (if un-upscaled) frame rather than
+      // a stale or empty one.
       D3D12_RESOURCE_BARRIER to_copy[2] = {};
       to_copy[0].Transition = {
           .pResource = res.color_in.Get(),
@@ -402,6 +498,10 @@ int RunDlaaHelper(const wchar_t* map_name) {
       ++shared->failed_frames;
       break;
     }
+    // Streamline hooks Present to run its per-frame bookkeeping; without it
+    // slEvaluateFeature reports "presentCommon() was not observed". Nothing
+    // looks at what this presents.
+    present_pump.Pump();
     processed = wanted;
     shared->completed_frame_index = wanted;
   }
@@ -417,6 +517,7 @@ int RunDlaaHelper(const wchar_t* map_name) {
       WaitForSingleObject(ready_event, 2000);
     }
   }
+  present_pump.Destroy();
 #ifdef DX8TO12_HAVE_STREAMLINE
   if (streamline_ready) slShutdown();
 #endif

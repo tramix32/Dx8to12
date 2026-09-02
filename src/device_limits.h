@@ -24,7 +24,21 @@ static constexpr int kMaxSamplerStates = 64;
 // level load. Bumped with generous headroom rather than tuned to the exact
 // observed count, since a bigger level/more art could need more still.
 static constexpr int kMaxNumSrvs = 8192;
-static constexpr int kMaxNumRtvs = 32;
+// Sizes both the RTV and the DSV heap (see Device::Create). 32 was enough
+// when the only render targets were two back buffers, one depth-stencil and
+// whatever the game made for its radar and mirrors. The upscaling pipeline
+// adds eleven more that the game never asked for -- the scene colour target
+// and its depth, the motion vector and depth-copy targets, and four shared
+// textures per frame slot -- and 32 then ran out on the Reset that starting a
+// new game triggers.
+//
+// Eight of those eleven do not need an RTV at all: the shared textures are
+// only ever copy sources, copy destinations, or UAVs the upscaler writes, but
+// GpuTexture::InitFromResource (the wrapper used for back buffers) always
+// builds one. Raising the limit is the cheap fix -- an RTV descriptor is a
+// handful of bytes -- and leaves that waste as a tidy-up rather than a
+// prerequisite.
+static constexpr int kMaxNumRtvs = 256;
 
 // Was 40MB -- bumped since modern GPUs have far more VRAM to spare than
 // when this was originally sized, and this buffer holds every dynamic

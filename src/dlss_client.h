@@ -60,7 +60,11 @@ class DlssClient {
   // helper. Safe to call again after a device Reset; tears the old one down
   // first. Returns false if anything failed, in which case the caller must
   // carry on without DLAA rather than treat it as fatal.
-  bool Start(uint32_t width, uint32_t height, DlssIpc::Mode mode);
+  // render_* is the resolution the scene is drawn at, output_* the one the
+  // result is presented at. Equal for DLAA; render smaller for DLSS, which is
+  // the only arrangement that actually saves any time.
+  bool Start(uint32_t render_width, uint32_t render_height,
+             uint32_t output_width, uint32_t output_height, DlssIpc::Mode mode);
   void Stop();
 
   // Advances the startup state machine and returns whether the helper is
@@ -141,8 +145,10 @@ class DlssClient {
   // is eventually given up on instead of being polled forever.
   ULONGLONG start_tick_ = 0;
   bool pending_history_reset_ = true;
-  uint32_t width_ = 0;
-  uint32_t height_ = 0;
+  uint32_t render_width_ = 0;
+  uint32_t render_height_ = 0;
+  uint32_t output_width_ = 0;
+  uint32_t output_height_ = 0;
 };
 
 }  // namespace Dx8to12
