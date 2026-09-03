@@ -2746,6 +2746,20 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // after it -- a resolution change or device loss is a discontinuity.
   has_prev_view_proj_ = false;
   frame_view_proj_captured_ = false;
+  // And say the same thing to the upscaler, which keeps a history of its own
+  // that this side cannot see or correct. RequestHistoryReset was written for
+  // exactly this -- its comment names a device Reset as one of the two things
+  // that invalidate the previous frame -- but nothing ever called it from
+  // here.
+  //
+  // The cost of that omission is not a stale frame or two. Minimising the
+  // window loses the device, and while it is gone the game presents nothing,
+  // so what accumulates in the upscaler's history is darkness. Auto exposure
+  // then adapts to that, and on restore the whole scene comes back black
+  // apart from the brightest emissive sprites, which bloom across the
+  // screen -- with no way out, because the exposure it is now stuck at is
+  // derived from the very history that needs discarding.
+  if (dlss_client_) dlss_client_->RequestHistoryReset();
   // Rebuilt here rather than once at Init: the debug PSO's render target
   // format comes from the scene target, which was just recreated.
   InitMotionVectorPass();
