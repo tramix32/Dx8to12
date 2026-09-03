@@ -2070,6 +2070,40 @@ void Device::RunDlaaExchange() {
         width ? mvec_multiplier / static_cast<float>(width) : 1.f;
     constants.mvec_scale[1] =
         height ? mvec_multiplier / static_cast<float>(height) : 1.f;
+    // Refuse to hand over a camera that does not describe a real view.
+    //
+    // Two ways that happens. The aspect ratio is derived as m11/m00, and this
+    // game's projection has a negative m00 -- so what was being sent was a
+    // negative aspect, every frame, since this code was written. And for a
+    // few frames after a device Reset the game has not re-established its
+    // transforms, so near, far and the field of view come out of a degenerate
+    // matrix as zero, infinite or reversed.
+    //
+    // The upscaler has no defence against either; it accepts them, and its
+    // internal state does not recover afterwards. Skipping the frame costs
+    // one un-upscaled image, which is invisible, and the history reset tells
+    // it there is a gap rather than leaving it to blend across one.
+    constants.aspect = std::abs(constants.aspect);
+    const bool camera_is_sane =
+        std::isfinite(constants.near_plane) &&
+        std::isfinite(constants.far_plane) && std::isfinite(constants.fov) &&
+        std::isfinite(constants.aspect) && constants.near_plane > 0.f &&
+        constants.far_plane > constants.near_plane && constants.fov > 0.f &&
+        constants.fov < 3.15f && constants.aspect > 0.f;
+    if (!camera_is_sane) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        LOG_ERROR() << "DLSS: refusing a degenerate camera (near="
+                    << constants.near_plane << " far=" << constants.far_plane
+                    << " fov=" << constants.fov
+                    << " aspect=" << constants.aspect
+                    << "); presenting this frame un-upscaled.\n";
+      }
+      dlss_client_->RequestHistoryReset();
+      ResolveScenePass();
+      return;
+    }
     dlss_client_->SetCameraConstants(constants);
   }
 #endif
