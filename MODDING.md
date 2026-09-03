@@ -63,13 +63,17 @@ LightingMode=0
 ; any of them missing the game runs exactly as if this were 0, and says so in
 ; log.txt.
 ;   0 = Off
-;   1 = DLAA -- native-resolution temporal AA. Working.
+;   1 = DLAA -- native-resolution temporal AA. Working; verified against
+;               GTA: Vice City.
 ;   2 = DLSS -- accepted, but currently behaves as DLAA: the scene is still
 ;               rendered at output resolution, so there is nothing to upscale
 ;               from yet.
 ; Objects that move independently of the camera (cars, pedestrians) ghost
 ; slightly: the motion vectors are reconstructed from depth and describe
-; camera movement only.
+; camera movement only. The same limit shows up on camera-facing foliage,
+; which smears a little as it turns -- a billboard rotates in world space
+; every frame, so no camera-only vector describes where its pixels went.
+; DlssPreset=10 (preset J) trades some of that ghosting for extra flicker.
 ; Turning this on also turns on TemporalJitter and MotionVectors: a temporal
 ; upscaler without both does not degrade gracefully, it produces a blurred,
 ; ghosting image that looks like a bug in the upscaler rather than a missing
