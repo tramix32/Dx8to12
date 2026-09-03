@@ -797,6 +797,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   int perf_frame_sample_count_ = 0;
 
   ComPtr<ID3D12Debug5> debug_interface_;
+  uint32_t perf_last_upscaled_ = 0;
+  uint32_t perf_last_fallback_ = 0;
+  uint32_t perf_last_bypassed_ = 0;
+  uint32_t perf_bypass_notices_ = 0;
   uint32_t frames_upscaled_ = 0;
   uint32_t frames_fallback_ = 0;
   uint32_t frames_bypassed_ = 0;

@@ -7219,7 +7219,16 @@ void Device::SubmitAndWait(bool should_present) {
             << "Perf: avg frame=" << avg_frame_ms
             << "ms (fps=" << (1000.0 / avg_frame_ms)
             << ") avg GPU-fence-wait=" << avg_wait_ms << "ms ("
-            << (100.0 * avg_wait_ms / avg_frame_ms) << "% of frame)\n";
+            << (100.0 * avg_wait_ms / avg_frame_ms) << "% of frame)"
+            // Per window, not since start: a black frame is an event, and a
+            // running total cannot say whether one happened just now.
+            << " frames upscaled=" << (frames_upscaled_ - perf_last_upscaled_)
+            << " fallback=" << (frames_fallback_ - perf_last_fallback_)
+            << " bypassed=" << (frames_bypassed_ - perf_last_bypassed_)
+            << "\n";
+        perf_last_upscaled_ = frames_upscaled_;
+        perf_last_fallback_ = frames_fallback_;
+        perf_last_bypassed_ = frames_bypassed_;
         perf_frame_ticks_accum_ = 0;
         perf_wait_ticks_accum_ = 0;
         perf_frame_sample_count_ = 0;
@@ -7336,6 +7345,19 @@ void Device::SubmitAndWait(bool should_present) {
       if (scene_pass_active_ && !frame_had_3d_draw_ && dlss_client_) {
         dlss_client_->RequestHistoryReset();
         ++frames_bypassed_;
+#if defined(DX8TO12_ENABLE_VALIDATION) || defined(DX8TO12_PERF_LOG)
+        // Only once gameplay has started: in the menu every frame is 2D, and
+        // saying so thousands of times is noise. Mid-gameplay it is the
+        // opposite -- a frame with no 3D draw at all is unusual, and this is
+        // the timestamp to line up against when the screen blinks.
+        if (frames_upscaled_ > 0 && perf_bypass_notices_ < 20) {
+          ++perf_bypass_notices_;
+          LOG(AixLog::Severity::error)
+              << "Frame bypassed the upscaler mid-gameplay: no 3D draw this "
+                 "frame (bypass #"
+              << frames_bypassed_ << ").\n";
+        }
+#endif
       }
       ResolveScenePass();
     }
