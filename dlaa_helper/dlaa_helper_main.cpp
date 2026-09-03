@@ -1011,15 +1011,29 @@ int RunDlaaHelper(const wchar_t* map_name) {
                                  shared->render_height};
         sl::Extent output_extent{0, 0, shared->output_width,
                                  shared->output_height};
+        // eValidUntilPresent, not eOnlyValidNow. The difference is not a
+        // hint: eOnlyValidNow tells Streamline the resource may change or be
+        // destroyed the moment it has been handed over, so Streamline
+        // *clones* it. On an input that only wastes a copy per frame. On the
+        // **output** it is silently fatal -- super resolution writes into
+        // Streamline's clone, nothing copies that back, and the texture the
+        // game presents is never touched. slEvaluateFeature still reports
+        // success, so the failure reaches the player as a black screen with
+        // the HUD drawn over it and not one error anywhere.
+        //
+        // These four are dedicated shared textures owned by this helper and
+        // its client, written once per frame and read by nothing else in
+        // between, which is exactly what eValidUntilPresent describes.
+        // Streamline's own guidance is to tag everything that way first.
         const sl::ResourceTag tags[] = {
             {&r_in, sl::kBufferTypeScalingInputColor,
-             sl::ResourceLifecycle::eOnlyValidNow, &render_extent},
+             sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
             {&r_out, sl::kBufferTypeScalingOutputColor,
-             sl::ResourceLifecycle::eOnlyValidNow, &output_extent},
+             sl::ResourceLifecycle::eValidUntilPresent, &output_extent},
             {&r_depth, sl::kBufferTypeDepth,
-             sl::ResourceLifecycle::eOnlyValidNow, &render_extent},
+             sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
             {&r_mvec, sl::kBufferTypeMotionVectors,
-             sl::ResourceLifecycle::eOnlyValidNow, &render_extent}};
+             sl::ResourceLifecycle::eValidUntilPresent, &render_extent}};
 
         sl::Constants consts{};
         consts.cameraViewToClip = ToSlMatrix(shared->camera_view_to_clip);
