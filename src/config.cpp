@@ -52,6 +52,12 @@ constexpr ULONGLONG kMinSaveIntervalMs = 1000;
 // MotionVectorDebug paints over half the screen. If a mod turns either on for
 // a session, writing that back would leave the player with a broken-looking
 // game and no idea why, having never edited the file themselves.
+// The highest lighting mode that actually renders differently. Config's own
+// documentation marks 2 (RTShadows), 3 (RTReflections) and 4 (RTFullGI) as
+// not yet implemented; this is the single place that keeps that comment and
+// the behaviour from drifting apart. Raise it as each mode becomes real.
+constexpr int kHighestImplementedLightingMode = 1;
+
 constexpr ConfigField kFields[] = {
     {"AnisotropicOverride", ConfigFieldType::Int, true},
     {"MSAASamples", ConfigFieldType::Int, true},
@@ -393,6 +399,21 @@ bool SetConfigValueInt(const std::string &key, int value) {
   }
   if (EqualsIgnoreCase(key, "LightingMode")) {
     if (value < 0 || value > 4) return false;
+    // Hardware is not the only thing a mode needs. Modes 2-4 have their RT
+    // capture and helper plumbing but no lighting of their own -- the
+    // generated shaders treat everything >= 1 identically -- so selecting one
+    // turns on work that changes nothing except what can go wrong. Gating
+    // them only on RaytracingSupported() meant a mod could select mode 4, the
+    // write-back persisted it, and the shim then started in that mode with
+    // the mod long gone. Refuse until they are real, and say which of the two
+    // reasons applies.
+    if (value > kHighestImplementedLightingMode) {
+      LOG(AixLog::Severity::error)
+          << "LightingMode " << value
+          << " is not implemented yet -- staying on PerPixel (1). This is not "
+             "about the GPU: the mode has no lighting of its own to run.\n";
+      value = kHighestImplementedLightingMode;
+    }
     if (value >= 2 && !RaytracingSupported()) {
       LOG(AixLog::Severity::error)
           << "LightingMode " << value
