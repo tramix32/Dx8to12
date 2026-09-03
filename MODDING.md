@@ -121,6 +121,18 @@ DlssPreset=0
 ; actually running, which is not the same as having been asked for.
 NeuralRendering=false
 
+; Diagnostic. Makes the helper skip super resolution and copy its input
+; straight to its output, so the picture is un-upscaled but otherwise
+; untouched. It exists to split two failures that look identical from inside
+; the game -- both end as a black frame with the HUD drawn over it:
+;   picture comes back  -> the scene and the cross-process transport are fine,
+;                          the fault is inside super resolution
+;   still black         -> the scene never reached the helper
+; Only defined when render and output resolutions match; the helper says so
+; and ignores it otherwise. Not written back to this file: it answers one
+; question during one session and is not a mode to leave a game in.
+UpscalerLoopback=false
+
 [Tuning]
 ; Reuse the previous draw's PSO lookup, root signature binding and vertex
 ; buffer views when nothing they depend on changed. Measured at about 31%
