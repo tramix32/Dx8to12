@@ -7431,6 +7431,42 @@ void Device::SubmitAndWait(bool should_present) {
     if (!window_visible && dlss_client_) {
       dlss_client_->RequestHistoryReset();
     }
+    // Coming back from hidden, restart the upscaler outright rather than
+    // trying to mend it in place.
+    //
+    // Mending it in place is what the previous four attempts did, and it does
+    // not work: freeing the feature's resources and re-applying its options
+    // leaves state behind that still produces a black frame. A full restart
+    // does clear it -- that is what the F8 hotkey established, by recovering
+    // a picture that had been stuck black.
+    //
+    // It has to happen *here*, on the way back, not on the device Reset. The
+    // Reset arrives while the window is still hidden, so a restart there is
+    // immediately followed by the very frames that ruin it again. That timing
+    // is why the in-place rebuild appeared to fire correctly and change
+    // nothing.
+    //
+    // The cost is a couple of seconds without upscaling while the helper
+    // comes up, during which the scene is presented as it was rendered. That
+    // is invisible next to a picture that never comes back.
+    if (window_visible && !window_was_visible_ && dlss_client_ &&
+        dlss_client_->helper_running()) {
+      const uint32_t render_w = dlss_client_->render_width();
+      const uint32_t render_h = dlss_client_->render_height();
+      const uint32_t out_w = dlss_client_->output_width();
+      const uint32_t out_h = dlss_client_->output_height();
+      if (render_w && out_w) {
+        LOG(AixLog::Severity::error)
+            << "Window shown again: restarting the upscaler, which does not "
+               "survive the game losing its device.\n";
+        dlss_client_->Stop();
+        dlss_client_->Start(render_w, render_h, out_w, out_h,
+                            GetConfig().temporal_aa == 2
+                                ? DlssIpc::Mode::kDlss
+                                : DlssIpc::Mode::kDlaa);
+      }
+    }
+    window_was_visible_ = window_visible;
     if (scene_pass_active_ && frame_had_3d_draw_ && window_visible &&
         dlss_client_ && dlss_client_->PollReady()) {
       RunDlaaExchange();
