@@ -7460,8 +7460,14 @@ void Device::SubmitAndWait(bool should_present) {
     const bool resets_have_settled =
         last_device_reset_tick_ != 0 &&
         GetTickCount64() - last_device_reset_tick_ > kUpscalerRestartQuietMs;
+    // ready(), not just helper_running(). A helper that has not finished
+    // starting has no poisoned state to clear, and restarting it only puts it
+    // back to the beginning: the game issues several Resets while it loads,
+    // each arming this, and the helper needs about two seconds to report
+    // ready -- so it was being killed and relaunched about every 1.4 seconds
+    // and never reached a working state at all.
     if (upscaler_restart_pending_ && window_visible && resets_have_settled &&
-        dlss_client_ && dlss_client_->helper_running()) {
+        dlss_client_ && dlss_client_->ready()) {
       upscaler_restart_pending_ = false;
       const uint32_t render_w = dlss_client_->render_width();
       const uint32_t render_h = dlss_client_->render_height();
