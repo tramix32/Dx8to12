@@ -362,9 +362,21 @@ struct NeuralRendering {
     // A real project identity, because the runtime declines callers it cannot
     // identify. ENGINE_TYPE_CUSTOM is what the SDK documents for anything
     // that is not Unreal/Unity/Omniverse, which this is.
+    // A real directory NGX may write its own logs and model cache into. The
+    // helper's own directory is the one place guaranteed to exist and to be
+    // the same across runs.
+    wchar_t data_path[MAX_PATH] = L".";
+    if (!runtime_path_.empty()) {
+      const size_t slash = runtime_path_.find_last_of(L'\\');
+      if (slash != std::wstring::npos) {
+        wcsncpy_s(data_path, runtime_path_.substr(0, slash).c_str(),
+                  _TRUNCATE);
+      }
+    }
+
     const NVSDK_NGX_Result init = NVSDK_NGX_D3D12_Init_with_ProjectID(
-        kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion,
-        L".", device, nullptr, NVSDK_NGX_Version_API);
+        kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion, data_path,
+        device, nullptr, NVSDK_NGX_Version_API);
     if (NVSDK_NGX_FAILED(init)) {
       std::fprintf(stderr,
                    "DLAA helper: NGX init failed 0x%08X; neural rendering "
@@ -379,6 +391,12 @@ struct NeuralRendering {
     if (NVSDK_NGX_FAILED(alloc) || params_ == nullptr) {
       std::fprintf(stderr, "DLAA helper: NGX AllocateParameters failed 0x%08X\n",
                    static_cast<unsigned>(alloc));
+      // Do not leave a half-initialised NGX behind: super resolution goes
+      // through the same NGX core in this process, and it matters more than
+      // this feature does.
+      NVSDK_NGX_D3D12_Shutdown1(device_);
+      ngx_initialised_ = false;
+      params_ = nullptr;
       return false;
     }
 
@@ -519,8 +537,14 @@ struct NeuralRendering {
   // Identity this project presents to NGX. Its own, deliberately: the runtime
   // wants to know who is calling, and answering with somebody else's is not
   // something this project does.
+  //
+  // This must be a real UUID. A first attempt spelled the last group
+  // "dx8to12neural", which reads nicely and is not hexadecimal, and NGX
+  // rejected the whole init with FAIL_InvalidParameter (0xBAD00005) -- an
+  // error that says nothing about which parameter, so it is worth being
+  // precise here rather than clever.
   static constexpr const char* kProjectId =
-      "a1d4f0e2-6c3b-4f5a-9d21-dx8to12neural";
+      "a1d4f0e2-6c3b-4f5a-9d21-7e6b5c4a3f20";
   static constexpr const char* kEngineVersion = "1.0";
 
   static D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource* resource,
@@ -871,16 +895,17 @@ int RunDlaaHelper(const wchar_t* map_name) {
   // and a panel needs to know before anyone asks for it.
   neural.Probe();
   shared->neural_rendering_available = neural.available ? 1u : 0u;
+  // Whether to bring neural rendering up at all. Deferred to the first frame
+  // super resolution has actually completed, rather than done here: this
+  // process shares one NGX core between Streamline and NGX-direct calls, and
+  // touching it before Streamline has finished its own bring-up puts this
+  // feature in a position to break the one that already works. Nothing about
+  // neural rendering is worth that.
+  bool neural_requested = shared->neural_rendering != 0;
+  bool neural_tried = false;
   strncpy_s(shared->neural_rendering_runtime,
             sizeof(shared->neural_rendering_runtime),
             neural.runtime_name.c_str(), _TRUNCATE);
-  if (shared->neural_rendering) {
-    neural.active = neural.Initialise(device.Get(), shared->output_width,
-                                      shared->output_height);
-  }
-  // What is actually running, not what was asked for -- the game's status API
-  // reports this, and the two differ whenever the runtime is missing.
-  shared->neural_rendering_active = neural.active ? 1u : 0u;
 
   shared->status = static_cast<uint32_t>(Ipc::HelperStatus::kReady);
 
@@ -1006,9 +1031,19 @@ int RunDlaaHelper(const wchar_t* map_name) {
           // After super resolution, over its output: NR is a post-pass, and
           // the same depth and motion vectors it was given still describe the
           // frame.
+          if (neural_requested && !neural.active && !neural_tried) {
+            // First frame past a working super resolution: NGX is up and
+            // settled, so it is now safe to ask it for feature 18 as well.
+            neural_tried = true;
+            neural.active = neural.Initialise(device.Get(),
+                                              shared->output_width,
+                                              shared->output_height);
+            shared->neural_rendering_active = neural.active ? 1u : 0u;
+          }
           if (neural.active) {
             neural.Evaluate(cmd_list.Get(), res.color_out.Get(),
                             res.depth_in.Get(), res.mvec_in.Get(), shared);
+            shared->neural_rendering_active = neural.active ? 1u : 0u;
           }
         } else {
           shared->last_hresult = E_FAIL;
