@@ -580,6 +580,10 @@ class Device : public IDirect3DDevice8, RefCounted {
   // adjust persist any dynamic buffers.
   void SubmitAndWait(bool should_present);
   void WaitForFrame(uint64_t frame_number);
+  // Blocks until everything this device has submitted has finished. Needed
+  // before releasing resources the GPU may still be reading -- the shared
+  // upscaler textures, in particular, which are freed on a helper restart.
+  void WaitForGpuIdle();
 
 #undef PURE
 #define PURE = 0
@@ -798,6 +802,10 @@ class Device : public IDirect3DDevice8, RefCounted {
 
   ComPtr<ID3D12Debug5> debug_interface_;
   bool window_was_visible_ = true;
+  // Set by Reset, acted on once the window is back and the Resets have
+  // stopped arriving. See the restart in SubmitAndWait.
+  bool upscaler_restart_pending_ = false;
+  ULONGLONG last_device_reset_tick_ = 0;
   bool upscaler_restart_hotkey_was_down_ = false;
   bool world_has_been_drawn_ = false;
   bool last_frame_had_3d_draw_ = false;

@@ -2826,6 +2826,10 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // screen -- with no way out, because the exposure it is now stuck at is
   // derived from the very history that needs discarding.
   if (dlss_client_) dlss_client_->NotifyDeviceReset();
+  // Arm the restart; SubmitAndWait performs it once the window is back and
+  // no further Reset has arrived for a while.
+  upscaler_restart_pending_ = true;
+  last_device_reset_tick_ = GetTickCount64();
   // Rebuilt here rather than once at Init: the debug PSO's render target
   // format comes from the scene target, which was just recreated.
   InitMotionVectorPass();
@@ -7440,17 +7444,25 @@ void Device::SubmitAndWait(bool should_present) {
     // does clear it -- that is what the F8 hotkey established, by recovering
     // a picture that had been stuck black.
     //
-    // It has to happen *here*, on the way back, not on the device Reset. The
-    // Reset arrives while the window is still hidden, so a restart there is
-    // immediately followed by the very frames that ruin it again. That timing
-    // is why the in-place rebuild appeared to fire correctly and change
-    // nothing.
+    // It has to happen after the Resets have stopped arriving, not on the
+    // first visible frame. Restoring the window makes it visible before the
+    // game has noticed it lost its device, so the Reset -- often several --
+    // lands on the freshly started helper and ruins it again. Firing on the
+    // first visible frame was tried and did not work; pressing F8 does,
+    // because a person presses it seconds later, once the Resets are over.
+    // This waits for the same quiet period rather than relying on someone to
+    // supply it by hand.
     //
     // The cost is a couple of seconds without upscaling while the helper
     // comes up, during which the scene is presented as it was rendered. That
     // is invisible next to a picture that never comes back.
-    if (window_visible && !window_was_visible_ && dlss_client_ &&
-        dlss_client_->helper_running()) {
+    if (!window_visible) last_device_reset_tick_ = GetTickCount64();
+    const bool resets_have_settled =
+        last_device_reset_tick_ != 0 &&
+        GetTickCount64() - last_device_reset_tick_ > kUpscalerRestartQuietMs;
+    if (upscaler_restart_pending_ && window_visible && resets_have_settled &&
+        dlss_client_ && dlss_client_->helper_running()) {
+      upscaler_restart_pending_ = false;
       const uint32_t render_w = dlss_client_->render_width();
       const uint32_t render_h = dlss_client_->render_height();
       const uint32_t out_w = dlss_client_->output_width();
@@ -7708,6 +7720,10 @@ void Device::SubmitAndWait(bool should_present) {
   dirty_texture_stage_mask_ = 0xFF;
   dirty_sampler_stage_mask_ = 0xFF;
   last_vbuffer_view_count_ = 0;
+}
+
+void Device::WaitForGpuIdle() {
+  if (next_fence_ > 1) WaitForFrame(next_fence_ - 1);
 }
 
 void Device::WaitForFrame(uint64_t frame_number) {

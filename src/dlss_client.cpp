@@ -317,12 +317,22 @@ void DlssClient::Stop() {
     // resources this process is about to free.
     shared_->shutdown_requested = 1;
   }
+  // Our own GPU work can still be reading the shared textures this function
+  // is about to release -- the copies into them are recorded on the game's
+  // command list like any other. Asking the helper to stop bounds its work,
+  // not ours.
+  if (device_) device_->WaitForGpuIdle();
   if (helper_process_.hProcess) {
-    if (WaitForSingleObject(helper_process_.hProcess, 2000) != WAIT_OBJECT_0) {
+    // 250ms, not 2000. The helper is asked to exit and observed not to: the
+    // log line below fires on every restart, so the long wait was two
+    // seconds of a frozen game thread bought nothing. Restarting mid-session
+    // is now a normal thing to do rather than a shutdown path, and a
+    // multi-second freeze on restoring a window is its own bug.
+    if (WaitForSingleObject(helper_process_.hProcess, 250) != WAIT_OBJECT_0) {
       LOG(AixLog::Severity::error)
           << "DLSS: helper did not exit on request; terminating.\n";
       TerminateProcess(helper_process_.hProcess, 1);
-      WaitForSingleObject(helper_process_.hProcess, 1000);
+      WaitForSingleObject(helper_process_.hProcess, 250);
     }
     CloseHandle(helper_process_.hProcess);
     if (helper_process_.hThread) CloseHandle(helper_process_.hThread);

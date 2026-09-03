@@ -3,6 +3,12 @@
 #include "config.h"
 
 namespace Dx8to12 {
+
+// How long the window must be visible, with no further device Reset, before
+// the upscaler is restarted. Restoring a window makes it visible before the
+// game notices the device is gone, so a restart fired on the first visible
+// frame is immediately undone by the Reset that follows.
+inline constexpr unsigned long long kUpscalerRestartQuietMs = 750;
 // Back to two. Three would let the CPU run a frame further ahead of the GPU,
 // but measurements put this shim firmly CPU-bound (0% of frame spent waiting
 // on the GPU fence), so there was nothing to win -- and with
