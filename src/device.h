@@ -797,6 +797,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   int perf_frame_sample_count_ = 0;
 
   ComPtr<ID3D12Debug5> debug_interface_;
+  bool world_has_been_drawn_ = false;
+  bool last_frame_had_3d_draw_ = false;
+  uint32_t world_transition_notices_ = 0;
   uint32_t perf_last_upscaled_ = 0;
   uint32_t perf_last_fallback_ = 0;
   uint32_t perf_last_bypassed_ = 0;

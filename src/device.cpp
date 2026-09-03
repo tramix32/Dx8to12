@@ -7345,22 +7345,29 @@ void Device::SubmitAndWait(bool should_present) {
       if (scene_pass_active_ && !frame_had_3d_draw_ && dlss_client_) {
         dlss_client_->RequestHistoryReset();
         ++frames_bypassed_;
-#if defined(DX8TO12_ENABLE_VALIDATION) || defined(DX8TO12_PERF_LOG)
-        // Only once gameplay has started: in the menu every frame is 2D, and
-        // saying so thousands of times is noise. Mid-gameplay it is the
-        // opposite -- a frame with no 3D draw at all is unusual, and this is
-        // the timestamp to line up against when the screen blinks.
-        if (frames_upscaled_ > 0 && perf_bypass_notices_ < 20) {
-          ++perf_bypass_notices_;
-          LOG(AixLog::Severity::error)
-              << "Frame bypassed the upscaler mid-gameplay: no 3D draw this "
-                 "frame (bypass #"
-              << frames_bypassed_ << ").\n";
-        }
-#endif
       }
       ResolveScenePass();
     }
+#if defined(DX8TO12_ENABLE_VALIDATION) || defined(DX8TO12_PERF_LOG)
+    // Whether the game is drawing a world at all, reported independently of
+    // the upscaler -- deliberately, because it is the one thing that tells
+    // these two apart. A frame with no 3D draw and a broken upscaler look
+    // identical from outside the process: black, with the HUD still on top.
+    // Only the transitions are logged; the state itself would be thousands of
+    // identical lines.
+    if (frame_had_3d_draw_) world_has_been_drawn_ = true;
+    if (world_has_been_drawn_ &&
+        frame_had_3d_draw_ != last_frame_had_3d_draw_ &&
+        world_transition_notices_ < 20) {
+      ++world_transition_notices_;
+      LOG(AixLog::Severity::error)
+          << (frame_had_3d_draw_
+                  ? "World geometry is being submitted again.\n"
+                  : "The game stopped submitting 3D draws entirely. A black "
+                    "screen from here is an empty scene, not the upscaler.\n");
+    }
+    last_frame_had_3d_draw_ = frame_had_3d_draw_;
+#endif
 #endif
     if (dirty_flags_ & DIRTY_FLAG_OM) {
       BeginScene();
