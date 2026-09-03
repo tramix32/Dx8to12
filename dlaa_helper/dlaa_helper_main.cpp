@@ -1083,7 +1083,17 @@ int RunDlaaHelper(const wchar_t* map_name) {
         // then copies input to output. Reusing that rather than adding a
         // second copy: it already handles the size check and the barriers,
         // and it is the path a failed evaluate has always taken.
-        if (!shared->force_loopback &&
+        //
+        // It needs a branch of its own rather than a term in the condition
+        // below. Folding it in there meant a loopback frame fell through to
+        // the else, which reports E_FAIL -- so the client counted a failed
+        // frame, disabled the helper on the spot, and the session that was
+        // supposed to be testing the transport ran without one at all. A
+        // diagnostic that silently disables what it is measuring is worse
+        // than no diagnostic.
+        if (shared->force_loopback) {
+          // Deliberately empty: recorded stays false.
+        } else if (
             Ok(slSetTagForFrame(*token, viewport, tags, _countof(tags),
                                 cmd_list.Get()),
                "slSetTagForFrame") &&
