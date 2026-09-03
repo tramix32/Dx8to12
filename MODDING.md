@@ -114,11 +114,21 @@ DlssPreset=0
 ; this shim already produces all three -- with motion vectors reconstructed
 ; from the real depth buffer rather than estimated from the final image.
 ;
-; Two things it needs beyond this setting: Streamline 2.12 exposes no feature
-; for it, so the helper has to call NGX directly (put that SDK in
-; third_party/ngx), and NVIDIA ships DLSS 5 for RTX 50 only, so RTX 40 needs a
-; runtime built for it. Dx8to12_GetUpscalerStatus reports whether it is
-; actually running, which is not the same as having been asked for.
+; The calls are written, against the real contract: it is NGX feature 18
+; (NVSDK_NGX_Feature_Reserved18), driven through NGX directly because
+; Streamline 2.12 exposes no feature for it, over a DLSSNR.* parameter block.
+; Building them needs the NGX SDK in third_party/ngx.
+;
+; What is not settled is whether the runtime will start. It is nvngx_dlssnr.dll,
+; and NGX loads its core from the *driver*, not from that file -- so the driver
+; decides whether feature 18 exists. On a 4080 with driver 32.0.16.1656 the
+; core knows the name DLSSNR but refuses to create it
+; (FAIL_UnableToInitializeFeature). Note that is not the "unsupported hardware"
+; code, so this may be a newer-driver matter rather than a card one.
+;
+; Dx8to12_GetUpscalerStatusEx reports separately whether a runtime was found
+; and whether it is actually running -- "installed" and "working" are different
+; answers, and only one of them is yours to fix.
 NeuralRendering=false
 
 ; Diagnostic. Makes the helper skip super resolution and copy its input
