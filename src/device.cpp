@@ -2178,6 +2178,38 @@ void Device::EndScenePassIfDrawIsUi(bool draw_is_pretransformed) {
 void Device::PollGraphicsHotkey() {
   // GetAsyncKeyState rather than the game's input: this has to work while the
   // game has focus and runs its own message loop.
+
+  // F8 tears the upscaler down and starts it again from nothing -- a new
+  // helper process, new shared resources, a new feature.
+  //
+  // It exists to answer one question that four attempted fixes could not:
+  // when the picture is stuck black, is the bad state inside the upscaler or
+  // in what this side keeps sending it? Pressing this recovers the picture
+  // only in the first case. Either answer rules out half of what is left,
+  // which is more than another guess has managed.
+  //
+  // It is also a real recovery: whatever the cause, a player with a black
+  // screen would rather press a key than restart the game.
+#ifdef DX8TO12_SCENE_TARGET
+  {
+    const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (f8 && !upscaler_restart_hotkey_was_down_ && dlss_client_) {
+      LOG(AixLog::Severity::error)
+          << "F8: restarting the upscaler from scratch.\n";
+      const uint32_t render_w = dlss_client_->render_width();
+      const uint32_t render_h = dlss_client_->render_height();
+      const uint32_t out_w = dlss_client_->output_width();
+      const uint32_t out_h = dlss_client_->output_height();
+      dlss_client_->Stop();
+      if (render_w && out_w) {
+        dlss_client_->Start(render_w, render_h, out_w, out_h,
+                            GetConfig().temporal_aa == 2 ? DlssIpc::Mode::kDlss
+                                                         : DlssIpc::Mode::kDlaa);
+      }
+    }
+    upscaler_restart_hotkey_was_down_ = f8;
+  }
+#endif
 #ifdef DX8TO12_DRAW_STATE_CACHE
   // F6, separate from F5: this is a CPU-side optimisation and the upscaler is
   // a GPU-side one, so mixing them into one cycle would mean never measuring
