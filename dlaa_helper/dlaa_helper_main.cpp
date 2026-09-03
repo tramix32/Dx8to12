@@ -877,6 +877,20 @@ int RunDlaaHelper(const wchar_t* map_name) {
     options.outputWidth = shared->output_width;
     options.outputHeight = shared->output_height;
     options.colorBuffersHDR = sl::Boolean::eFalse;
+    // Let DLSS work its own exposure out. The alternative -- the default --
+    // is that it expects the application to tag kBufferTypeExposure with a
+    // buffer holding one, and nothing here ever did: a D3D8 fixed-function
+    // game has no exposure to hand over. It renders finished LDR colour and
+    // that is all there is.
+    //
+    // Leaving this at its default did not fail outright, which is what made
+    // it hard to see. DLSS ran, reported success and returned an image; the
+    // exposure it worked from was simply not anchored to anything, so it
+    // drifted, and once it collapsed the frame went black apart from the
+    // brightest emissive sprites, which bloomed enormously. That reaches a
+    // player as "it worked for a while, then started blinking, then went
+    // black" -- which is exactly how this arrived.
+    options.useAutoExposure = sl::Boolean::eTrue;
     // Zero means "let the SDK choose", which is both the right default and
     // what lets a newer DLSS model be adopted by dropping in newer DLLs. A
     // non-zero value is passed straight through, so a preset that does not
