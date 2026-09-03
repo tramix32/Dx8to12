@@ -465,6 +465,7 @@ bool DlssClient::SubmitFrame(float jitter_x, float jitter_y,
   shared_->nr_local_structure = config.nr_local_structure;
   shared_->nr_skin_structure = config.nr_skin_structure;
   shared_->force_loopback = config.upscaler_loopback ? 1u : 0u;
+  shared_->device_generation = device_generation_;
   pending_history_reset_ = false;
   // Published last: the helper treats a new frame_index as "everything else
   // in this struct is now valid for that frame".

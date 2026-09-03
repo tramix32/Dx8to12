@@ -120,6 +120,15 @@ class DlssClient {
   // Reset makes the previous frame meaningless to an upscaler.
   void RequestHistoryReset() { pending_history_reset_ = true; }
 
+  // A device Reset invalidates more than the previous frame: the upscaler's
+  // own resources were built against a device generation that is gone.
+  // Discarding history is not enough on its own -- see the comment on
+  // device_generation in the protocol.
+  void NotifyDeviceReset() {
+    ++device_generation_;
+    pending_history_reset_ = true;
+  }
+
  private:
   void CloseSharedObjects();
 
@@ -158,6 +167,7 @@ class DlssClient {
   // is eventually given up on instead of being polled forever.
   ULONGLONG start_tick_ = 0;
   bool pending_history_reset_ = true;
+  uint32_t device_generation_ = 0;
   uint32_t render_width_ = 0;
   uint32_t render_height_ = 0;
   uint32_t output_width_ = 0;

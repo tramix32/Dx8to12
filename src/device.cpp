@@ -2759,7 +2759,7 @@ Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // apart from the brightest emissive sprites, which bloom across the
   // screen -- with no way out, because the exposure it is now stuck at is
   // derived from the very history that needs discarding.
-  if (dlss_client_) dlss_client_->RequestHistoryReset();
+  if (dlss_client_) dlss_client_->NotifyDeviceReset();
   // Rebuilt here rather than once at Init: the debug PSO's render target
   // format comes from the scene target, which was just recreated.
   InitMotionVectorPass();

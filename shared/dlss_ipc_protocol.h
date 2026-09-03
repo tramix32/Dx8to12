@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 8;
+inline constexpr uint32_t kVersion = 9;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -188,6 +188,13 @@ struct Handshake {
   // Only valid when render and output sizes match; the helper says so and
   // refuses otherwise rather than copying between mismatched resources.
   uint32_t force_loopback = 0;
+
+  // Bumped by the game side on every device Reset. The upscaler keeps
+  // internal state this protocol cannot describe and the game side cannot
+  // reach; after a Reset that state refers to a device generation that no
+  // longer exists, and asking it to carry on produces an image it cannot
+  // recover from. The helper watches this and rebuilds the feature.
+  uint32_t device_generation = 0;
 
   // Frames the helper believes it produced an image for, by whichever path.
   // A number that climbs while the screen is black means the picture is

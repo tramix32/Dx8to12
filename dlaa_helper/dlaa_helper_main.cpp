@@ -854,8 +854,13 @@ int RunDlaaHelper(const wchar_t* map_name) {
   }
 
   sl::ViewportHandle viewport{0};
+  // Last device generation this helper has rebuilt for; see the reset check
+  // in the frame loop.
+  uint32_t seen_device_generation = 0;
+  // Kept outside the block that fills it in: a device Reset on the game side
+  // means these have to be applied a second time, long after this point.
+  sl::DLSSOptions options{};
   if (streamline_ready) {
-    sl::DLSSOptions options{};
     // Derived from the resolution the game actually chose rather than
     // hardcoded: DLSS sizes its internal buffers from the mode, so a mode
     // that disagrees with the render extent being tagged is asking it to
@@ -1008,6 +1013,23 @@ int RunDlaaHelper(const wchar_t* map_name) {
 
     bool recorded = false;
 #ifdef DX8TO12_HAVE_STREAMLINE
+    // The game lost its device since the last frame, so everything super
+    // resolution accumulated belongs to a device generation that is gone.
+    // Telling it to reset history is not enough: measured against a build
+    // that did exactly that, the picture still came back black apart from
+    // the sun. Its resources have to go too, which is what slFreeResources
+    // is for -- the options are then re-applied so the next evaluate builds
+    // the feature again from nothing.
+    if (streamline_ready && shared->device_generation != seen_device_generation) {
+      seen_device_generation = shared->device_generation;
+      slFreeResources(sl::kFeatureDLSS, viewport);
+      Ok(slDLSSSetOptions(viewport, options),
+         "slDLSSSetOptions after device reset");
+      std::fprintf(stderr,
+                   "DLAA helper: game device reset (generation %u); super "
+                   "resolution rebuilt.\n",
+                   shared->device_generation);
+    }
     if (streamline_ready && res.depth_in && res.mvec_in) {
       sl::FrameToken* token = nullptr;
       const uint32_t frame_index = static_cast<uint32_t>(wanted);
