@@ -170,6 +170,11 @@ struct Config {
   // hardware it also needs a runtime built for it; NVIDIA ships RTX 50 only.
   bool neural_rendering = false;
 
+  // Diagnostic: makes the helper copy its input to its output instead of
+  // running super resolution. Not persisted -- it is for answering one
+  // question during one session, not a mode to leave a game in.
+  bool upscaler_loopback = false;
+
   // Feature 18's look knobs, defaulted to what NVIDIA's own presets ship
   // with. Read every frame, so a mod moving a slider changes the image
   // without a restart. Ranges are the runtime's to enforce -- passing a value

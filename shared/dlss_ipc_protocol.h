@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 7;
+inline constexpr uint32_t kVersion = 8;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -180,6 +180,19 @@ struct Handshake {
   float nr_local_tone = 1.0f;
   float nr_local_structure = 2.0f;
   float nr_skin_structure = -1.0f;
+
+  // Diagnostic: skip super resolution and copy the input straight to the
+  // output. Splits "the picture never reached the helper" from "the helper
+  // ran and produced nothing" -- two failures that look identical from the
+  // game, because both end as a black frame with the HUD drawn over it.
+  // Only valid when render and output sizes match; the helper says so and
+  // refuses otherwise rather than copying between mismatched resources.
+  uint32_t force_loopback = 0;
+
+  // Frames the helper believes it produced an image for, by whichever path.
+  // A number that climbs while the screen is black means the picture is
+  // being lost after the helper, not inside it.
+  uint64_t produced_frames = 0;
 };
 
 }  // namespace Dx8to12::DlssIpc

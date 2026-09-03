@@ -1051,7 +1051,12 @@ int RunDlaaHelper(const wchar_t* map_name) {
                                              : sl::Boolean::eFalse;
 
         const sl::BaseStructure* inputs[] = {&viewport};
-        if (Ok(slSetTagForFrame(*token, viewport, tags, _countof(tags),
+        // Loopback skips super resolution entirely; the !recorded path below
+        // then copies input to output. Reusing that rather than adding a
+        // second copy: it already handles the size check and the barriers,
+        // and it is the path a failed evaluate has always taken.
+        if (!shared->force_loopback &&
+            Ok(slSetTagForFrame(*token, viewport, tags, _countof(tags),
                                 cmd_list.Get()),
                "slSetTagForFrame") &&
             Ok(slSetConstants(consts, *token, viewport), "slSetConstants") &&
@@ -1059,6 +1064,11 @@ int RunDlaaHelper(const wchar_t* map_name) {
                                  _countof(inputs), cmd_list.Get()),
                "slEvaluateFeature")) {
           recorded = true;
+          if (shared->produced_frames == 0) {
+            std::fprintf(stderr,
+                         "DLAA helper: first super resolution evaluate "
+                         "succeeded.\n");
+          }
           // After super resolution, over its output: NR is a post-pass, and
           // the same depth and motion vectors it was given still describe the
           // frame.
@@ -1143,6 +1153,7 @@ int RunDlaaHelper(const wchar_t* map_name) {
     // looks at what this presents.
     present_pump.Pump();
     processed = wanted;
+    ++shared->produced_frames;
     shared->completed_frame_index = wanted;
   }
 

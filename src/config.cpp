@@ -45,6 +45,12 @@ ULONGLONG g_last_save_tick = 0;
 // animating a value should not cost a file write per frame.
 constexpr ULONGLONG kMinSaveIntervalMs = 1000;
 
+// The highest lighting mode that actually renders differently. Config's own
+// documentation marks 2 (RTShadows), 3 (RTReflections) and 4 (RTFullGI) as
+// not yet implemented; this is the single place that keeps that comment and
+// the behaviour from drifting apart. Raise it as each mode becomes real.
+constexpr int kHighestImplementedLightingMode = 1;
+
 // The single list of settings. Everything that needs to enumerate keys --
 // the INI parser, the INI writer -- walks this instead of repeating them.
 //
@@ -52,12 +58,6 @@ constexpr ULONGLONG kMinSaveIntervalMs = 1000;
 // MotionVectorDebug paints over half the screen. If a mod turns either on for
 // a session, writing that back would leave the player with a broken-looking
 // game and no idea why, having never edited the file themselves.
-// The highest lighting mode that actually renders differently. Config's own
-// documentation marks 2 (RTShadows), 3 (RTReflections) and 4 (RTFullGI) as
-// not yet implemented; this is the single place that keeps that comment and
-// the behaviour from drifting apart. Raise it as each mode becomes real.
-constexpr int kHighestImplementedLightingMode = 1;
-
 constexpr ConfigField kFields[] = {
     {"AnisotropicOverride", ConfigFieldType::Int, true},
     {"MSAASamples", ConfigFieldType::Int, true},
@@ -69,6 +69,7 @@ constexpr ConfigField kFields[] = {
     {"RenderScale", ConfigFieldType::Float, true},
     {"DlssPreset", ConfigFieldType::Int, true},
     {"NeuralRendering", ConfigFieldType::Bool, true},
+    {"UpscalerLoopback", ConfigFieldType::Bool, false},
     {"NRStyle", ConfigFieldType::Int, true},
     {"NRPreset", ConfigFieldType::Int, true},
     {"NRAutoMask", ConfigFieldType::Bool, true},
@@ -584,6 +585,10 @@ bool GetConfigValueBool(const std::string &key, bool *out_value) {
     *out_value = g_config.neural_rendering;
     return true;
   }
+  if (EqualsIgnoreCase(key, "UpscalerLoopback")) {
+    *out_value = g_config.upscaler_loopback;
+    return true;
+  }
   if (EqualsIgnoreCase(key, "NearPlaneClipping")) {
     *out_value = g_config.near_plane_clipping;
     return true;
@@ -663,6 +668,11 @@ bool SetConfigValueBool(const std::string &key, bool value) {
   if (EqualsIgnoreCase(key, "NRUICorrection")) {
     if (value != g_config.nr_ui_correction) MarkConfigDirty();
     g_config.nr_ui_correction = value;
+    return true;
+  }
+  if (EqualsIgnoreCase(key, "UpscalerLoopback")) {
+    if (value != g_config.upscaler_loopback) MarkConfigDirty();
+    g_config.upscaler_loopback = value;
     return true;
   }
   return false;
