@@ -2091,6 +2091,7 @@ void Device::RunDlaaExchange() {
   GpuTexture *color_out = dlss_client_->AcquirePreviousResult();
 
   if (!color_out) {
+    ++frames_fallback_;
     // Normal on the first frame (there is no previous one) and on any frame
     // the helper missed. Falls back to the plain resolve, which itself knows
     // to do nothing when the scene and the backbuffer are different sizes.
@@ -2100,6 +2101,7 @@ void Device::RunDlaaExchange() {
     return;
   }
   scene_pass_active_ = false;
+  ++frames_upscaled_;
 
   TransitionTexture(color_out, 0, D3D12_RESOURCE_STATE_COPY_SOURCE);
   TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2425,6 +2427,9 @@ void Device::GetUpscalerStatusEx(Dx8to12_UpscalerStatusEx *out) const {
   full.render_height = base.render_height;
   full.output_width = base.output_width;
   full.output_height = base.output_height;
+  full.frames_upscaled = frames_upscaled_;
+  full.frames_fallback = frames_fallback_;
+  full.frames_bypassed = frames_bypassed_;
 #ifdef DX8TO12_SCENE_TARGET
   if (dlss_client_) {
     full.neural_rendering_active =
@@ -7330,6 +7335,7 @@ void Device::SubmitAndWait(bool should_present) {
       // before an unknown gap.
       if (scene_pass_active_ && !frame_had_3d_draw_ && dlss_client_) {
         dlss_client_->RequestHistoryReset();
+        ++frames_bypassed_;
       }
       ResolveScenePass();
     }

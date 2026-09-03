@@ -123,6 +123,18 @@ struct Dx8to12_UpscalerStatusEx {
   // installs it, so the useful message is "found nvngx_dlssnr.dll" rather
   // than "yes".
   char neural_rendering_runtime[64];
+
+  // How each presented frame was composited, counted since device creation.
+  // A black frame is not self-explaining -- it looks the same whichever path
+  // produced it -- so these exist to attribute one after the fact instead of
+  // guessing. They are why Ex carries struct_size: adding them here costs a
+  // recompile of nothing.
+  //   upscaled  -- the upscaler returned a result and it was presented
+  //   fallback  -- it had none ready, so the scene was copied un-upscaled
+  //   bypassed  -- the frame had no 3D draw, so it never went to the upscaler
+  unsigned int frames_upscaled;
+  unsigned int frames_fallback;
+  unsigned int frames_bypassed;
 };
 
 // One setting, for a mod enumerating them to build a panel without hardcoding
@@ -785,6 +797,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   int perf_frame_sample_count_ = 0;
 
   ComPtr<ID3D12Debug5> debug_interface_;
+  uint32_t frames_upscaled_ = 0;
+  uint32_t frames_fallback_ = 0;
+  uint32_t frames_bypassed_ = 0;
   ComPtr<ID3D12InfoQueue1> info_queue_;
   DWORD info_queue_cookie_;
 
