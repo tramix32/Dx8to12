@@ -214,6 +214,19 @@ std::wstring DriverNgxDirectory() {
 // candidate names are accepted -- picking up an unknown driver-shipped DLL
 // and loading it into the game is not a decision to make on the user's
 // behalf.
+#ifdef DX8TO12_HAVE_NGX
+// NGX's own diagnostics, into this helper's log. Worth wiring before it is
+// needed: NGX reports one result code for a whole init or feature create and
+// names no parameter, so without this its failures are a hex number and a
+// guess.
+static void NVSDK_CONV NgxLogCallback(const char* message,
+                                      NVSDK_NGX_Logging_Level level,
+                                      NVSDK_NGX_Feature source) {
+  std::fprintf(stderr, "[ngx][lvl %d][feature %d] %s", static_cast<int>(level),
+               static_cast<int>(source), message ? message : "(null)\n");
+}
+#endif
+
 bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
                                  std::string* found_name) {
   struct SearchDir {
@@ -374,9 +387,27 @@ struct NeuralRendering {
       }
     }
 
+    // Where to look for the feature DLL, and NGX's own log routed into this
+    // helper's log.
+    //
+    // Passing nullptr here is what produced FAIL_UnableToInitializeFeature
+    // ("the library for that feature could not be found") on the first
+    // attempt. The SDK does search the application folder by default, and the
+    // runtime is sitting in it, so the default was evidently not enough --
+    // hence both the explicit path list and the logging callback, because
+    // NGX's own reason is worth more than another guess from here.
+    const wchar_t* search_paths[] = {data_path, L"."};
+    NVSDK_NGX_FeatureCommonInfo common = {};
+    common.PathListInfo.Path = search_paths;
+    common.PathListInfo.Length =
+        static_cast<unsigned int>(_countof(search_paths));
+    common.LoggingInfo.LoggingCallback = &NgxLogCallback;
+    common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+    common.LoggingInfo.DisableOtherLoggingSinks = false;
+
     const NVSDK_NGX_Result init = NVSDK_NGX_D3D12_Init_with_ProjectID(
         kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion, data_path,
-        device, nullptr, NVSDK_NGX_Version_API);
+        device, &common, NVSDK_NGX_Version_API);
     if (NVSDK_NGX_FAILED(init)) {
       std::fprintf(stderr,
                    "DLAA helper: NGX init failed 0x%08X; neural rendering "

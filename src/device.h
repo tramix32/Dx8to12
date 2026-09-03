@@ -69,6 +69,49 @@ struct Dx8to12_UpscalerStatus {
   int mode;           // TemporalAA as the upscaler is running it.
   int preset;         // sl::DLSSPreset in effect; 0 means "SDK chooses".
   int helper_status;  // DlssIpc::HelperStatus, for diagnosing a failed start.
+  unsigned int failed_frames;
+  unsigned int render_width;
+  unsigned int render_height;
+  unsigned int output_width;
+  unsigned int output_height;
+};
+
+// 48 bytes: 7 ints then 5 unsigned ints. Frozen deliberately. Mods are
+// compiled against this layout and ship as binaries, so growing it writes
+// past the end of a buffer they allocated -- which is exactly what happened
+// once already. Anything new belongs in Dx8to12_UpscalerStatusEx below.
+static_assert(sizeof(Dx8to12_UpscalerStatus) == 48,
+              "Dx8to12_UpscalerStatus is a frozen ABI; add fields to "
+              "Dx8to12_UpscalerStatusEx instead");
+
+// The same thing plus what was learned after mods were already compiled
+// against the struct above.
+//
+// This exists because that struct has no size field, so **it can never grow
+// again**. Appending to it once already wrote 72 bytes past the end of the
+// buffer that every mod built against the previous layout passes in -- a
+// memory corruption in someone else's address space, produced by a call whose
+// entire job is to report status. Anything new goes here instead, and
+// struct_size is what makes this one safe to extend: the caller sets it, and
+// Dx8to12 writes only the fields that fit.
+struct Dx8to12_UpscalerStatusEx {
+  // Set to sizeof(Dx8to12_UpscalerStatusEx) before calling. A call that
+  // leaves it zero is rejected rather than guessed at.
+  int struct_size;
+
+  int compiled_in;
+  int helper_running;
+  int ready;
+  int healthy;
+  int mode;
+  int preset;
+  int helper_status;
+  unsigned int failed_frames;
+  unsigned int render_width;
+  unsigned int render_height;
+  unsigned int output_width;
+  unsigned int output_height;
+
   // Whether DLSS 5 Neural Rendering is running, which is not the same as
   // having been asked for: it needs an NGX runtime that may be absent.
   int neural_rendering_active;
@@ -80,11 +123,6 @@ struct Dx8to12_UpscalerStatus {
   // installs it, so the useful message is "found nvngx_dlssnr.dll" rather
   // than "yes".
   char neural_rendering_runtime[64];
-  unsigned int failed_frames;
-  unsigned int render_width;
-  unsigned int render_height;
-  unsigned int output_width;
-  unsigned int output_height;
 };
 
 // One setting, for a mod enumerating them to build a panel without hardcoding
@@ -167,6 +205,7 @@ class Device : public IDirect3DDevice8, RefCounted {
   // compiled in -- a mod should be able to render a greyed-out panel rather
   // than having to guess why a call failed.
   void GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const;
+  void GetUpscalerStatusEx(Dx8to12_UpscalerStatusEx *out) const;
   int GetActiveLightCount() const;
   bool GetActiveLight(int index, Dx8to12_LightInfo* out) const;
 

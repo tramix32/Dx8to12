@@ -2389,13 +2389,6 @@ void Device::GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const {
     out->helper_status = static_cast<int>(dlss_client_->helper_status());
     out->failed_frames = dlss_client_->failed_frames();
     out->preset = static_cast<int>(dlss_client_->preset());
-    out->neural_rendering_active =
-        static_cast<int>(dlss_client_->neural_rendering_active());
-    out->neural_rendering_available =
-        static_cast<int>(dlss_client_->neural_rendering_available());
-    strncpy_s(out->neural_rendering_runtime,
-              sizeof(out->neural_rendering_runtime),
-              dlss_client_->neural_rendering_runtime(), _TRUNCATE);
     // The client's own sizes are authoritative once it is running: they are
     // what the shared textures were actually created at, which is not the
     // same as the current setting if the setting changed since.
@@ -2405,6 +2398,49 @@ void Device::GetUpscalerStatus(Dx8to12_UpscalerStatus *out) const {
     out->output_height = dlss_client_->output_height();
   }
 #endif
+}
+
+// Everything GetUpscalerStatus reports, plus the neural rendering fields, into
+// a struct that carries its own size. Fields beyond the caller's size are not
+// written -- which is the entire reason this variant exists.
+void Device::GetUpscalerStatusEx(Dx8to12_UpscalerStatusEx *out) const {
+  if (!out) return;
+  const int size = out->struct_size;
+  if (size < static_cast<int>(sizeof(int))) return;
+
+  Dx8to12_UpscalerStatus base = {};
+  GetUpscalerStatus(&base);
+
+  Dx8to12_UpscalerStatusEx full = {};
+  full.struct_size = size;
+  full.compiled_in = base.compiled_in;
+  full.helper_running = base.helper_running;
+  full.ready = base.ready;
+  full.healthy = base.healthy;
+  full.mode = base.mode;
+  full.preset = base.preset;
+  full.helper_status = base.helper_status;
+  full.failed_frames = base.failed_frames;
+  full.render_width = base.render_width;
+  full.render_height = base.render_height;
+  full.output_width = base.output_width;
+  full.output_height = base.output_height;
+#ifdef DX8TO12_SCENE_TARGET
+  if (dlss_client_) {
+    full.neural_rendering_active =
+        static_cast<int>(dlss_client_->neural_rendering_active());
+    full.neural_rendering_available =
+        static_cast<int>(dlss_client_->neural_rendering_available());
+    strncpy_s(full.neural_rendering_runtime,
+              sizeof(full.neural_rendering_runtime),
+              dlss_client_->neural_rendering_runtime(), _TRUNCATE);
+  }
+#endif
+
+  const size_t copy = static_cast<size_t>(size) < sizeof(full)
+                          ? static_cast<size_t>(size)
+                          : sizeof(full);
+  memcpy(out, &full, copy);
 }
 
 int Device::GetActiveLightCount() const {

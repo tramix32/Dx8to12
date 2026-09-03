@@ -101,6 +101,18 @@ __declspec(dllexport) bool __cdecl Dx8to12_GetUpscalerStatus(
   return true;
 }
 
+// As above, but into a struct that carries its own size, so this one can gain
+// fields later without writing past a buffer a mod compiled earlier passed in.
+// Set out->struct_size = sizeof(Dx8to12_UpscalerStatusEx) before calling.
+__declspec(dllexport) bool __cdecl Dx8to12_GetUpscalerStatusEx(
+    Dx8to12_UpscalerStatusEx *out) {
+  if (!out || out->struct_size <= 0) return false;
+  ::Dx8to12::Device *device = ::Dx8to12::GetCurrentDeviceForModApi();
+  if (!device) return false;
+  device->GetUpscalerStatusEx(out);
+  return true;
+}
+
 // Whether an RT backend is available: native D3D12 DXR, or the provisioned
 // x64 helper used when NVIDIA's x86 D3D12 runtime reports Tier 0. LightingMode values that need raytracing
 // (see config.h) are clamped by SetConfigValueInt when this is false, but a
