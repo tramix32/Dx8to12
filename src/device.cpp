@@ -7349,8 +7349,24 @@ void Device::SubmitAndWait(bool should_present) {
     // the upscaler either. Whether it was reached depended on whether the
     // helper happened to become ready while the menu was still up, which is
     // why this came and went between launches of the same build.
-    if (scene_pass_active_ && frame_had_3d_draw_ && dlss_client_ &&
-        dlss_client_->PollReady()) {
+    // Not while the window is hidden. A minimised game still renders, and
+    // what it renders is black; feeding that to a temporal upscaler fills its
+    // history and its auto exposure with darkness, and the picture that comes
+    // back on restore is black apart from the brightest sprites.
+    //
+    // Rebuilding the feature on the device Reset alone did not fix this,
+    // because the Reset arrives when the device is *lost* -- while the window
+    // is still hidden -- so the rebuilt feature was immediately fed the same
+    // black frames and collapsed again. Withholding them is what makes the
+    // rebuild stick, and the history reset on the way back covers the frames
+    // it never saw.
+    const bool window_visible =
+        !window_ || (!IsIconic(window_) && IsWindowVisible(window_));
+    if (!window_visible && dlss_client_) {
+      dlss_client_->RequestHistoryReset();
+    }
+    if (scene_pass_active_ && frame_had_3d_draw_ && window_visible &&
+        dlss_client_ && dlss_client_->PollReady()) {
       RunDlaaExchange();
     } else {
       // A frame the upscaler never saw is a hole in its history; say so
