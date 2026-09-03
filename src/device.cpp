@@ -7307,9 +7307,30 @@ void Device::SubmitAndWait(bool should_present) {
     // check unreachable -- the helper launched, never reported ready, and
     // nothing ever said so, because the code that would have noticed only
     // ran once it already had.
-    if (scene_pass_active_ && dlss_client_ && dlss_client_->PollReady()) {
+    // frame_had_3d_draw_, not just scene_pass_active_. A frame the game drew
+    // entirely in 2D -- the menu, a loading screen, a fade -- has no depth
+    // worth reprojecting and no motion vectors that mean anything, so handing
+    // it to a temporal upscaler asks it to reconstruct from a history that
+    // does not correspond to it. What comes back is a heavily flickering
+    // image, and in the main menu that leaves the player unable to see the
+    // entry they are selecting.
+    //
+    // EndScenePassIfDrawIsUi already declines to end the pass on a 2D draw
+    // that no 3D draw preceded, which covers "2D after 3D". This is the other
+    // half of the same rule: a frame with no 3D draw at all never belongs to
+    // the upscaler either. Whether it was reached depended on whether the
+    // helper happened to become ready while the menu was still up, which is
+    // why this came and went between launches of the same build.
+    if (scene_pass_active_ && frame_had_3d_draw_ && dlss_client_ &&
+        dlss_client_->PollReady()) {
       RunDlaaExchange();
     } else {
+      // A frame the upscaler never saw is a hole in its history; say so
+      // rather than letting the next 3D frame blend against one that came
+      // before an unknown gap.
+      if (scene_pass_active_ && !frame_had_3d_draw_ && dlss_client_) {
+        dlss_client_->RequestHistoryReset();
+      }
       ResolveScenePass();
     }
 #endif
