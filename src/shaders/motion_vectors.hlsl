@@ -54,6 +54,19 @@ float2 ComputeMotion(float2 pixel_xy) {
   const float depth = depth_tex.Load(int3((int2)pixel_xy, 0));
   const float2 uv = pixel_xy / render_size;
 
+  // Nothing was drawn here, so there is no world point to have moved. Sky,
+  // distant geometry and anything the game left at the clear value all land
+  // on the far plane, where the unprojection below is numerically hopeless:
+  // w tends to zero, the reconstructed position explodes, and reprojecting it
+  // subtracts two huge nearly-equal numbers. What survives is not the small
+  // motion that was wanted but the rounding error, which is noise.
+  //
+  // The w guards further down do not catch this. They stop division by zero;
+  // they do nothing about w merely being tiny, which is the case that ruins
+  // the precision while staying comfortably above any epsilon. Rejecting on
+  // depth is the check that actually matches the situation.
+  if (depth >= 0.9999f) return float2(0.f, 0.f);
+
   // Pixel -> NDC. NDC y runs opposite to pixel y.
   const float4 clip = float4(uv.x * 2.f - 1.f, 1.f - uv.y * 2.f, depth, 1.f);
 
@@ -71,7 +84,17 @@ float2 ComputeMotion(float2 pixel_xy) {
   const float2 prev_ndc = prev_clip.xy / prev_clip.w;
   const float2 prev_uv = float2(prev_ndc.x * 0.5f + 0.5f, 0.5f - prev_ndc.y * 0.5f);
 
-  return (prev_uv - uv) * render_size;
+  const float2 motion = (prev_uv - uv) * render_size;
+
+  // A pixel cannot legitimately have come from outside the frame it is being
+  // reconstructed from, so anything beyond that is arithmetic that went wrong
+  // rather than movement that happened. Zero is the honest answer: it tells
+  // the upscaler "no history for this pixel", which it handles, where a wild
+  // vector tells it to go and fetch one from nowhere, which it does not.
+  if (!all(isfinite(motion)) || any(abs(motion) > render_size)) {
+    return float2(0.f, 0.f);
+  }
+  return motion;
 }
 
 // Two targets, not one. The upscaler needs the depth buffer as well as the
