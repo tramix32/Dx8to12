@@ -17,7 +17,22 @@ namespace {
 // 2 adds setting enumeration (Dx8to12_GetSettingCount/GetSettingInfo) and
 // Dx8to12_GetUpscalerStatus, so a mod can build a settings panel without a
 // hardcoded key list and can show what the upscaler is really doing.
-constexpr int kApiVersion = 3;
+// MODDING.md states the rule this number follows: it increases only for a
+// *breaking* change -- a signature that changed, or a function that was
+// removed. Adding an export or a setting is not breaking and must not touch
+// it.
+//
+// It was nonetheless bumped to 2 for adding three functions, and to 3 for
+// adding one more. Nothing was ever removed and no signature ever changed, so
+// the correct value has been 1 the whole time. The cost of getting that wrong
+// was not theoretical: a mod that followed the documented rule and refused an
+// unexpected version lost its render callback and logged the refusal once per
+// frame, which reads to a player as the picture freezing and the sound
+// cutting out.
+//
+// So: adding an export below does NOT belong in this number. Only removing
+// one, or changing one's signature or meaning, does.
+constexpr int kApiVersion = 1;
 }  // namespace
 
 extern "C" {
