@@ -1574,14 +1574,40 @@ void Device::ResolveScenePass() {
                   << "; clearing instead of copying (the upscaler owns this "
                      "frame's output).\n";
     }
-    // Cleared rather than left alone. A backbuffer nothing wrote holds
-    // whatever the swap chain last had there, which shows up as torn strips
-    // of colour on black -- exactly what a loading screen or a menu frame
-    // that never reached the upscaler looks like.
+    // Scaled onto the backbuffer rather than cleared.
+    //
+    // Clearing was what this did, and at a reduced render scale it meant the
+    // screen went black on every frame the upscaler did not produce -- during
+    // startup, during a restart after the window came back, and permanently
+    // if it never became ready. There was no un-upscaled path at all below
+    // scale 1, which made the whole feature depend on the upscaler never
+    // faltering.
+    TransitionTexture(scene_color_tex_.Get(), 0,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     TransitionTexture(backbuffer, 0, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const float black[4] = {0.f, 0.f, 0.f, 1.f};
-    cmd_list_->ClearRenderTargetView(backbuffer->rtv_handle(), black, 0,
-                                     nullptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE blit_rtv = backbuffer->rtv_handle();
+    cmd_list_->OMSetRenderTargets(1, &blit_rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT blit_viewport{
+        .TopLeftX = 0.f,
+        .TopLeftY = 0.f,
+        .Width = static_cast<float>(backbuffer->resource_desc().Width),
+        .Height = static_cast<float>(backbuffer->resource_desc().Height),
+        .MinDepth = 0.f,
+        .MaxDepth = 1.f};
+    const D3D12_RECT blit_scissor{
+        .left = 0,
+        .top = 0,
+        .right = static_cast<LONG>(backbuffer->resource_desc().Width),
+        .bottom = static_cast<LONG>(backbuffer->resource_desc().Height)};
+    cmd_list_->RSSetViewports(1, &blit_viewport);
+    cmd_list_->RSSetScissorRects(1, &blit_scissor);
+    cmd_list_->SetGraphicsRootSignature(mvec_root_sig_.get());
+    cmd_list_->SetPipelineState(scene_blit_pso_.get());
+    cmd_list_->SetGraphicsRootDescriptorTable(
+        1, srv_heap_.GetGPUHandleFor(scene_color_tex_->srv_handle()));
+    cmd_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd_list_->DrawInstanced(3, 1, 0, 0);
     dirty_flags_ |= DIRTY_FLAG_OM;
     dirty_flags_ |= DIRTY_FLAG_PSO;
     return;
@@ -1631,11 +1657,22 @@ void Device::InitMotionVectorPass() {
                            .pDescriptorRanges = &depth_range},
        .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL},
   };
+  // A static sampler, used only by the scale blit below. The motion vector
+  // shaders Load() their texels and ignore it, so adding it costs them
+  // nothing and saves the blit a descriptor.
+  D3D12_STATIC_SAMPLER_DESC blit_sampler{
+      .Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+      .AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+      .AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+      .AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+      .MaxLOD = D3D12_FLOAT32_MAX,
+      .ShaderRegister = 0,
+      .ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL};
   D3D12_ROOT_SIGNATURE_DESC sig_desc{
       .NumParameters = 2,
       .pParameters = params,
-      .NumStaticSamplers = 0,
-      .pStaticSamplers = nullptr,
+      .NumStaticSamplers = 1,
+      .pStaticSamplers = &blit_sampler,
       // No ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT: the fullscreen triangle is
       // generated from SV_VertexID, so there is no vertex buffer at all.
       .Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -1717,6 +1754,21 @@ void Device::InitMotionVectorPass() {
   ASSERT_HR(d3d12_device_->CreateGraphicsPipelineState(
       &pso_desc, IID_PPV_ARGS(mvec_debug_pso_.GetForInit())));
 #endif
+  // The scale blit: same root signature and same fullscreen triangle, one
+  // render target in the backbuffer's format.
+  {
+    ComPtr<ID3DBlob> blit_ps_blob = compile("PSScaleBlit", "ps_5_0");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC blit_desc = pso_desc;
+    blit_desc.PS = {blit_ps_blob->GetBufferPointer(),
+                    blit_ps_blob->GetBufferSize()};
+    blit_desc.NumRenderTargets = 1;
+    blit_desc.RTVFormats[0] =
+        back_buffers_.empty() ? DXGI_FORMAT_R8G8B8A8_UNORM
+                              : back_buffers_.at(0)->resource_desc().Format;
+    blit_desc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    ASSERT_HR(d3d12_device_->CreateGraphicsPipelineState(
+        &blit_desc, IID_PPV_ARGS(scene_blit_pso_.GetForInit())));
+  }
   LOG(INFO) << "InitMotionVectorPass: done\n";
 }
 

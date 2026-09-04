@@ -127,3 +127,22 @@ float4 PSDebug(VSOut input) : SV_Target {
   // red/green shift left-right and up-down respectively.
   return float4(scaled.x * 0.5f + 0.5f, scaled.y * 0.5f + 0.5f, 0.5f, 1.f);
 }
+
+// Scene colour scaled onto the backbuffer, for every frame the upscaler does
+// not produce.
+//
+// Without this there is no such path at all: at a reduced render scale the
+// scene target and the backbuffer are different sizes, CopyResource refuses
+// that, and the resolve cleared to black instead. So any moment the upscaler
+// was not ready -- startup, a restart after the window came back -- the
+// screen went black, and if it never became ready the game stayed black.
+//
+// Bilinear, which is what an ordinary upscale wants. The sampler is declared
+// static in the root signature, so this costs no descriptor.
+Texture2D<float4> scene_tex : register(t0);
+SamplerState scene_sampler : register(s0);
+
+float4 PSScaleBlit(VSOut input) : SV_Target {
+  return scene_tex.SampleLevel(scene_sampler, input.uv, 0.f);
+}
+

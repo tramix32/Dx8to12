@@ -984,6 +984,9 @@ class Device : public IDirect3DDevice8, RefCounted {
   // restored underneath it.
   ComPtr<ID3D12RootSignature> mvec_root_sig_;
   ComPtr<ID3D12PipelineState> mvec_pso_;
+  // Scene colour scaled onto the backbuffer whenever the upscaler produced
+  // nothing for this frame. See PSScaleBlit.
+  ComPtr<ID3D12PipelineState> scene_blit_pso_;
 #ifdef DX8TO12_MOTION_VECTORS_DEBUG
   // Same shader, same inputs, different output: false colour onto the scene
   // target, whose format differs from the motion buffer's, hence a second PSO.
