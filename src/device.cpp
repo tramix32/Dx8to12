@@ -2149,11 +2149,14 @@ void Device::RunDlaaExchange() {
 
 #ifdef DX8TO12_SCENE_TARGET
 void Device::EndScenePassIfDrawIsUi(bool draw_is_pretransformed) {
+  // Recorded before the early return below, not after: whether the frame has
+  // any 3D content is now also what decides whether the *next* frame opens a
+  // scene pass at all, so it has to be tracked even on frames that never
+  // opened one. Leaving it inside the guard meant a frame drawn straight to
+  // the backbuffer could never report that 3D had come back.
+  if (!draw_is_pretransformed) frame_had_3d_draw_ = true;
   if (!scene_pass_active_) return;
-  if (!draw_is_pretransformed) {
-    frame_had_3d_draw_ = true;
-    return;
-  }
+  if (!draw_is_pretransformed) return;
   // A 2D draw before any 3D one is not the HUD arriving -- it is a fade, a
   // letterbox or a loading screen, and the scene has not been rendered yet.
   if (!frame_had_3d_draw_) return;
@@ -7665,7 +7668,20 @@ void Device::SubmitAndWait(bool should_present) {
   if (should_present) {
     // Re-evaluated per frame, so a mod toggling the setting takes effect on
     // the next frame rather than needing a device Reset.
-    scene_pass_active_ = SceneTargetWanted();
+    // Only open a scene pass when the previous frame actually drew a world.
+    //
+    // A frame with no 3D content does not belong to the upscaler, and it does
+    // not belong in the scene target either: at a reduced render scale the
+    // scene target is smaller than the backbuffer, so resolving such a frame
+    // has nothing it can copy and clears to black instead. That is a menu
+    // that renders correctly into a texture nobody ever shows -- which is
+    // exactly how this surfaced, the moment RenderScale went below 1.
+    //
+    // Menus and loading screens are steady states, so predicting from the
+    // previous frame costs one frame of adjustment on the way in and out and
+    // nothing else.
+    const bool previous_frame_drew_a_world = frame_had_3d_draw_;
+    scene_pass_active_ = SceneTargetWanted() && previous_frame_drew_a_world;
     frame_had_3d_draw_ = false;
     // CurrentColorTarget() changes answer here, and the freshly-reset
     // command list has no RTV bound anyway.
