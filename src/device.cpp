@@ -7666,10 +7666,24 @@ void Device::SubmitAndWait(bool should_present) {
   }
   // Present!
   if (should_present) {
-    ASSERT_HR(swap_chain_->Present(
+    const HRESULT present_hr = swap_chain_->Present(
         sync_interval_, sync_interval_ == 0 && tearing_supported_
-                             ? DXGI_PRESENT_ALLOW_TEARING
-                             : 0));
+                            ? DXGI_PRESENT_ALLOW_TEARING
+                            : 0);
+    if (FAILED(present_hr)) {
+      // Present reports that the device is gone; it does not report why, and
+      // the reason is the whole difference between a GPU hang, a driver
+      // fault, and someone else in this process upsetting it. Ask before
+      // asserting, because the assert takes the game down and the answer is
+      // unavailable afterwards.
+      const HRESULT removed_hr = d3d12_device_->GetDeviceRemovedReason();
+      LOG_ERROR() << "Present failed hr=0x" << std::hex << present_hr
+                  << ", device removed reason=0x" << removed_hr << std::dec
+                  << " (0x887A0006 hung, 0x887A0007 reset, 0x887A0020 driver "
+                     "internal, 0x887A0005 removed). Frames presented so far: "
+                  << next_fence_ << "\n";
+    }
+    ASSERT_HR(present_hr);
 #ifdef DX8TO12_ENABLE_MINDEBUG
     FlushRwCallDiagnostics(next_fence_);
 #endif
