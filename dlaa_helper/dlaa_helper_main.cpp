@@ -244,6 +244,18 @@ bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
   const std::wstring driver_dir = DriverNgxDirectory();
   if (!driver_dir.empty()) dirs.push_back({driver_dir, false});
 
+  // Two passes, and the order matters. The first looks only for the exact
+  // names a neural rendering runtime is known by; the second, which accepts
+  // any unrecognised nvngx_*.dll a user deliberately installed, runs only if
+  // the first found nothing.
+  //
+  // A single pass in directory order picked "nvngx_dlssnr - kopia.dll" -- the
+  // duplicate Windows leaves when a file is copied beside itself -- over the
+  // nvngx_dlssnr.dll sitting next to it, purely because enumeration returned
+  // it first. Reporting a stale duplicate as the runtime in use is misleading
+  // on its own, and would be worse if the duplicate were a stub.
+  for (int pass = 0; pass < 2; ++pass) {
+  const bool exact_names_only = (pass == 0);
   for (const SearchDir& dir : dirs) {
     const std::wstring pattern = dir.path + L"\\nvngx_*.dll";
     WIN32_FIND_DATAW find = {};
@@ -261,6 +273,7 @@ bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
       for (const wchar_t* candidate : kNeuralRenderingCandidates) {
         if (EqualsIgnoreCaseW(find.cFileName, candidate)) is_candidate = true;
       }
+      if (!is_candidate && exact_names_only) continue;
       if (!is_candidate && !dir.trusted) {
         // Interesting, but not ours to load. Name it so it stops being a
         // mystery if neural rendering is expected and does not appear.
@@ -288,6 +301,7 @@ bool ProbeNeuralRenderingRuntime(std::wstring* found_path,
       return true;
     } while (FindNextFileW(handle, &find));
     FindClose(handle);
+  }
   }
   std::fprintf(stderr,
                "DLAA helper: no neural rendering runtime found. Drop one next "
