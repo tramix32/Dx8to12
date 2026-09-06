@@ -389,6 +389,19 @@ bool DlssClient::PollReady() {
         << ", mvec " << shared_->seen_mvec_in_width << " fmt "
         << shared_->seen_mvec_in_format << " -- "
         << (matches ? "matches what we created" : "MISMATCH") << ".\n";
+    // What this side is about to report to mods about neural rendering.
+    // A panel saying "no runtime detected" while the helper's own log says it
+    // found one leaves two possibilities -- this side reporting zero, or the
+    // panel reading it wrongly -- and they are not distinguishable from
+    // either log alone. This line settles it.
+    LOG(AixLog::Severity::error)
+        << "DLSS: neural rendering as reported to mods: available="
+        << shared_->neural_rendering_available
+        << " active=" << shared_->neural_rendering_active << " runtime=\""
+        << (shared_->neural_rendering_runtime[0]
+                ? shared_->neural_rendering_runtime
+                : "(none)")
+        << "\"\n";
     if (!matches) {
       LOG(AixLog::Severity::error)
           << "DLSS: shared resources did not resolve to what was created; "
