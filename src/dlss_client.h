@@ -91,6 +91,11 @@ class DlssClient {
   uint32_t neural_rendering_active() const;
   uint32_t neural_rendering_available() const;
   const char *neural_rendering_runtime() const;
+  // The NGX core's capability verdict: 0 = not queried, 1 = available,
+  // 2 = needs a newer driver, 3 = unsupported on this device.
+  uint32_t neural_rendering_support() const;
+  uint32_t neural_rendering_min_driver_major() const;
+  uint32_t neural_rendering_min_driver_minor() const;
 
   // The texture the game's scene should be copied into, and the one the
   // result comes back in. Both are x86-owned.

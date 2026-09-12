@@ -366,6 +366,11 @@ struct NeuralRendering {
   bool active = false;
   bool available = false;
   std::string runtime_name;
+  // The NGX capability query's verdict, forwarded to the shim for mods.
+  // 0 = not queried, 1 = available, 2 = needs newer driver, 3 = unsupported.
+  uint32_t support = 0;
+  uint32_t support_min_driver_major = 0;
+  uint32_t support_min_driver_minor = 0;
 
   // Looks for the runtime whether or not it was asked for, so a settings
   // panel can offer the option only when it would do something. The
@@ -443,6 +448,46 @@ struct NeuralRendering {
       ngx_initialised_ = false;
       params_ = nullptr;
       return false;
+    }
+
+    // Ask the driver's own NGX core whether it will run feature 18, before
+    // trying to create it. This is NGX's documented capability query -- the
+    // same one the SDK uses for every other feature -- not a way around
+    // anything: GetCapabilityParameters returns a map the core fills in, and
+    // "DLSSNR.*" mirrors the "SuperSampling.*" names the headers define for
+    // super resolution. It turns the bare 0xBAD0000B a failed create gives
+    // into the core's actual reason: unsupported on this device, or supported
+    // from driver version X.Y onward.
+    NVSDK_NGX_Parameter* caps = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) &&
+        caps) {
+      int available = 0, needs_driver = 0;
+      unsigned int min_major = 0, min_minor = 0;
+      NVSDK_NGX_Parameter_GetI(caps, "DLSSNR.Available", &available);
+      NVSDK_NGX_Parameter_GetI(caps, "DLSSNR.NeedsUpdatedDriver", &needs_driver);
+      NVSDK_NGX_Parameter_GetUI(caps, "DLSSNR.MinDriverVersionMajor", &min_major);
+      NVSDK_NGX_Parameter_GetUI(caps, "DLSSNR.MinDriverVersionMinor", &min_minor);
+      // Kept so the shim can report the driver's own answer to mods, not just
+      // to this log. 1 = available, 2 = needs newer driver, 3 = unsupported.
+      support = available ? 1u : (needs_driver ? 2u : 3u);
+      support_min_driver_major = min_major;
+      support_min_driver_minor = min_minor;
+      if (available) {
+        std::fprintf(stderr,
+                     "DLAA helper: NGX core reports feature 18 AVAILABLE on "
+                     "this device.\n");
+      } else if (needs_driver && (min_major || min_minor)) {
+        std::fprintf(stderr,
+                     "DLAA helper: NGX core reports feature 18 needs a newer "
+                     "driver -- minimum %u.%u. This is the driver's own "
+                     "answer, and the number to watch for.\n",
+                     min_major, min_minor);
+      } else {
+        std::fprintf(stderr,
+                     "DLAA helper: NGX core reports feature 18 unavailable on "
+                     "this device, and not as a driver-version matter. On Ada "
+                     "this is the gate that has to lift before it can run.\n");
+      }
     }
 
     std::fprintf(stderr,
@@ -1154,6 +1199,14 @@ int RunDlaaHelper(const wchar_t* map_name) {
                                               shared->output_width,
                                               shared->output_height);
             shared->neural_rendering_active = neural.active ? 1u : 0u;
+            // The capability query ran inside Initialise; forward its verdict
+            // so a mod's panel can explain an unavailable feature -- "needs
+            // driver X.Y" rather than a dead grey checkbox.
+            shared->neural_rendering_support = neural.support;
+            shared->neural_rendering_min_driver_major =
+                neural.support_min_driver_major;
+            shared->neural_rendering_min_driver_minor =
+                neural.support_min_driver_minor;
           }
           if (neural.active) {
             neural.Evaluate(cmd_list.Get(), res.color_out.Get(),

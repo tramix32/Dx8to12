@@ -19,7 +19,7 @@
 namespace Dx8to12::DlssIpc {
 
 inline constexpr uint32_t kMagic = 0x444C4141;  // 'DLAA'
-inline constexpr uint32_t kVersion = 9;
+inline constexpr uint32_t kVersion = 10;
 
 // Frame slots, so the game does not have to wait for the helper inside the
 // frame it just handed over. In frame N the game writes inputs to slot
@@ -168,6 +168,15 @@ struct Handshake {
   // this project can know ahead of time -- NVIDIA ships DLSS 5 for RTX 50
   // only, so an RTX 40 build arrives from outside and may be called anything.
   char neural_rendering_runtime[64] = {};
+
+  // The NGX core's own answer to "will you run feature 18 on this device",
+  // from its capability query -- so a settings panel can say *why* it is
+  // unavailable rather than only that it is. 0 = not yet queried / no answer,
+  // 1 = available, 2 = needs a newer driver (see the min fields), 3 =
+  // unsupported on this device and not a driver-version matter.
+  uint32_t neural_rendering_support = 0;
+  uint32_t neural_rendering_min_driver_major = 0;
+  uint32_t neural_rendering_min_driver_minor = 0;
 
   // The look knobs feature 18 exposes. Read every frame rather than at
   // create time, so a mod's slider moves the image while the game runs --

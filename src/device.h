@@ -123,6 +123,14 @@ struct Dx8to12_UpscalerStatusEx {
   // installs it, so the useful message is "found nvngx_dlssnr.dll" rather
   // than "yes".
   char neural_rendering_runtime[64];
+  // The NGX core's own verdict on whether it will run feature 18 here, so a
+  // panel can say why it is unavailable rather than only that it is:
+  //   0 = not queried yet (request NeuralRendering once to populate it),
+  //   1 = available, 2 = needs a newer driver, 3 = unsupported on this device.
+  // When 2, the min_driver fields hold the version the driver itself named.
+  int neural_rendering_support;
+  unsigned int neural_rendering_min_driver_major;
+  unsigned int neural_rendering_min_driver_minor;
 
   // How each presented frame was composited, counted since device creation.
   // A black frame is not self-explaining -- it looks the same whichever path

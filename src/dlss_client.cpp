@@ -88,6 +88,18 @@ const char *DlssClient::neural_rendering_runtime() const {
   return shared_ ? shared_->neural_rendering_runtime : "";
 }
 
+uint32_t DlssClient::neural_rendering_support() const {
+  return shared_ ? shared_->neural_rendering_support : 0u;
+}
+
+uint32_t DlssClient::neural_rendering_min_driver_major() const {
+  return shared_ ? shared_->neural_rendering_min_driver_major : 0u;
+}
+
+uint32_t DlssClient::neural_rendering_min_driver_minor() const {
+  return shared_ ? shared_->neural_rendering_min_driver_minor : 0u;
+}
+
 DlssClient::~DlssClient() { Stop(); }
 
 bool DlssClient::Start(uint32_t render_width, uint32_t render_height,

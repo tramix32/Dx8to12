@@ -2560,6 +2560,12 @@ void Device::GetUpscalerStatusEx(Dx8to12_UpscalerStatusEx *out) const {
     strncpy_s(full.neural_rendering_runtime,
               sizeof(full.neural_rendering_runtime),
               dlss_client_->neural_rendering_runtime(), _TRUNCATE);
+    full.neural_rendering_support =
+        static_cast<int>(dlss_client_->neural_rendering_support());
+    full.neural_rendering_min_driver_major =
+        dlss_client_->neural_rendering_min_driver_major();
+    full.neural_rendering_min_driver_minor =
+        dlss_client_->neural_rendering_min_driver_minor();
   }
 #endif
 
