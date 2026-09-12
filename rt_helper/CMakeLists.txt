@@ -46,7 +46,7 @@ endif()
 # which would change the existing RT path for every session even when DLSS is
 # not in use. rt_helper_main.cpp loads sl.interposer.dll dynamically instead,
 # only inside --dlss-probe.
-set(DX8TO12_STREAMLINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/streamline")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/VendorSdks.cmake")
 if(EXISTS "${DX8TO12_STREAMLINE_DIR}/include/sl.h")
   message(STATUS "Streamline SDK found: ${DX8TO12_STREAMLINE_DIR}")
   target_include_directories(dx8to12_rt_helper PRIVATE "${DX8TO12_STREAMLINE_DIR}/include")

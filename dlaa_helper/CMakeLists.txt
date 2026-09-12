@@ -18,7 +18,9 @@ target_compile_definitions(dx8to12_dlaa_helper PRIVATE WIN32_LEAN_AND_MEAN NOMIN
 target_include_directories(dx8to12_dlaa_helper
                            PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../shared")
 
-set(DX8TO12_STREAMLINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/streamline")
+# Where the SDKs come from -- a local copy in third_party/ if present, else the
+# pinned public release fetched at configure time. See cmake/VendorSdks.cmake.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/VendorSdks.cmake")
 if(EXISTS "${DX8TO12_STREAMLINE_DIR}/include/sl.h")
   message(STATUS "Streamline SDK found: ${DX8TO12_STREAMLINE_DIR}")
   target_include_directories(dx8to12_dlaa_helper
@@ -55,13 +57,12 @@ endif()
 # Rendering. Streamline 2.12 has no feature for it -- its kFeature list stops
 # at DLSS, DLSS_G, DLSS_RR and DirectSR -- so NR has to be driven through NGX
 # directly, which means this SDK in addition to Streamline rather than instead
-# of it. Supplied by the developer and never committed, exactly like
-# Streamline; absence must not break anything.
+# of it. Fetched by cmake/VendorSdks.cmake or placed in third_party/ngx, and
+# never committed, exactly like Streamline; absence must not break anything.
 #
 # The runtime it needs, nvngx_dlssnr.dll, is a separate matter again: NVIDIA
 # ships DLSS 5 for RTX 50 only, so running it on RTX 40 needs a build made for
 # that. Put whichever you have next to the helper.
-set(DX8TO12_NGX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ngx")
 if(EXISTS "${DX8TO12_NGX_DIR}/include/nvsdk_ngx.h")
   message(STATUS "NGX SDK found: ${DX8TO12_NGX_DIR}")
   target_include_directories(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_DIR}/include")
@@ -70,12 +71,18 @@ if(EXISTS "${DX8TO12_NGX_DIR}/include/nvsdk_ngx.h")
   # vs2010/vs2012/vs2013 directories are for those compilers and link against
   # a CRT this one does not have -- picking one of those gives a wall of
   # _MSC_VER mismatch and missing __imp___iob_func, which is what a naive
-  # "first match wins" glob over that tree produces. nvsdk_ngx_d is the
-  # dynamic-CRT variant, matching this target's default /MD.
-  set(DX8TO12_NGX_LIB "${DX8TO12_NGX_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
-  if(EXISTS "${DX8TO12_NGX_LIB}")
-    message(STATUS "NGX import library: ${DX8TO12_NGX_LIB}")
-    target_link_libraries(dx8to12_dlaa_helper PRIVATE "${DX8TO12_NGX_LIB}")
+  # "first match wins" glob over that tree produces.
+  #
+  # Two variants, chosen per configuration: nvsdk_ngx_d is built against the
+  # release dynamic CRT and nvsdk_ngx_d_dbg against the debug one. Linking the
+  # release one into a Debug build fails with RuntimeLibrary and
+  # _ITERATOR_DEBUG_LEVEL mismatches, which is how a scratch configure with no
+  # CMAKE_BUILD_TYPE first ran into it.
+  set(_ngx_libdir "${DX8TO12_NGX_DIR}/lib/Windows_x86_64/x64")
+  if(EXISTS "${_ngx_libdir}/nvsdk_ngx_d.lib")
+    message(STATUS "NGX import libraries: ${_ngx_libdir}")
+    target_link_libraries(dx8to12_dlaa_helper PRIVATE
+      "$<IF:$<CONFIG:Debug>,${_ngx_libdir}/nvsdk_ngx_d_dbg.lib,${_ngx_libdir}/nvsdk_ngx_d.lib>")
   else()
     message(WARNING "NGX headers found but no lib/Windows_x86_64/x64/nvsdk_ngx_d.lib -- neural rendering will not link")
   endif()

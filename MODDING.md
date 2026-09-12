@@ -65,9 +65,12 @@ LightingMode=0
 ;   0 = Off
 ;   1 = DLAA -- native-resolution temporal AA. Working; verified against
 ;               GTA: Vice City.
-;   2 = DLSS -- accepted, but currently behaves as DLAA: the scene is still
-;               rendered at output resolution, so there is nothing to upscale
-;               from yet.
+;   2 = DLSS -- the scene is rendered at RenderScale times the output
+;               resolution and reconstructed up to it. Working; verified at
+;               0.667 against GTA: Vice City. Frames the upscaler has not
+;               produced yet (startup, the restart after the window comes
+;               back) are scaled onto the backbuffer plainly, so nothing is
+;               ever black while it catches up.
 ; Objects that move independently of the camera (cars, pedestrians) ghost
 ; slightly: the motion vectors are reconstructed from depth and describe
 ; camera movement only. The same limit shows up on camera-facing foliage,
@@ -121,14 +124,17 @@ DlssPreset=0
 ; The calls are written, against the real contract: it is NGX feature 18
 ; (NVSDK_NGX_Feature_Reserved18), driven through NGX directly because
 ; Streamline 2.12 exposes no feature for it, over a DLSSNR.* parameter block.
-; Building them needs the NGX SDK in third_party/ngx.
+; Building them needs the NGX SDK, which the helper's CMake fetches (or
+; takes from third_party/ngx if a copy is placed there).
 ;
-; What is not settled is whether the runtime will start. It is nvngx_dlssnr.dll,
-; and NGX loads its core from the *driver*, not from that file -- so the driver
-; decides whether feature 18 exists. On a 4080 with driver 32.0.16.1656 the
-; core knows the name DLSSNR but refuses to create it
-; (FAIL_UnableToInitializeFeature). Note that is not the "unsupported hardware"
-; code, so this may be a newer-driver matter rather than a card one.
+; Whether it runs is decided by the driver, not by this code or by the
+; nvngx_dlssnr.dll next to the game: NGX loads its core from the driver, and
+; that core is asked before the file is ever opened. On an RTX 4080 with driver
+; 32.0.16.1664 the answer is explicit -- "feature is not supported on this
+; device" -- and NVIDIA's own Streamline NR plugin, where one is available,
+; reports the same. So on that hardware this setting does nothing until a
+; driver says otherwise, at which point it works without a rebuild: the helper
+; probes for the runtime on every start.
 ;
 ; Dx8to12_GetUpscalerStatusEx reports separately whether a runtime was found
 ; and whether it is actually running -- "installed" and "working" are different
@@ -265,9 +271,11 @@ of the differences worth measuring.
 ### Upgrading DLSS
 
 Nothing here is tied to a DLSS version. Newer models ship as newer
-`nvngx_dlss.dll` plus, if the API moved, a newer Streamline; drop them into
-`third_party/streamline/` and rebuild -- the helper's CMake copies whatever is
-there next to the executable. `DlssPreset=0` (the default) asks the SDK to
+`nvngx_dlss.dll` plus, if the API moved, a newer Streamline. To move to one,
+bump `DX8TO12_STREAMLINE_VERSION` (a CMake cache variable, see
+`cmake/VendorSdks.cmake`) and reconfigure; or drop the SDK into
+`third_party/streamline/`, which takes precedence. Either way the helper's
+CMake copies the runtime DLLs it finds next to the executable. `DlssPreset=0` (the default) asks the SDK to
 choose, so a newer model is picked up without touching any code.
 
 #### Settings that are not persisted

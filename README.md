@@ -56,8 +56,13 @@ any of them missing the game runs exactly as if the feature were off, and says
 so in `log.txt`.
 
 The NVIDIA Streamline SDK is **not** included here — it has its own licence
-and redistribution terms. Drop it in `third_party/streamline/` to build the
-helper with DLSS support; without it everything still builds and runs.
+and redistribution terms. Configuring the helper downloads the pinned public
+release into the build tree (`cmake/VendorSdks.cmake`; the version is the
+`DX8TO12_STREAMLINE_VERSION` cache variable). A copy placed by hand in
+`third_party/streamline/` takes precedence, which is how an offline machine
+or a non-public SDK build is used. Set `DX8TO12_FETCH_VENDOR_SDKS=OFF` to
+forbid the download entirely; without any SDK everything still builds and
+runs, with the feature off.
 
 ### Other additions
 

@@ -15,7 +15,7 @@ cmake_minimum_required(VERSION 3.21)
 #   cmake --build build-x64-dlss-bench
 project(Dx8to12DlssBench LANGUAGES CXX)
 
-set(DX8TO12_STREAMLINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/streamline")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/VendorSdks.cmake")
 if(NOT EXISTS "${DX8TO12_STREAMLINE_DIR}/include/sl.h")
   message(FATAL_ERROR
           "Streamline SDK not found at ${DX8TO12_STREAMLINE_DIR}. "
