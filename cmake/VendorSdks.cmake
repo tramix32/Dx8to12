@@ -20,15 +20,23 @@
 
 include_guard(GLOBAL)
 
-set(DX8TO12_STREAMLINE_VERSION "2.12.0" CACHE STRING
+set(DX8TO12_STREAMLINE_VERSION "2.14.1" CACHE STRING
     "Streamline SDK release downloaded when third_party/streamline is absent")
-set(DX8TO12_NGX_VERSION "v310.7.0" CACHE STRING
+set(DX8TO12_NGX_VERSION "v310.9.1" CACHE STRING
     "NVIDIA DLSS (NGX) SDK tag downloaded when third_party/ngx is absent")
 option(DX8TO12_FETCH_VENDOR_SDKS
        "Download the pinned Streamline and NGX SDKs at configure time when no local copy exists"
        ON)
 
 get_filename_component(_dx8to12_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+
+# One download shared by every build tree, rather than a 230 MB zip per tree.
+# build-deps/ falls under the build-*/ gitignore like the rest. A user who has
+# already set FETCHCONTENT_BASE_DIR keeps their choice.
+if(NOT DEFINED FETCHCONTENT_BASE_DIR)
+  set(FETCHCONTENT_BASE_DIR "${_dx8to12_root}/build-deps" CACHE PATH
+      "Where fetched SDKs are stored; shared across build trees")
+endif()
 set(DX8TO12_STREAMLINE_DIR "${_dx8to12_root}/third_party/streamline")
 set(DX8TO12_NGX_DIR "${_dx8to12_root}/third_party/ngx")
 

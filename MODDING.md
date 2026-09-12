@@ -108,7 +108,7 @@ RenderScale=1.0
 ; what lets a newer DLSS be adopted by dropping in newer DLLs with no code
 ; change. A non-zero value is passed straight through, so a preset added by a
 ; future SDK is selectable from here without this being edited. As of
-; Streamline 2.12: 11 = K (transformer, the default for DLAA and Quality),
+; Streamline 2.14: 11 = K (transformer, the default for DLAA and Quality),
 ; 12 = L, 13 = M.
 DlssPreset=0
 
